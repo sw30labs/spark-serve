@@ -1,7 +1,15 @@
 # spark-serve
 
-Mac CLI + SwiftUI app that switches a two-node [NVIDIA DGX Spark](https://www.nvidia.com/en-us/products/workstations/dgx-spark/)
-cluster between catalogued vLLM recipes.
+Mac CLI + SwiftUI helper that remotely switches which catalogued vLLM model a
+two-node [NVIDIA DGX Spark](https://www.nvidia.com/en-us/products/workstations/dgx-spark/)
+cluster is serving.
+
+**This is not how you set up a cluster.** Cabling, ConnectX-7 / QSFP, pairing
+the Sparks, SSH, and the fabric are NVIDIA's docs, not this repo. Start at the
+[DGX Spark user guide](https://docs.nvidia.com/dgx/dgx-spark/)
+([system configuration and clustering](https://docs.nvidia.com/dgx/dgx-spark/system-config-and-operation.html)).
+This project assumes that cluster already exists and the Mac can SSH to both
+nodes. It only starts, stops, and swaps the vLLM recipe on the live endpoint.
 
 The live OpenAI-compatible endpoint stays on the head node's LAN port 8000.
 All SSH / docker / NCCL work lives in the Python CLI. The GUI is a thin
