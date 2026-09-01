@@ -7,6 +7,8 @@ The live OpenAI-compatible endpoint stays on the head node's LAN port 8000.
 All SSH / docker / NCCL work lives in the Python CLI. The GUI is a thin
 `Process` wrapper around that CLI.
 
+![spark-serve GUI](docs/gui.png)
+
 ```
 cp models.example.toml models.toml   # then edit [cluster]
 ./spark-serve list
