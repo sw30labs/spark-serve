@@ -1,0 +1,754 @@
+#!/usr/bin/env python3
+"""Mac-side launcher for a two-node NVIDIA DGX Spark vLLM cluster.
+
+Add a model by dropping a [models.<id>] table in models.toml next to this
+script. Copy models.example.toml to models.toml and edit [cluster].
+Do not retune NCCL here. Never stop names in cluster.keep_containers.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+def _ensure_python_311() -> None:
+    if sys.version_info >= (3, 11):
+        return
+    home = Path.home()
+    for cand in (
+        home / "miniconda3/bin/python3.14",
+        home / "miniconda3/bin/python3",
+        home / "miniforge3/bin/python3",
+        Path("/opt/homebrew/bin/python3.14"),
+        Path("/opt/homebrew/bin/python3.12"),
+        Path("/opt/homebrew/bin/python3.11"),
+    ):
+        if cand.is_file() and os.access(cand, os.X_OK):
+            os.execv(str(cand), [str(cand), *sys.argv])
+    sys.stderr.write(
+        f"spark-serve: Python 3.11+ required (have {sys.version.split()[0]})\n"
+    )
+    raise SystemExit(1)
+
+
+_ensure_python_311()
+import tomllib  # noqa: E402
+
+HERE = Path(__file__).resolve().parent
+CATALOG = HERE / "models.toml"
+EXAMPLE = HERE / "models.example.toml"
+HERMES_CONFIG = Path.home() / ".hermes" / "config.yaml"
+
+# When True, die() emits a JSON-line error event (used by `up --json`).
+_JSON_MODE = False
+
+
+def die(msg: str, code: int = 1) -> None:
+    if _JSON_MODE:
+        _emit("error", detail=msg)
+    else:
+        print(f"spark-serve: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def load() -> dict:
+    if not CATALOG.exists():
+        hint = f"copy {EXAMPLE.name} to {CATALOG.name} and edit [cluster]" if EXAMPLE.exists() else f"create {CATALOG}"
+        die(f"missing catalog {CATALOG} — {hint}")
+    with CATALOG.open("rb") as f:
+        return tomllib.load(f)
+
+
+def resolve_model(cfg: dict, name: str) -> tuple[str, dict]:
+    models = cfg.get("models") or {}
+    key = name.strip().lower()
+    if key in models:
+        return key, models[key]
+    for mid, m in models.items():
+        aliases = [a.lower() for a in m.get("aliases") or []]
+        if key in aliases or key == str(m.get("served_name", "")).lower():
+            return mid, m
+    known = ", ".join(sorted(models))
+    die(f"unknown model {name!r}. catalog: {known}")
+
+
+def ssh_cmd(cfg: dict, host: str, remote: str, check: bool = True) -> subprocess.CompletedProcess:
+    opts = list(cfg["cluster"].get("ssh_opts") or ["-o", "BatchMode=yes"])
+    proc = subprocess.run(
+        ["ssh", *opts, host, "bash", "-s"],
+        input=remote,
+        text=True,
+        capture_output=True,
+    )
+    if check and proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip()
+        die(f"{host}: {err or f'exit {proc.returncode}'}")
+    return proc
+
+
+def ssh_out(cfg: dict, host: str, remote: str) -> str:
+    return ssh_cmd(cfg, host, remote).stdout
+
+
+def env_pairs(cfg: dict, model: dict) -> list[tuple[str, str]]:
+    pairs: list[tuple[str, str]] = []
+    for k, v in (cfg["cluster"].get("nccl") or {}).items():
+        pairs.append((str(k), str(v)))
+    for k, v in (model.get("env") or {}).items():
+        pairs.append((str(k), str(v)))
+    return pairs
+
+
+def docker_base(cfg: dict, model: dict, name: str) -> list[str]:
+    cluster = cfg["cluster"]
+    cache = cluster["hf_cache_host"]
+    mount = model.get("hf_mount") or "/cache/huggingface"
+    cmd = [
+        "docker", "run", "-d",
+        "--name", name,
+        "--privileged",
+        "--network", "host",
+        "--ipc", "host",
+        "--shm-size", "10g",
+        "--gpus", "all",
+        "--security-opt", "label=disable",
+        "-v", f"{cache}:{mount}",
+        "--device", "/dev/infiniband",
+        "-w", "/tmp",
+    ]
+    extra = model.get("docker_extra") or []
+    if isinstance(extra, str):
+        extra = shlex.split(extra)
+    cmd.extend(extra)
+    for k, v in env_pairs(cfg, model):
+        cmd.extend(["-e", f"{k}={v}"])
+    return cmd
+
+
+def rank_flags(cfg: dict, rank: int, headless: bool) -> list[str]:
+    c = cfg["cluster"]
+    flags = [
+        "--nnodes", str(c["nnodes"]),
+        "--node-rank", str(rank),
+        "--master-addr", str(c["master_addr"]),
+        "--master-port", str(c["master_port"]),
+        "--distributed-executor-backend", str(c.get("executor") or "mp"),
+    ]
+    if headless:
+        flags.append("--headless")
+    return flags
+
+
+def vllm_args(cfg: dict, model: dict) -> list[str]:
+    block = model.get("vllm") or {}
+    args = [str(a) for a in (block.get("args") or [])]
+    tp = cfg["cluster"].get("tensor_parallel")
+    if tp is not None and "--tensor-parallel-size" not in args:
+        args.extend(["--tensor-parallel-size", str(tp)])
+    return args
+
+
+def inner_argv(cfg: dict, model: dict, rank: int, headless: bool) -> list[str]:
+    wrapper = model.get("wrapper") or "vllm"
+    hf_id = model["hf_id"]
+    args = vllm_args(cfg, model) + rank_flags(cfg, rank, headless)
+    if wrapper == "dsv4":
+        return ["serve", hf_id, *args]
+    if wrapper == "vllm":
+        return [hf_id, *args]
+    die(f"unknown wrapper {wrapper!r} (use dsv4 or vllm)")
+
+
+def docker_run_script(cfg: dict, model: dict, rank: int, headless: bool) -> str:
+    name = cfg["cluster"]["container"]
+    image = model["image"]
+    wrapper = model.get("wrapper") or "vllm"
+    argv = inner_argv(cfg, model, rank, headless)
+    base = docker_base(cfg, model, name)
+    if wrapper == "dsv4":
+        # Image ENTRYPOINT is not `vllm`; wrap the proven dsv4 helper.
+        inner = "exec /usr/local/bin/dsv4-vllm-entrypoint " + " ".join(
+            shlex.quote(a) for a in argv
+        )
+        full = base + [image, "bash", "-lc", inner]
+    else:
+        full = base + [image, *argv]
+    return (
+        "set -euo pipefail\n"
+        + shlex.join(full)
+        + "\n"
+        + f"echo started $(hostname) rank={rank} id=$(docker inspect -f '{{{{.Id}}}}' {name} | cut -c1-12)\n"
+    )
+
+
+def drop_caches(cfg: dict, host: str) -> str:
+    proc = ssh_cmd(
+        cfg,
+        host,
+        'if sudo -n true 2>/dev/null; then sudo -n sh -c "sync; echo 3 > /proc/sys/vm/drop_caches"; echo dropped; else echo skip_no_sudo; fi',
+        check=False,
+    )
+    return (proc.stdout or "").strip() or "skip"
+
+
+def stop_host(cfg: dict, host: str) -> str:
+    names = " ".join(shlex.quote(n) for n in cfg["cluster"]["stop_names"])
+    keep = cfg["cluster"].get("keep_containers") or []
+    keep_pat = "|".join(keep) if keep else "^$"
+    remote = f"""
+set -u
+keep_pat={shlex.quote(keep_pat)}
+for name in {names}; do
+  if echo "$name" | grep -Eq "$keep_pat"; then
+    echo "refusing to stop $name"
+    continue
+  fi
+  docker rm -f "$name" >/dev/null 2>&1 || true
+done
+echo stopped_or_absent
+"""
+    return ssh_out(cfg, host, remote).strip()
+
+
+def catalog_served_names(cfg: dict) -> set[str]:
+    names: set[str] = set()
+    for m in (cfg.get("models") or {}).values():
+        served = str(m.get("served_name") or "").strip()
+        if served:
+            names.add(served)
+    return names
+
+
+def parse_v1_ids(body: str) -> list[str]:
+    if not body or body in ("DOWN",):
+        return []
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        return []
+    ids = []
+    for m in data.get("data") or []:
+        mid = m.get("id")
+        if mid:
+            ids.append(str(mid))
+    return ids
+
+
+def probe_v1(cfg: dict, timeout: int = 5) -> str:
+    url = cfg["cluster"]["lan_url"].rstrip("/") + "/v1/models"
+    return ssh_cmd(
+        cfg,
+        cfg["cluster"]["head"],
+        f"curl -sf --max-time {int(timeout)} {shlex.quote(url)} || true",
+        check=False,
+    ).stdout.strip()
+
+
+def _container_running(state: str) -> bool:
+    st = (state or "").strip().lower()
+    return st == "running" or st.startswith("up")
+
+
+def status_host_json(cfg: dict, host: str) -> list:
+    remote = "docker ps -a --format '{{.Names}}|||{{.State}}|||{{.Image}}'"
+    out = ssh_cmd(cfg, host, remote, check=False).stdout.strip()
+    containers = []
+    for line in out.splitlines():
+        if "|||" not in line:
+            continue
+        parts = line.split("|||")
+        if len(parts) != 3:
+            continue
+        name, state, image = (p.strip() for p in parts)
+        if "vllm" in name.lower():
+            containers.append({
+                "name": name,
+                "state": state,
+                "image": image,
+                "running": _container_running(state),
+            })
+    return containers
+
+
+def collect_status(cfg: dict) -> dict:
+    c = cfg["cluster"]
+    name = str(c.get("container") or "vllm_cluster")
+    nnodes = int(c.get("nnodes") or 1)
+    head_c = status_host_json(cfg, c["head"])
+    worker_c = status_host_json(cfg, c["worker"])
+    body = probe_v1(cfg)
+    ids = parse_v1_ids(body)
+    served = ids[0] if ids else None
+    catalog = catalog_served_names(cfg)
+    in_catalog = bool(served) and served in catalog
+    head_ours = any(x["name"] == name and x["running"] for x in head_c)
+    worker_ours = any(x["name"] == name and x["running"] for x in worker_c)
+    ours_running = head_ours and (worker_ours if nnodes > 1 else True)
+    vllm_running = any(x["running"] for x in head_c + worker_c)
+    port_busy = bool(ids)
+    # Occupant of :8000 that is not our vLLM set is foreign even if the
+    # served id happens to match a catalog name.
+    if port_busy and not vllm_running:
+        foreign = served or "unknown"
+    elif served and not in_catalog:
+        foreign = served
+    else:
+        foreign = None
+    return {
+        "head": c["head"],
+        "worker": c["worker"],
+        "url": c["lan_url"],
+        "head_containers": head_c,
+        "worker_containers": worker_c,
+        "ready": bool(ours_running and in_catalog),
+        "served": served,
+        "foreign_served": foreign,
+        "ours_running": ours_running,
+        "vllm_running": vllm_running,
+        "port_busy": port_busy,
+        "v1_models_raw": body,
+    }
+
+
+def foreign_warning(st: dict) -> str | None:
+    if not st.get("port_busy"):
+        return None
+    if st.get("ours_running") and not st.get("foreign_served"):
+        return None
+    who = st.get("foreign_served") or st.get("served") or "unknown"
+    if st.get("vllm_running"):
+        return None
+    return f":8000 serving {who} (not a spark-serve container)"
+
+
+def cmd_stop(cfg: dict) -> None:
+    print("stopping cluster vLLM (atlas left alone)")
+    c = cfg["cluster"]
+    print(f"  stop {c['head']}: {stop_host(cfg, c['head'])}")
+    print(f"  stop {c['worker']}: {stop_host(cfg, c['worker'])}")
+    warn = foreign_warning(collect_status(cfg))
+    if warn:
+        print(f"warning: {warn}", file=sys.stderr)
+
+
+def cmd_list(cfg: dict) -> None:
+    print(f"{'id':<10} {'aliases':<28} {'served as':<24} {'ctx':>8}  image")
+    for mid, m in cfg["models"].items():
+        aliases = ",".join(m.get("aliases") or [])
+        ctx = m.get("max_model_len") or ""
+        print(f"{mid:<10} {aliases:<28} {m.get('served_name',''):<24} {ctx:>8}  {m['image']}")
+        if m.get("notes"):
+            print(f"           {m['notes']}")
+
+
+def cmd_list_json(cfg: dict) -> None:
+    out = []
+    for mid, m in cfg["models"].items():
+        out.append({
+            "id": mid,
+            "label": m.get("label") or mid,
+            "aliases": list(m.get("aliases") or []),
+            "served_name": m.get("served_name", ""),
+            "ctx": int(m.get("max_model_len") or 0),
+            "image": m.get("image", ""),
+            "notes": m.get("notes", ""),
+            "wrapper": m.get("wrapper", "vllm"),
+            "hermes_provider": m.get("hermes_provider", "spark"),
+        })
+    print(json.dumps(out, indent=2))
+
+
+def cmd_status_json(cfg: dict) -> None:
+    print(json.dumps(collect_status(cfg), indent=2))
+
+
+def status_host(cfg: dict, host: str) -> str:
+    names = " ".join(shlex.quote(n) for n in cfg["cluster"]["stop_names"])
+    remote = f"""
+docker ps -a --format '{{{{.Names}}}} {{{{.Status}}}}' | awk '$1 ~ /vllm/ {{print}}'
+echo ---
+for name in {names}; do
+  docker inspect "$name" --format 'name={{{{.Name}}}} running={{{{.State.Running}}}} image={{{{.Config.Image}}}}' 2>/dev/null && break
+done
+"""
+    return ssh_cmd(cfg, host, remote, check=False).stdout.strip()
+
+
+def cmd_status(cfg: dict) -> None:
+    c = cfg["cluster"]
+    st = collect_status(cfg)
+    print(f"head   {c['head']}  worker {c['worker']}  url {c['lan_url']}")
+    print(f"-- {c['head']} --")
+    print(status_host(cfg, c["head"]) or "(ssh failed)")
+    print(f"-- {c['worker']} --")
+    print(status_host(cfg, c["worker"]) or "(ssh failed)")
+    print("-- /v1/models --")
+    print(st["v1_models_raw"] or "DOWN")
+    if st["ready"]:
+        print(f"ready: {st['served']}")
+    else:
+        print("ready: no")
+    warn = foreign_warning(st)
+    if warn:
+        print(f"warning: {warn}")
+
+
+def cmd_logs(cfg: dict, follow: bool, which: str) -> None:
+    host = cfg["cluster"]["head"] if which != "worker" else cfg["cluster"]["worker"]
+    name = cfg["cluster"]["container"]
+    flag = "-f --tail 80" if follow else "--tail 120"
+    opts = list(cfg["cluster"].get("ssh_opts") or ["-o", "BatchMode=yes"])
+    os.execvp("ssh", ["ssh", *opts, host, f"docker logs {flag} {shlex.quote(name)}"])
+
+
+def wait_models(
+    cfg: dict,
+    timeout: int = 1500,
+    expect_served: str | None = None,
+    on_poll=None,
+) -> tuple[bool, str | None, str]:
+    catalog = catalog_served_names(cfg)
+    t0 = time.time()
+    body = ""
+    while time.time() - t0 < timeout:
+        body = probe_v1(cfg, timeout=4)
+        ids = parse_v1_ids(body)
+        if expect_served:
+            if expect_served in ids:
+                return True, expect_served, body
+        else:
+            hit = next((i for i in ids if i in catalog), None)
+            if hit:
+                return True, hit, body
+        elapsed = int(time.time() - t0)
+        if on_poll:
+            on_poll(elapsed)
+        else:
+            print(f"  waiting for serve ({elapsed}s)…")
+        time.sleep(15)
+    return False, None, body
+
+
+def cmd_wait(cfg: dict) -> None:
+    st = collect_status(cfg)
+    warn = foreign_warning(st)
+    if warn:
+        print(f"note: {warn}; waiting for a catalog model")
+    ok, served, body = wait_models(cfg)
+    if not ok:
+        die("timed out waiting for /v1/models")
+    print(body)
+    print(f"ready: {served}")
+
+
+def _hermes_patch(cfg: dict, mid: str, model: dict, skip: bool) -> tuple[str, bool]:
+    """Return (message, ok). ok=False means the patch did not apply."""
+    if skip:
+        return ("skipped (--no-hermes)", False)
+    path = HERMES_CONFIG
+    if not path.exists():
+        return (f"no {path}, skipped", False)
+    served = model["served_name"]
+    provider = model.get("hermes_provider") or "spark"
+    ctx = int(model.get("hermes_context_length") or model.get("max_model_len") or 0)
+    url = cfg["cluster"]["lan_url"].rstrip("/") + "/v1"
+    py = None
+    for cand in (
+        Path.home() / ".hermes/hermes-agent/venv/bin/python",
+        shutil.which("python3"),
+    ):
+        if cand and Path(cand).exists():
+            py = str(cand)
+            break
+    if not py:
+        return ("no python, skipped", False)
+    # Prefer ruamel.yaml so comments / key order in ~/.hermes/config.yaml survive.
+    # omlx / GLM blocks are never deleted; only spark (+ leftover spark-ds4 url) move.
+    patch = f"""
+import sys
+from pathlib import Path
+p = Path({str(path)!r})
+text = p.read_text()
+engine = None
+yaml_obj = None
+try:
+    from ruamel.yaml import YAML
+    yaml_obj = YAML()
+    yaml_obj.preserve_quotes = True
+    yaml_obj.width = 4096
+    data = yaml_obj.load(text) or {{}}
+    engine = 'ruamel'
+except Exception:
+    try:
+        import yaml as pyyaml
+        data = pyyaml.safe_load(text) or {{}}
+        yaml_obj = pyyaml
+        engine = 'pyyaml'
+    except ImportError:
+        print('NO_YAML')
+        sys.exit(2)
+model = data.setdefault('model', {{}})
+model['default'] = {served!r}
+model['provider'] = {provider!r}
+if {ctx}:
+    model['context_length'] = {ctx}
+providers = data.setdefault('providers', {{}})
+block = providers.setdefault({provider!r}, {{}})
+block['name'] = 'Spark cluster'
+block['api_key'] = block.get('api_key') or 'dummy'
+block['api_mode'] = block.get('api_mode') or 'chat_completions'
+block['base_url'] = {url!r}
+block['default_model'] = {served!r}
+models = block.setdefault('models', {{}})
+models[{served!r}] = {{'context_length': {ctx} or 8192}}
+if 'spark-ds4' in providers and {provider!r} != 'spark-ds4':
+    providers['spark-ds4']['base_url'] = {url!r}
+if engine == 'ruamel':
+    with p.open('w') as f:
+        yaml_obj.dump(data, f)
+else:
+    p.write_text(yaml_obj.safe_dump(data, sort_keys=False, default_flow_style=False))
+print('patched', p, 'via', engine, 'provider', {provider!r}, 'model', {served!r}, 'ctx', {ctx})
+"""
+    proc = subprocess.run([py, "-c", patch], text=True, capture_output=True)
+    msg = (proc.stdout or proc.stderr or "").strip()
+    if proc.returncode != 0:
+        return (f"not patched ({msg or proc.returncode})", False)
+    return (msg, True)
+
+
+def maybe_hermes(cfg: dict, mid: str, model: dict, skip: bool) -> None:
+    msg, _ = _hermes_patch(cfg, mid, model, skip)
+    print(f"hermes: {msg}")
+
+
+def maybe_hermes_json(cfg: dict, mid: str, model: dict, skip: bool) -> str:
+    msg, _ = _hermes_patch(cfg, mid, model, skip)
+    return msg
+
+
+def cmd_pull(cfg: dict, name: str) -> None:
+    mid, model = resolve_model(cfg, name)
+    image = model["image"]
+    hf_id = model["hf_id"]
+    print(f"pull {mid}: image {image}")
+    print(f"pull {mid}: weights {hf_id}")
+    remote = f"""
+set -euo pipefail
+echo "== docker pull {image} =="
+docker pull {shlex.quote(image)}
+echo "== hf download {hf_id} =="
+export HF_HUB_DISABLE_XET=1 HF_HUB_DISABLE_IMPLICIT_TOKEN=1 HF_HUB_ENABLE_HF_TRANSFER=0 HF_TOKEN=
+if command -v hf >/dev/null 2>&1; then
+  HF=hf
+elif [ -x "$HOME/miniconda3/bin/hf" ]; then
+  HF="$HOME/miniconda3/bin/hf"
+elif [ -x "$HOME/.local/bin/hf" ]; then
+  HF="$HOME/.local/bin/hf"
+else
+  echo "no hf CLI"; exit 1
+fi
+"$HF" download {shlex.quote(hf_id)}
+echo DONE
+"""
+    for host in (cfg["cluster"]["worker"], cfg["cluster"]["head"]):
+        print(f"-- {host} --")
+        proc = ssh_cmd(cfg, host, remote, check=False)
+        sys.stdout.write(proc.stdout or "")
+        if proc.returncode != 0:
+            sys.stderr.write(proc.stderr or "")
+            die(f"pull failed on {host}")
+
+
+def _emit(event: str, **fields) -> None:
+    obj = {"event": event}
+    obj.update(fields)
+    print(json.dumps(obj), flush=True)
+
+
+class _Sink:
+    def __init__(self, json_mode: bool):
+        self.json_mode = json_mode
+
+    def event(self, name: str, **fields) -> None:
+        if self.json_mode:
+            _emit(name, **fields)
+            return
+        if name == "start":
+            print(f"up {fields.get('model')} ({fields.get('label')})")
+            print(f"  image  {fields.get('image')}")
+            print(f"  served {fields.get('served')}  ctx {fields.get('ctx')}")
+            print(f"  url    {fields.get('url')}")
+        elif name == "stop":
+            print(f"  stop {fields.get('host')}: {fields.get('output')}")
+        elif name == "drop_caches":
+            print(f"  drop_caches {fields.get('host')}: {fields.get('output')}")
+        elif name == "worker_start":
+            print(f"start worker {fields.get('host')} rank 1")
+            if fields.get("output"):
+                print(fields["output"])
+        elif name == "head_start":
+            print(f"start head {fields.get('host')} rank 0")
+            if fields.get("output"):
+                print(fields["output"])
+        elif name == "hermes":
+            print(f"hermes: {fields.get('detail')}")
+        elif name == "waiting":
+            print("boot takes ~10–25 min (Triton JIT on Qwen is the long one).")
+            print("  spark-serve status")
+            print("  spark-serve logs -f")
+            if fields.get("hermes_hint"):
+                print(f"  hermes  ({fields['hermes_hint']})")
+            print("waiting for /v1/models …")
+        elif name == "poll":
+            print(f"  waiting for serve ({fields.get('elapsed', 0)}s)…")
+        elif name == "ready":
+            if fields.get("body"):
+                print(fields["body"])
+            print("ready")
+        elif name == "launched":
+            print("launched (--no-wait)")
+        elif name == "timeout":
+            die("containers started but /v1/models never came up — spark-serve logs")
+        elif name == "error":
+            die(fields.get("detail") or "error")
+
+    def fail(self, msg: str, code: int = 1) -> None:
+        if self.json_mode:
+            _emit("error", detail=msg)
+        else:
+            print(f"spark-serve: {msg}", file=sys.stderr)
+        raise SystemExit(code)
+
+
+def _bring_up(cfg: dict, name: str, no_hermes: bool, no_wait: bool, sink: _Sink) -> None:
+    mid, model = resolve_model(cfg, name)
+    c = cfg["cluster"]
+    sink.event(
+        "start",
+        model=mid,
+        label=model.get("label") or mid,
+        image=model["image"],
+        served=model["served_name"],
+        ctx=int(model.get("max_model_len") or 0),
+        url=c["lan_url"] + "/v1",
+    )
+    st = collect_status(cfg)
+    if st["port_busy"] and not st["vllm_running"]:
+        who = st["foreign_served"] or st["served"] or "unknown"
+        sink.fail(
+            f":8000 already serving {who} (spark-serve containers not running). "
+            "Stop that process before up."
+        )
+    if not sink.json_mode:
+        print("stopping cluster vLLM (atlas left alone)")
+    for host in (c["head"], c["worker"]):
+        sink.event("stop", host=host, output=stop_host(cfg, host))
+    time.sleep(2)
+    if model.get("drop_caches", True):
+        for host in (c["worker"], c["head"]):
+            sink.event("drop_caches", host=host, output=drop_caches(cfg, host))
+    w = ssh_cmd(cfg, c["worker"], docker_run_script(cfg, model, 1, True), check=False)
+    if w.returncode != 0:
+        sink.fail(f"{c['worker']}: {(w.stderr or w.stdout or '').strip() or f'exit {w.returncode}'}")
+    sink.event("worker_start", host=c["worker"], output=(w.stdout or "").strip())
+    # Give the worker a moment to bind the torch.distributed master port.
+    time.sleep(8)
+    h = ssh_cmd(cfg, c["head"], docker_run_script(cfg, model, 0, False), check=False)
+    if h.returncode != 0:
+        sink.fail(f"{c['head']}: {(h.stderr or h.stdout or '').strip() or f'exit {h.returncode}'}")
+    sink.event("head_start", host=c["head"], output=(h.stdout or "").strip())
+    hermes = maybe_hermes_json(cfg, mid, model, skip=no_hermes)
+    sink.event("hermes", detail=hermes)
+    if no_wait:
+        sink.event("launched")
+        return
+    hint = f"provider {model.get('hermes_provider', 'spark')}, -m {model['served_name']}"
+    sink.event("waiting", hermes_hint=hint)
+    t0 = time.time()
+    ok, served, body = wait_models(
+        cfg,
+        expect_served=model["served_name"],
+        on_poll=lambda elapsed: sink.event("poll", elapsed=elapsed),
+    )
+    if ok:
+        sink.event("ready", served=served, elapsed=int(time.time() - t0), body=body)
+        return
+    sink.event("timeout")
+    if sink.json_mode:
+        raise SystemExit(1)
+
+
+def cmd_up(cfg: dict, name: str, no_hermes: bool, no_wait: bool, json_mode: bool) -> None:
+    _bring_up(cfg, name, no_hermes, no_wait, _Sink(json_mode))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="spark-serve",
+        description="Switch the two-Spark cluster between catalogued vLLM recipes.",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    lst = sub.add_parser("list", help="show catalog")
+    lst.add_argument("--json", action="store_true", help="emit catalog as JSON")
+
+    st = sub.add_parser("status", help="containers + /v1/models")
+    st.add_argument("--json", action="store_true", help="emit status as JSON")
+
+    sub.add_parser("stop", help="stop cluster vLLM, leave atlas")
+    sub.add_parser("wait", help="block until a catalog model answers /v1/models")
+
+    up = sub.add_parser("up", help="stop current serve, start a catalog model")
+    up.add_argument("model")
+    up.add_argument("--no-hermes", action="store_true", help="do not retarget ~/.hermes/config.yaml")
+    up.add_argument("--no-wait", action="store_true", help="do not block on /v1/models")
+    up.add_argument("--json", action="store_true", help="emit JSON-line progress events")
+
+    pull = sub.add_parser("pull", help="docker pull + hf download on both Sparks")
+    pull.add_argument("model")
+
+    logs = sub.add_parser("logs", help="docker logs on head (or worker)")
+    logs.add_argument("-f", "--follow", action="store_true")
+    logs.add_argument("which", nargs="?", default="head", choices=["head", "worker"])
+    return p
+
+
+def main(argv: list[str] | None = None) -> None:
+    global _JSON_MODE
+    args = build_parser().parse_args(argv)
+    cfg = load()
+    if args.cmd == "list":
+        if args.json:
+            cmd_list_json(cfg)
+        else:
+            cmd_list(cfg)
+    elif args.cmd == "status":
+        if args.json:
+            cmd_status_json(cfg)
+        else:
+            cmd_status(cfg)
+    elif args.cmd == "stop":
+        cmd_stop(cfg)
+    elif args.cmd == "wait":
+        cmd_wait(cfg)
+    elif args.cmd == "up":
+        _JSON_MODE = bool(args.json)
+        cmd_up(cfg, args.model, no_hermes=args.no_hermes, no_wait=args.no_wait, json_mode=_JSON_MODE)
+    elif args.cmd == "pull":
+        cmd_pull(cfg, args.model)
+    elif args.cmd == "logs":
+        cmd_logs(cfg, args.follow, args.which)
+    else:
+        die(f"unhandled {args.cmd}")
+
+
+if __name__ == "__main__":
+    main()
