@@ -230,7 +230,10 @@ final class CLIRunner: ObservableObject {
             guard let self else { return }
             let out = self.runRaw(["stop"])
             DispatchQueue.main.async {
-                if !out.isEmpty { self.appendLog(out) }
+                for line in out.split(whereSeparator: \.isNewline) {
+                    let s = String(line).trimmingCharacters(in: .whitespaces)
+                    if !s.isEmpty { self.appendLog(s) }
+                }
                 self.bootState = .idle
             }
             self.refresh()

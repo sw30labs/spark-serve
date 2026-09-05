@@ -94,51 +94,85 @@ args = [
 ]
 
 # ---------------------------------------------------------------------------
-# Model B — Qwen3.8-Flash-Next-FP8 (official vLLM recipe, native 262k)
+# Model B — DeepSeek-V4-Flash-0731 + FlyCockpit vision (Anemll + plugin)
+# Flip with: ./spark-serve up ds4-vision
+# Flip back:  ./spark-serve up ds4
+# Agent contract: thinking false on image turns; see docs/ds4-vision.md
 # ---------------------------------------------------------------------------
-[models.qwen]
-aliases = ["qwen38", "qwen3.8", "qwen3.8-flash-next", "qwen-fp8"]
-label = "Qwen3.8-Flash-Next-FP8"
-image = "vllm/vllm-openai:qwen38-flash-next"
-hf_id = "Qwen/Qwen3.8-Flash-Next-FP8"
-served_name = "qwen3.8-flash-next"
-wrapper = "vllm"  # image ENTRYPOINT is already `vllm serve`
-hf_mount = "/root/.cache/huggingface"
+[models.ds4-vision]
+aliases = ["ds4v", "deepseek-vision", "0731-vision", "flycockpit"]
+label = "DeepSeek-V4-Flash-0731 Vision"
+image = "dsv4-vision-vllm:0.1.1"
+hf_id = "deepseek-ai/DeepSeek-V4-Flash-0731"
+serve_path = "/cache/huggingface/dsv4-0731-vision"
+served_name = "deepseek-v4-flash-0731-vision"
+wrapper = "dsv4-vision"
+hf_mount = "/cache/huggingface"
 drop_caches = true
-gpu_memory_utilization = 0.82
-max_model_len = 262144
-max_num_seqs = 2
+shm_size = "64g"
+gpu_memory_utilization = 0.80
+max_model_len = 131072
+max_num_seqs = 4
 hermes_provider = "spark"
-hermes_context_length = 262144
-notes = "enforce-eager required. No PLE CPU offload with nnodes=2. Do not set kv-cache-dtype fp8."
-docker_extra = ["--cap-add", "SYS_NICE", "--ulimit", "memlock=-1"]
+hermes_context_length = 131072
+host_ip_head = "192.168.100.10"
+host_ip_worker = "192.168.100.11"
+notes = "Requires 0731 weights + FlyCockpit tower/adapter + built dsv4-vision-vllm:0.1.1. Stops text ds4 on same :8000."
 
-[models.qwen.env]
-HF_HOME = "/root/.cache/huggingface"
+[[models.ds4-vision.mounts]]
+head = "/home/spider/REPOS/DeepSeek-V4-Vision-2x-DGX-Sparks/plugin"
+worker = "/home/spider/REPOS/DeepSeek-V4-Vision-2x-DGX-Sparks/plugin"
+container = "/opt/dsv4-vision-plugin"
+
+[[models.ds4-vision.mounts]]
+head = "/home/spider/.cache/huggingface/vision/tower"
+worker = "/home/spider/.cache/huggingface/vision/tower"
+container = "/tower"
+ro = true
+
+[[models.ds4-vision.mounts]]
+head = "/home/spider/.cache/huggingface/vision/adapter"
+worker = "/home/spider/.cache/huggingface/vision/adapter"
+container = "/ckpt"
+ro = true
+
+[models.ds4-vision.env]
+HF_HOME = "/cache/huggingface"
 HF_HUB_OFFLINE = "1"
-HF_HUB_DISABLE_IMPLICIT_TOKEN = "1"
+TRANSFORMERS_OFFLINE = "1"
+VLLM_CACHE_ROOT = "/cache/huggingface/vllm-cache"
 VLLM_ALLOW_LONG_MAX_MODEL_LEN = "1"
+VLLM_USE_B12X_MOE = "1"
+VLLM_SPARSE_INDEXER_MAX_LOGITS_MB = "256"
+VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS = "0"
+VLLM_USE_FLASHINFER_SAMPLER = "1"
+TORCH_CUDA_ARCH_LIST = "12.1a"
+FLASHINFER_CUDA_ARCH_LIST = "12.1a"
+FLASHINFER_DISABLE_VERSION_CHECK = "1"
+DSV4_VISION_TOWER = "/tower/deepencoder_v2_tower.safetensors"
+DSV4_VISION_ADAPTER = "/ckpt/latest.pt"
+NCCL_NVLS_ENABLE = "0"
+PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True"
 
-[models.qwen.vllm]
+[models.ds4-vision.vllm]
 args = [
-  "--served-model-name", "qwen3.8-flash-next",
+  "--served-model-name", "deepseek-v4-flash-0731-vision",
   "--host", "0.0.0.0",
   "--port", "8000",
   "--trust-remote-code",
   "--tensor-parallel-size", "2",
   "--pipeline-parallel-size", "1",
-  "--dtype", "auto",
-  "--kv-cache-dtype", "auto",
-  "--max-model-len", "262144",
-  "--max-num-seqs", "2",
-  "--gpu-memory-utilization", "0.82",
+  "--kv-cache-dtype", "nvfp4_ds_mla",
+  "--block-size", "256",
+  "--max-model-len", "131072",
+  "--max-num-seqs", "4",
+  "--max-num-batched-tokens", "8192",
+  "--gpu-memory-utilization", "0.80",
   "--enforce-eager",
-  "--compilation-config", "{\"mode\":0}",
-  "--enable-prefix-caching",
-  "--enable-chunked-prefill",
-  "--no-enable-flashinfer-autotune",
-  "--speculative-config", "{\"method\":\"mtp\",\"num_speculative_tokens\":3}",
-  "--enable-auto-tool-choice",
-  "--tool-call-parser", "qwen3_xml",
-  "--reasoning-parser", "qwen3",
+  "--limit-mm-per-prompt", "{\"image\":8}",
+  "--tokenizer-mode", "deepseek_v4",
+  "--moe-backend", "flashinfer_b12x",
+  "--generation-config", "vllm",
+  "--trust-request-chat-template",
 ]
+

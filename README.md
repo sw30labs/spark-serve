@@ -24,7 +24,6 @@ cp models.example.toml models.toml   # then edit [cluster]
 ./spark-serve list
 ./spark-serve status
 ./spark-serve up ds4
-./spark-serve up qwen
 ./spark-serve stop
 ./spark-serve logs -f
 ```
@@ -46,13 +45,16 @@ cp models.example.toml models.toml   # then edit [cluster]
 ## Behaviour
 
 `up` stops the previous cluster serve, starts the worker (rank 1, `--headless`)
-then the head (rank 0), and retargets Hermes `spark` at the new served name if
-`~/.hermes/config.yaml` exists. Names in `cluster.keep_containers` are never
-removed. Local oMLX / GLM on the Mac is never touched.
+then the head (rank 0), waits until the recipe is ready, then retargets Hermes
+`spark` at the new served name if `~/.hermes/config.yaml` exists. Names in
+`cluster.keep_containers` are never removed. Local oMLX / GLM on the Mac is
+never touched. Catalog: text `ds4` and vision `ds4-vision` (FlyCockpit 0731). Only one owns `:8000` — see `docs/ds4-vision.md`.
 
-`up` refuses if `:8000` is already serving a process that is **not** a
-spark-serve vLLM container. Stop that process yourself first. `stop` only
-removes the catalogued vLLM names; it warns if `:8000` is still occupied.
+`stop` (and `up`, before it starts a recipe) removes the catalogued vLLM
+names **and** any other docker container on either node whose command binds
+the serve port (sglang, leftover serves). Names in `keep_containers` are
+never removed. If something still answers on `:8000` after that (bare
+process, not docker), `stop` prints a note — that is not a failed stop.
 
 `status` is ready only when the catalog containers are running **and**
 `/v1/models` matches a catalogued `served_name`. JSON also reports
