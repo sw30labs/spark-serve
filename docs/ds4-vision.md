@@ -44,3 +44,7 @@ curl -sS http://192.168.86.44:8000/v1/chat/completions \
 ```
 
 Playbook upstream: https://github.com/FlyCockpit/DeepSeek-V4-Vision-2x-DGX-Sparks
+
+## Hermes / tools
+
+Vision recipe includes `--enable-auto-tool-choice` and `--tool-call-parser deepseek_v4` (same as text ds4) so Hermes `tool_choice=auto` works. Restart with `./spark-serve up ds4-vision` after changing `models.toml`.
