@@ -159,8 +159,9 @@ def docker_base(cfg: dict, model: dict, name: str, rank: int = 0) -> list[str]:
 def rank_flags(cfg: dict, rank: int, headless: bool, model: dict | None = None) -> list[str]:
     c = cfg["cluster"]
     m = model or {}
+    nnodes = int(m.get("nnodes") or c["nnodes"])
     flags = [
-        "--nnodes", str(c["nnodes"]),
+        "--nnodes", str(nnodes),
         "--node-rank", str(rank),
         "--master-addr", str(m.get("master_addr") or c["master_addr"]),
         "--master-port", str(m.get("master_port") or c["master_port"]),
@@ -174,7 +175,10 @@ def rank_flags(cfg: dict, rank: int, headless: bool, model: dict | None = None) 
 def vllm_args(cfg: dict, model: dict) -> list[str]:
     block = model.get("vllm") or {}
     args = [str(a) for a in (block.get("args") or [])]
-    tp = cfg["cluster"].get("tensor_parallel")
+    # Prefer per-model tensor_parallel when injecting the default flag.
+    tp = model.get("tensor_parallel")
+    if tp is None:
+        tp = cfg["cluster"].get("tensor_parallel")
     if tp is not None and "--tensor-parallel-size" not in args:
         args.extend(["--tensor-parallel-size", str(tp)])
     return args
@@ -369,6 +373,9 @@ def collect_status(cfg: dict) -> dict:
     head_ours = any(is_ours(x) for x in head_c)
     worker_ours = any(is_ours(x) for x in worker_c)
     ours_running = head_ours and (worker_ours if nnodes > 1 else True)
+    # Solo recipes (model nnodes=1) only occupy head; cluster.nnodes may still be 2.
+    if head_ours and not worker_ours and in_catalog:
+        ours_running = True
     vllm_running = any(x["running"] for x in head_c + worker_c)
     port_busy = bool(ids)
     # Occupant of :8000 that is not our vLLM set is foreign even if the
@@ -788,11 +795,12 @@ def _bring_up(
 ) -> None:
     mid, model = resolve_model(cfg, name)
     c = cfg["cluster"]
+    nnodes = int(model.get("nnodes") or c["nnodes"])
     if print_cmd:
-        for rank, headless, label in (
-            (0, False, "head/rank0"),
-            (1, True, "worker/rank1"),
-        ):
+        ranks = [(0, False, "head/rank0")]
+        if nnodes > 1:
+            ranks.append((1, True, "worker/rank1"))
+        for rank, headless, label in ranks:
             print(f"===== {label} name={container_name(cfg, model)} =====")
             print(docker_run_script(cfg, model, rank, headless), end="")
         return
@@ -804,6 +812,7 @@ def _bring_up(
         served=model["served_name"],
         ctx=int(model.get("max_model_len") or 0),
         url=c["lan_url"] + "/v1",
+        nnodes=nnodes,
     )
     if not sink.json_mode:
         print("stopping cluster serve (keep_containers left alone)")
@@ -818,14 +827,18 @@ def _bring_up(
             "(not a docker container we could remove)"
         )
     if model.get("drop_caches", True):
-        for host in (c["worker"], c["head"]):
+        hosts = (c["head"],) if nnodes == 1 else (c["worker"], c["head"])
+        for host in hosts:
             sink.event("drop_caches", host=host, output=drop_caches(cfg, host))
-    w = ssh_cmd(cfg, c["worker"], docker_run_script(cfg, model, 1, True), check=False)
-    if w.returncode != 0:
-        sink.fail(f"{c['worker']}: {(w.stderr or w.stdout or '').strip() or f'exit {w.returncode}'}")
-    sink.event("worker_start", host=c["worker"], output=(w.stdout or "").strip())
-    # Give the worker a moment to bind the torch.distributed master port.
-    time.sleep(8)
+    if nnodes > 1:
+        w = ssh_cmd(cfg, c["worker"], docker_run_script(cfg, model, 1, True), check=False)
+        if w.returncode != 0:
+            sink.fail(f"{c['worker']}: {(w.stderr or w.stdout or '').strip() or f'exit {w.returncode}'}")
+        sink.event("worker_start", host=c["worker"], output=(w.stdout or "").strip())
+        # Give the worker a moment to bind the torch.distributed master port.
+        time.sleep(8)
+    else:
+        sink.event("worker_start", host=c["worker"], output="skipped (model nnodes=1)")
     h = ssh_cmd(cfg, c["head"], docker_run_script(cfg, model, 0, False), check=False)
     if h.returncode != 0:
         sink.fail(f"{c['head']}: {(h.stderr or h.stdout or '').strip() or f'exit {h.returncode}'}")

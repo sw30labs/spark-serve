@@ -176,3 +176,52 @@ args = [
   "--trust-request-chat-template",
 ]
 
+
+# ---------------------------------------------------------------------------
+# Model C — Nemotron-3-Super-120B NVFP4 (NVIDIA single-Spark recipe)
+# Solo on sparkone: nnodes=1, TP=1. Do NOT default to TP=2.
+# Flip with: ./spark-serve up nemotron-super
+# Flip back:  ./spark-serve up ds4   (or ds4-vision)
+# Playbook: docs/nemotron-super.md
+# ---------------------------------------------------------------------------
+[models.nemotron-super]
+aliases = ["nemotron-super", "nemotron3-super", "n3s"]
+label = "Nemotron-3-Super-120B NVFP4"
+image = "vllm/vllm-openai:cu130-nightly"
+hf_id = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
+served_name = "nemotron-3-super"
+wrapper = "vllm"
+nnodes = 1
+tensor_parallel = 1
+drop_caches = true
+max_model_len = 262144
+hermes_provider = "spark"
+hermes_context_length = 262144
+notes = "NVIDIA single-Spark NVFP4 recipe. Solo on sparkone (nnodes=1, TP=1). Not Aiden DS4 image. Hunt local caches before Hub pull; rsync to sparktwo only if you later switch to TP=2."
+
+[models.nemotron-super.env]
+HF_HOME = "/cache/huggingface"
+HF_HUB_OFFLINE = "1"
+VLLM_CACHE_ROOT = "/cache/huggingface/vllm-cache"
+VLLM_NVFP4_GEMM_BACKEND = "marlin"
+VLLM_ALLOW_LONG_MAX_MODEL_LEN = "1"
+VLLM_FLASHINFER_ALLREDUCE_BACKEND = "trtllm"
+VLLM_USE_FLASHINFER_MOE_FP4 = "0"
+
+[models.nemotron-super.vllm]
+# Flags after `<hf_id>`. Rank/master are injected by the CLI (nnodes=1 → no worker).
+args = [
+  "--served-model-name", "nemotron-3-super",
+  "--host", "0.0.0.0",
+  "--port", "8000",
+  "--trust-remote-code",
+  "--dtype", "auto",
+  "--quantization", "fp4",
+  "--moe-backend", "marlin",
+  "--tensor-parallel-size", "1",
+  "--max-model-len", "262144",
+  "--gpu-memory-utilization", "0.90",
+  "--kv-cache-dtype", "fp8",
+  "--enable-auto-tool-choice",
+  "--tool-call-parser", "hermes",
+]
