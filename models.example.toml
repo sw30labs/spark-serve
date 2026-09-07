@@ -20,6 +20,16 @@ ssh_opts = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=8"]
 keep_containers = []
 stop_names = ["vllm_cluster"]
 
+# Independent YuE song/take workers (requires Artist Twin protocol-v2 factory).
+# Host names here must resolve from the Mac; SSH aliases need not resolve in HTTP.
+[yue]
+head_url = "http://spark-head.lan:8011"
+worker_url = "http://spark-worker.lan:8011"
+service = "yue-icl.service"
+factory_root = "~/.local/share/artist-twin/yue-factory"
+port = 8011
+ready_timeout = 180
+
 [cluster.nccl]
 # Right-port QSFP rails (enp1s0f1 / enP2p1s0f1). Do not switch back to f0.
 NCCL_IB_DISABLE = "0"

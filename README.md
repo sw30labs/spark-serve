@@ -1,7 +1,7 @@
 # spark-serve
 
-Mac CLI + SwiftUI helper that remotely switches which catalogued vLLM model a
-two-node [NVIDIA DGX Spark](https://www.nvidia.com/en-us/products/workstations/dgx-spark/)
+Mac CLI + SwiftUI helper that switches between catalogued vLLM models and
+independent YuE song workers on a two-node [NVIDIA DGX Spark](https://www.nvidia.com/en-us/products/workstations/dgx-spark/)
 cluster is serving.
 
 **This is not how you set up a cluster.** Cabling, ConnectX-7 / QSFP, pairing
@@ -9,10 +9,11 @@ the Sparks, SSH, and the fabric are NVIDIA's docs, not this repo. Start at the
 [DGX Spark user guide](https://docs.nvidia.com/dgx/dgx-spark/)
 ([system configuration and clustering](https://docs.nvidia.com/dgx/dgx-spark/system-config-and-operation.html)).
 This project assumes that cluster already exists and the Mac can SSH to both
-nodes. It only starts, stops, and swaps the vLLM recipe on the live endpoint.
+nodes. It controls workload ownership and starts, drains, stops, and swaps the
+serving backend.
 
 The live OpenAI-compatible endpoint stays on the head node's LAN port 8000.
-All SSH / docker / NCCL work lives in the Python CLI. The GUI is a thin
+YuE uses one HTTP worker per Spark on port 8011. All SSH / Docker / NCCL work lives in the Python CLI. The GUI is a thin
 `Process` wrapper around that CLI.
 
 <p align="center">
@@ -44,21 +45,89 @@ cp models.example.toml models.toml   # then edit [cluster]
 
 ## Behaviour
 
-`up` stops the previous cluster serve, starts the worker (rank 1, `--headless`)
-then the head (rank 0), waits until the recipe is ready, then retargets Hermes
-`spark` at the new served name if `~/.hermes/config.yaml` exists. Names in
-`cluster.keep_containers` are never removed. Local oMLX / GLM on the Mac is
-never touched. Catalog: text `ds4` and vision `ds4-vision` (FlyCockpit 0731). Only one owns `:8000` — see `docs/ds4-vision.md`.
+`up ds4` / `up ds4-vision` drain YuE jobs, stop the previous workload, verify
+both GPUs are free, start the worker (rank 1, `--headless`) and head (rank 0),
+then retarget Hermes after readiness. Single-node recipes such as
+`nemotron-super` preserve their `nnodes=1` and TP=1 settings.
 
-`stop` (and `up`, before it starts a recipe) removes the catalogued vLLM
-names **and** any other docker container on either node whose command binds
-the serve port (sglang, leftover serves). Names in `keep_containers` are
-never removed. If something still answers on `:8000` after that (bare
-process, not docker), `stop` prints a note — that is not a failed stop.
+`up yue` starts two **independent** workers. Each can render a different song or
+take. This uses the existing SSH hosts and Mac app, while YuE keeps its own
+inference pipeline and does not inject NCCL settings or change Hermes.
 
-`status` is ready only when the catalog containers are running **and**
-`/v1/models` matches a catalogued `served_name`. JSON also reports
-`foreign_served`, `ours_running`, `vllm_running`, and `port_busy`.
+Every `up` and `stop` uses the same process lock and atomically persisted state
+in `~/.local/state/spark-serve` (`SPARK_SERVE_STATE_DIR` overrides it). Discovery
+is revoked before draining. Active renders keep running: the command reports
+their job IDs and exits without starting a conflicting workload. Retry after
+completion, or explicitly use `--cancel-jobs`. A failed/interrupted transition
+stays visible and the next command reconciles both nodes before starting anything.
+Each node also keeps a generation lock in `~/.local/state/spark-serve`; delayed SSH
+commands for an older transition cannot admit a worker or launch a model after a
+new transition starts. Commands hold that lock through their side effects,
+including when a parent process is interrupted.
+
+Only exact catalog-owned Docker IDs are stopped. `keep_containers` are retained,
+including when accidentally listed in `stop_names`. Unreachable hosts, untracked
+GPU containers, or remaining host compute processes block a mode switch. Stop
+foreign workloads separately; Spark Serve does not claim ownership from a name
+prefix or a port number.
+
+`status --json` retains vLLM fields and adds `mode`, `phase`, `transition_error`,
+`yue_workers`, and `ready_workers`. Distributed vLLM readiness requires the expected
+container on **both** nodes plus the expected served ID; a head-only response is
+sufficient only for an explicitly single-node recipe. YuE readiness requires the
+same worker identity and generation from control and HTTP, validated pinned assets,
+CUDA, and admission. HTTP 200 alone is insufficient.
+
+### Install the YuE workers
+
+Install Artist Twin's protocol-v2 factory and pinned runtime/assets on each Spark
+using its `scripts/spark` deployment instructions. The service must start drained;
+do not enable autonomous admission or run the old v1 factory. This CLI checks the
+source protocol marker before invoking controls, so an old script cannot mistake
+`control status` for a request to start another server.
+
+After copying the final factory payload and creating its systemd service, run
+`control manifest` on each Spark with that service's environment. This inventories
+the pinned weights, tokenizers, codecs, source, factory files, and Docker image.
+`up yue` checks those assets and performs a CUDA/import probe before admission.
+The factory must be upgraded on both nodes before switching to or from YuE.
+
+Optionally add this **top-level** section to the private `models.toml`:
+
+```toml
+[yue]
+head_url = "http://spark-head.lan:8011"
+worker_url = "http://spark-worker.lan:8011"
+# service = "yue-icl.service"
+# factory_root = "~/.local/share/artist-twin/yue-factory"
+# port = 8011
+# ready_timeout = 180
+```
+
+Use LAN names/addresses resolvable from the Mac; SSH aliases alone need not be DNS
+names. The default head URL reuses the host from `cluster.lan_url`; the worker URL
+defaults to the configured SSH worker name. Unknown `[yue]` keys fail closed.
+Credentials belong in environment variables, never the catalog or discovery.
+
+```sh
+./spark-serve up yue
+./spark-serve status --json
+./spark-serve stop                 # drain; blocks if a render is active
+./spark-serve stop --cancel-jobs   # explicit cancellation and verified cleanup
+./spark-serve up ds4              # drain YuE, release GPUs, start DeepSeek
+```
+
+Artist Twin reads the atomic public file
+`~/.local/state/spark-serve/yue-workers.json`, not this private model catalog.
+Its schema is `{version:1, mode:"yue", generation, workers:[{id,url,generation,
+runtime_manifest}]}`. An unavailable mode publishes an empty worker list.
+Worker IDs come from each factory's durable identity, not the SSH alias. Artist
+Twin owns durable job/take dispatch, rights checks, seeds, downloads, and provenance.
+Rebooted workers start drained and require `up yue` to validate and re-admit them.
+
+Two workers improve throughput under load; they do not split a single song across
+the fabric. Each factory still loads the model pipeline for each render. Single-song
+latency and aggregate speedup need measurement on the installed Sparks.
 
 Add a model by copying a `[models.<id>]` table. `wrapper = "vllm"` for a stock
 `vllm/vllm-openai:*` image (ENTRYPOINT already `vllm serve`). `wrapper = "dsv4"`
@@ -73,7 +142,10 @@ NCCL / UCX in the example catalog are pinned to the right-port QSFP rails
 ## GUI
 
 Menu-bar + window app. It shells out to this CLI (`list` / `status` / `up` /
-`stop --json`); it does not speak SSH itself.
+`stop`); it does not speak SSH itself. The YuE card and per-worker status show
+readiness, draining, and active work. The regular Stop preserves active renders;
+“Cancel jobs & stop” is a separate confirmed action. It never kills a running CLI
+transition merely to launch another one.
 
 ```
 make -C gui
@@ -85,3 +157,14 @@ or `SPARK_SERVE_HOME`. The app's `PATH` includes `~/miniconda3/bin` so the
 `python3` shebang works under a GUI environment.
 
 Requires Command Line Tools (`swiftc`); full Xcode is not needed.
+
+## Offline verification
+
+```sh
+python3 -m unittest discover -s tests -v
+```
+
+Fault-injection tests cover concurrent controllers, lost/offline ownership,
+legacy migration, active-job draining, explicit cancellation, stale generations,
+misrouted health, partial starts, exact-container cleanup, protected services,
+and preservation of single-node/distributed vLLM recipes. They use no network or GPU.

@@ -14,6 +14,18 @@ struct ModelEntry: Identifiable, Codable {
     let notes: String
     let wrapper: String
     let hermes_provider: String
+    let backend: String?
+    let topology: String?
+}
+
+struct YueWorker: Codable, Identifiable {
+    var id: String { host }
+    let host: String
+    let url: String
+    let ready: Bool
+    let accepting: Bool
+    let busy: Bool
+    let error: String?
 }
 
 struct Container: Codable {
@@ -36,6 +48,13 @@ struct ClusterStatus: Codable {
     let vllm_running: Bool
     let port_busy: Bool
     let v1_models_raw: String
+    let mode: String?
+    let phase: String?
+    let target: String?
+    let yue_workers: [YueWorker]?
+    let ready_workers: Int?
+    let total_workers: Int?
+    let transition_error: String?
 }
 
 enum BootState {
@@ -91,6 +110,7 @@ final class CLIRunner: ObservableObject {
     @Published var models: [ModelEntry] = []
     @Published var bootState: BootState = .idle
     @Published var logLines: [String] = []
+    @Published private var isStopping = false
 
     private let home: URL?
     private let cliPath: String
@@ -100,33 +120,77 @@ final class CLIRunner: ObservableObject {
     private var lastDecodeError: String?
 
     var isBusy: Bool {
+        if isStopping { return true }
         switch bootState {
         case .launching, .booting: return true
         default: return false
         }
     }
 
+    var activeYueWorkers: [YueWorker] {
+        status?.yue_workers?.filter { $0.busy } ?? []
+    }
+
+    private var yueIsDraining: Bool {
+        activeYueWorkers.contains { !$0.accepting }
+    }
+
+    private var transitionIsBlocked: Bool {
+        status?.phase == "failed"
+    }
+
+    var transitionNote: String? {
+        guard transitionIsBlocked else { return nil }
+        let target = status?.target == "none" ? "stop" : "switch to \(status?.target ?? "the requested workload")"
+        if yueIsDraining {
+            return "The \(target) is blocked while YuE finishes active renders. Retry when they finish."
+        }
+        return status?.transition_error ?? "The \(target) needs attention."
+    }
+
     var badgeColor: Color {
+        if isBusy || yueIsDraining { return .orange }
+        if transitionIsBlocked { return .red }
         switch bootState {
         case .ready: return .green
         case .booting, .launching: return .orange
         case .failed: return .red
         case .idle:
             if status?.ready == true { return .green }
-            if status?.foreign_served != nil { return .orange }
+            if !activeYueWorkers.isEmpty || status?.foreign_served != nil { return .orange }
             return .gray
         }
     }
 
     var badgeText: String {
+        if isStopping { return "draining / stopping" }
+        switch bootState {
+        case .booting(_, let elapsed): return "booting (\(elapsed)s)"
+        case .launching(let model): return "starting \(model)…"
+        default: break
+        }
+        if yueIsDraining {
+            return "YuE draining · \(activeYueWorkers.count) active"
+        }
+        if transitionIsBlocked {
+            return activeYueWorkers.isEmpty ? "Switch blocked" : "YuE rendering · switch blocked"
+        }
+        if status?.mode == "yue", status?.phase == "ready" {
+            let ready = status?.ready_workers ?? 0
+            let total = status?.total_workers ?? 2
+            return "YuE \(ready)/\(total) ready · \(activeYueWorkers.count) busy"
+        }
+        if !activeYueWorkers.isEmpty {
+            return "YuE rendering · \(activeYueWorkers.count) active"
+        }
         switch bootState {
         case .ready(_, let served): return "serving \(served ?? "")"
         case .booting(_, let elapsed): return "booting (\(elapsed)s)"
-        case .launching(let m): return "starting \(m)…"
-        case .failed(let msg): return msg
+        case .launching(let model): return "starting \(model)…"
+        case .failed(let message): return message
         case .idle:
-            if let s = status, s.ready {
-                return "serving \(s.served ?? "")"
+            if let status, status.ready {
+                return "serving \(status.served ?? "")"
             }
             if let foreign = status?.foreign_served {
                 return "foreign: \(foreign)"
@@ -220,23 +284,26 @@ final class CLIRunner: ObservableObject {
         }
     }
 
-    func stop() {
-        appendLog("$ spark-serve stop")
-        if let proc = upProcess, proc.isRunning {
-            proc.terminate()
-            upProcess = nil
+    func stop(cancelJobs: Bool = false) {
+        guard !isBusy else {
+            appendLog("A mode transition is already running. Wait for it to finish before stopping.")
+            return
         }
+        let args = cancelJobs ? ["stop", "--cancel-jobs"] : ["stop"]
+        appendLog("$ spark-serve \(args.joined(separator: " "))")
+        isStopping = true
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
-            let out = self.runRaw(["stop"])
+            let (out, code) = self.runResult(args)
             DispatchQueue.main.async {
                 for line in out.split(whereSeparator: \.isNewline) {
                     let s = String(line).trimmingCharacters(in: .whitespaces)
                     if !s.isEmpty { self.appendLog(s) }
                 }
-                self.bootState = .idle
+                self.isStopping = false
+                self.bootState = code == 0 ? .idle : .failed(message: "Stop needs attention; see log")
+                self.refresh()
             }
-            self.refresh()
         }
     }
 
@@ -330,7 +397,9 @@ final class CLIRunner: ObservableObject {
                 appendLog("  drop_caches \(host): \(obj["output"] as? String ?? "")")
             }
         case "worker_start":
-            appendLog("  worker started")
+            appendLog("  worker started: \(obj["host"] as? String ?? "")")
+        case "worker_ready":
+            appendLog("  YuE worker ready: \(obj["host"] as? String ?? "") (\(jsonInt(obj, "ready_workers") ?? 0)/\(jsonInt(obj, "total_workers") ?? 2))")
         case "head_start":
             appendLog("  head started")
         case "hermes":
@@ -339,7 +408,7 @@ final class CLIRunner: ObservableObject {
             }
         case "waiting":
             bootState = .booting(model: model, elapsed: 0)
-            appendLog("  waiting for /v1/models …")
+            appendLog("  waiting for \(obj["ready_path"] as? String ?? "runtime readiness") …")
         case "poll":
             if let elapsed = jsonInt(obj, "elapsed") {
                 bootState = .booting(model: model, elapsed: elapsed)
@@ -349,7 +418,7 @@ final class CLIRunner: ObservableObject {
             bootState = .ready(model: model, served: served)
             appendLog("  ready — serving \(served)")
         case "timeout":
-            bootState = .failed(message: "Timed out waiting for /v1/models")
+            bootState = .failed(message: "Timed out waiting for runtime readiness")
             appendLog("  timeout")
         case "error":
             let detail = obj["detail"] as? String ?? "error"
@@ -404,14 +473,18 @@ final class CLIRunner: ObservableObject {
 
     @discardableResult
     private func runRaw(_ args: [String]) -> String {
+        return runResult(args).0
+    }
+
+    private func runResult(_ args: [String]) -> (String, Int32) {
         let process = makeProcess(args)
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = pipe
-        do { try process.run() } catch { return "error: \(error.localizedDescription)" }
+        do { try process.run() } catch { return ("error: \(error.localizedDescription)", -1) }
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
-        return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .newlines) ?? ""
+        return (String(data: data, encoding: .utf8)?.trimmingCharacters(in: .newlines) ?? "", process.terminationStatus)
     }
 }
 
@@ -503,7 +576,7 @@ struct MenuBarView: View {
                     HStack {
                         Text("↑ \(m.label)")
                         Spacer()
-                        Text(fmtCtx(m.ctx))
+                        Text(m.backend == "yue" ? "2 workers" : fmtCtx(m.ctx))
                             .foregroundStyle(.secondary)
                             .font(.caption)
                     }
@@ -553,6 +626,7 @@ struct MainView: View {
     @EnvironmentObject var runner: CLIRunner
     @State private var selectedModel: String?
     @State private var showNotes = true
+    @State private var confirmCancelJobs = false
 
     var body: some View {
         VStack(spacing: 12) {
@@ -560,10 +634,29 @@ struct MainView: View {
             Divider()
             modelPicker
             controls
+            if let workers = runner.status?.yue_workers, runner.status?.mode == "yue" || workers.contains(where: { $0.busy || $0.accepting || $0.error != nil }) {
+                HStack(alignment: .top, spacing: 12) {
+                    ForEach(workers) { worker in
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("\(worker.host): \(worker.busy ? "rendering" : worker.ready ? "ready" : worker.accepting ? "validating" : "drained")")
+                                .font(.caption.weight(.medium))
+                            if let error = worker.error {
+                                Text(error).font(.caption2).foregroundStyle(.orange).lineLimit(2)
+                            }
+                        }
+                    }
+                }
+            }
             Divider()
             logView
         }
         .padding(16)
+        .confirmationDialog("Cancel active YuE renders and stop?", isPresented: $confirmCancelJobs) {
+            Button("Cancel renders and stop", role: .destructive) { runner.stop(cancelJobs: true) }
+            Button("Keep rendering", role: .cancel) { }
+        } message: {
+            Text("Active renders will end. Completed results are retained.")
+        }
         .onAppear {
             if selectedModel == nil {
                 selectedModel = runner.models.first?.id
@@ -585,6 +678,12 @@ struct MainView: View {
                     Text("\(s.head) + \(s.worker)  ·  \(s.url)")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                }
+                if let note = runner.transitionNote {
+                    Text(note)
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .lineLimit(2)
                 }
                 if let foreign = runner.status?.foreign_served, runner.status?.ready != true {
                     Text("foreign on :8000: \(foreign)")
@@ -608,6 +707,7 @@ struct MainView: View {
     }
 
     private var isCurrentModel: String? {
+        if !runner.activeYueWorkers.isEmpty { return "yue" }
         switch runner.bootState {
         case .ready(let m, _): return m
         case .booting(let m, _): return m
@@ -650,6 +750,13 @@ struct MainView: View {
             }
             .buttonStyle(.bordered)
             .tint(.red)
+            .disabled(runner.isBusy)
+
+            if runner.status?.yue_workers?.contains(where: { $0.busy }) == true {
+                Button("Cancel jobs & stop") { confirmCancelJobs = true }
+                    .buttonStyle(.bordered)
+                    .disabled(runner.isBusy)
+            }
 
             Button("Refresh") {
                 runner.refresh()
@@ -706,7 +813,7 @@ struct ModelCard: View {
                         .font(.caption)
                 }
             }
-            Text("served: \(model.served_name)")
+            Text(model.backend == "yue" ? "Artist Twin song / take queue" : "served: \(model.served_name)")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             HStack(spacing: 8) {
@@ -737,6 +844,7 @@ struct ModelCard: View {
     }
 
     private var ctxLabel: String {
+        if model.backend == "yue" { return "2 independent workers" }
         if model.ctx >= 1_048_576 { return "1M ctx" }
         if model.ctx >= 262_144 { return "262k ctx" }
         return "\(model.ctx / 1024)k ctx"
