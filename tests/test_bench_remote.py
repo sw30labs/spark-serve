@@ -77,6 +77,7 @@ def remote_case(tmp_path, monkeypatch):
         jobs_per_level=6, iterations=2, warmup=1, cooldown=5, timeout=90, wait_idle=120, seed=42,
         telemetry_interval=1, factory_root=Path('~/.local/share/artist-twin/yue-factory'),
         service='yue-icl.service', min_free_gb=12, max_temperature_c=85, max_swap_growth_gb=1,
+        min_temperature_margin_c=5,
         worker='worker-a', synthetic=False)
     return SimpleNamespace(args=args, state=state, package=package, assets=assets, workload=workload)
 
@@ -129,7 +130,7 @@ def test_deploys_only_owned_source_and_explicit_references_under_real_lock(remot
     assert options['--endpoint'] == 'http://spark-a.lan:8011'
     for name in ('concurrency', 'jobs_per_level', 'iterations', 'warmup', 'cooldown', 'timeout',
                  'wait_idle', 'seed', 'telemetry_interval', 'factory_root', 'service', 'min_free_gb',
-                 'max_temperature_c', 'max_swap_growth_gb', 'worker'):
+                 'max_temperature_c', 'min_temperature_margin_c', 'max_swap_growth_gb', 'worker'):
         assert options['--' + name.replace('_', '-')] == str(getattr(case.args, name))
     assert options['--output'].startswith('/home/bench/.local/share/spark-serve/benchmarks/bench-')
     assert options['--output'].endswith('/results')

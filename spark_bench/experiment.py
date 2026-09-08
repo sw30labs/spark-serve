@@ -152,7 +152,7 @@ def jobs_for_trial(workload, *, count, seed, run_id, trial_id, concurrency, warm
 
 
 def execute_trial(root, jobs, runner, *, concurrency, stop_event, telemetry_interval=2, synthetic=False,
-                  min_free_gb=12, max_temperature_c=85, max_swap_growth_gb=1):
+                  min_free_gb=12, max_temperature_c=85, max_swap_growth_gb=1, min_temperature_margin_c=5):
     from .telemetry import TelemetryCollector, TelemetrySampler
     root.mkdir(parents=True)
     start = time.time()
@@ -185,6 +185,8 @@ def execute_trial(root, jobs, runner, *, concurrency, stop_event, telemetry_inte
                         baseline_swap = swap
                     temperatures = [gpu.get('temperature_gpu_c') for gpu in sample.get('gpus', [])]
                     temperatures = [value for value in temperatures if isinstance(value, (int, float))]
+                    margins = [gpu.get('temperature_tlimit_c') for gpu in sample.get('gpus', [])]
+                    margins = [value for value in margins if isinstance(value, (int, float)) and math.isfinite(value)]
                     reason = None
                     if available is None:
                         reason = 'Unified memory telemetry unavailable; cannot safely increase load'
@@ -194,6 +196,8 @@ def execute_trial(root, jobs, runner, *, concurrency, stop_event, telemetry_inte
                         reason = 'Available unified memory below configured reserve'
                     elif temperatures and max(temperatures) >= max_temperature_c:
                         reason = 'GPU temperature exceeded configured guard'
+                    elif margins and min(margins) <= min_temperature_margin_c:
+                        reason = 'GPU thermal headroom reached configured minimum'
                     elif swap is not None and baseline_swap is not None and swap - baseline_swap > max_swap_growth_gb * 1024**3:
                         reason = 'Swap growth exceeded configured guard'
                     if reason:
@@ -251,6 +255,8 @@ def run_experiment(args):
             raise ValueError(key + ' must be finite and positive')
     if not math.isfinite(args.cooldown) or args.cooldown < 0:
         raise ValueError('cooldown must be finite and nonnegative')
+    if not math.isfinite(args.min_temperature_margin_c) or args.min_temperature_margin_c < 0:
+        raise ValueError('min_temperature_margin_c must be finite and nonnegative')
     workload = load_workload(args.workload, synthetic=args.synthetic)
     root = args.output.expanduser().resolve()
     root.mkdir(parents=True, exist_ok=False)
@@ -268,6 +274,7 @@ def run_experiment(args):
                 'order': list(trial_order(levels, args.iterations)), 'started_at': time.time(),
                 'status': 'preparing', 'network_topology_changed': False,
                 'guards': {'min_free_gb': args.min_free_gb, 'max_temperature_c': args.max_temperature_c,
+                           'min_temperature_margin_c': args.min_temperature_margin_c,
                            'max_swap_growth_gb': args.max_swap_growth_gb}}
     write_json(root / 'run-metadata.json', metadata)
     stop = threading.Event()
@@ -305,7 +312,8 @@ def run_experiment(args):
             execute_trial(root / 'trials' / trial_id, trial_jobs, runner, concurrency=concurrency,
                           stop_event=stop, synthetic=args.synthetic, telemetry_interval=args.telemetry_interval,
                           min_free_gb=args.min_free_gb, max_temperature_c=args.max_temperature_c,
-                          max_swap_growth_gb=args.max_swap_growth_gb)
+                          max_swap_growth_gb=args.max_swap_growth_gb,
+                          min_temperature_margin_c=args.min_temperature_margin_c)
             analyze(root)
             if args.cooldown and not stop.is_set():
                 stop.wait(args.cooldown)

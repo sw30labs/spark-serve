@@ -92,6 +92,7 @@ print(root)
                        '--telemetry-interval', str(args.telemetry_interval),
                        '--factory-root', str(args.factory_root), '--service', args.service,
                        '--min-free-gb', str(args.min_free_gb), '--max-temperature-c', str(args.max_temperature_c),
+                       '--min-temperature-margin-c', str(args.min_temperature_margin_c),
                        '--max-swap-growth-gb', str(args.max_swap_growth_gb)]
         if args.worker:
             remote_args += ['--worker', args.worker]

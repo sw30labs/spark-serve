@@ -106,6 +106,27 @@ def test_cuda_oom_halts_sweep_and_records_unlaunched_jobs(tmp_path, monkeypatch)
     assert [row['status'] for row in results] == ['failed', 'cancelled', 'cancelled']
 
 
+@pytest.mark.parametrize('headroom,should_stop', [(None, False), (6, False), (5, True), (-1, True)])
+def test_thermal_headroom_stops_below_absolute_temperature_limit(tmp_path, monkeypatch, headroom, should_stop):
+    monkeypatch.setattr(telemetry, 'TelemetryCollector', NoTelemetry)
+    sample = {'memory': {'available_bytes': 40 * 1024**3, 'swap_used_bytes': 0},
+              'gpus': [{'temperature_gpu_c': 76, 'temperature_tlimit_c': headroom}]}
+    monkeypatch.setattr(telemetry, 'TelemetrySampler', lambda: SimpleNamespace(sample=lambda: sample))
+    stop = threading.Event()
+    launched = []
+    class Runner:
+        def run(self, job, _root):
+            launched.append(job['job_id'])
+            return {**job, 'status': 'succeeded', 'retry_count': 0}
+    trial = execute_trial(tmp_path / 'trial', jobs(count=1, concurrency=1), Runner(), concurrency=1,
+                          stop_event=stop, max_temperature_c=90, min_temperature_margin_c=5)
+    assert stop.is_set() is should_stop
+    assert bool(launched) is not should_stop
+    assert trial['status'] == ('stopped' if should_stop else 'complete')
+    if should_stop:
+        assert 'thermal headroom' in trial['stop_reason']
+
+
 def test_failed_production_restoration_exits_nonzero_and_preserves_metadata(tmp_path, monkeypatch):
     corpus_path = Path(__file__).parent / 'workloads/yue-standard.json'
     corpus = load_workload(corpus_path, synthetic=True)

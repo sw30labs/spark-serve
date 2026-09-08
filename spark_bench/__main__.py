@@ -24,6 +24,8 @@ def main():
     run.add_argument('--endpoint', help='recorded Artist Twin-facing origin (inference executes node-locally)')
     run.add_argument('--min-free-gb', type=float, default=12)
     run.add_argument('--max-temperature-c', type=float, default=85)
+    run.add_argument('--min-temperature-margin-c', type=float, default=5,
+                     help='stop at this NVIDIA T.Limit headroom when the device exposes it')
     run.add_argument('--max-swap-growth-gb', type=float, default=1)
     run.add_argument('--synthetic', action='store_true', help='no GPU/production access; timings are not capacity evidence')
     run.add_argument('--ssh-host', help='deploy/run on this configured Spark, holding the Mac controller lock')
