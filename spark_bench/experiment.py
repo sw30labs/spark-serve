@@ -13,6 +13,7 @@ import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from .common import append_json, digest_file, write_json
 from .runtime import DockerRunner, NodeLease, SyntheticRunner, load_factory
@@ -37,6 +38,17 @@ def levels_value(text: str) -> list[int]:
     if 1 not in values:
         raise ValueError('Include concurrency=1 as the baseline')
     return values
+
+
+def validate_endpoint(value):
+    if value is None:
+        return None
+    parsed = urlsplit(value)
+    if (parsed.scheme not in ('http', 'https') or not parsed.hostname or parsed.username or parsed.password
+            or parsed.query or parsed.fragment or parsed.path not in ('', '/')
+            or any(character.isspace() or ord(character) < 32 for character in value)):
+        raise ValueError('Endpoint must be an HTTP(S) origin without credentials, query, or fragment')
+    return value.rstrip('/')
 
 
 def load_workload(path: Path, *, synthetic=False) -> dict:
@@ -228,6 +240,7 @@ def execute_trial(root, jobs, runner, *, concurrency, stop_event, telemetry_inte
 
 def run_experiment(args):
     from .analysis import analyze
+    args.endpoint = validate_endpoint(args.endpoint)
     levels = levels_value(args.concurrency)
     if args.jobs_per_level < max(levels) or args.jobs_per_level < 1 or args.iterations < 1 or args.warmup < 0:
         raise ValueError('Use >= maximum concurrency jobs per level, positive iterations, and nonnegative warmup')

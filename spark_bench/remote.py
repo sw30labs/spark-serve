@@ -9,7 +9,7 @@ import subprocess
 import tarfile
 import time
 import tomllib
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from spark_serve_controller import Controller, yue_profile
 
@@ -43,7 +43,10 @@ def remote_run(args):
     data = io.BytesIO()
     with tarfile.open(fileobj=data, mode='w:gz') as archive:
         for path in sorted((repo / 'spark_bench').glob('*.py')):
-            archive.add(path, arcname='src/spark_bench/' + path.name)
+            if path.is_file() and not path.is_symlink():
+                archive.add(path, arcname='src/spark_bench/' + path.name)
+        if not (repo / 'spark_serve_controller.py').is_file() or (repo / 'spark_serve_controller.py').is_symlink():
+            raise ValueError('Controller source must be a regular file')
         archive.add(repo / 'spark_serve_controller.py', arcname='src/spark_serve_controller.py')
         for field, name in (('attestation', 'attestation.txt'), ('vocal', 'vocal.wav'), ('instrumental', 'instrumental.wav')):
             archive.add(workload[field], arcname='input/' + name)
@@ -75,6 +78,11 @@ print(root)
         if result.returncode:
             raise RuntimeError('Benchmark deployment failed: ' + result.stderr.decode(errors='replace')[-500:])
         remote_root = result.stdout.decode().strip()
+        if (not PurePosixPath(remote_root).is_absolute()
+                or not remote_root.endswith('/' + remote_rel)
+                or '..' in PurePosixPath(remote_root).parts
+                or any(ord(character) < 32 for character in remote_root)):
+            raise RuntimeError('Deployment returned an invalid benchmark directory')
         remote_args = ['concurrency', '--workload', remote_root + '/input/workload.json',
                        '--output', remote_root + '/results', '--endpoint', selected['url'],
                        '--concurrency', args.concurrency, '--jobs-per-level', str(args.jobs_per_level),
@@ -111,8 +119,17 @@ with tarfile.open(fileobj=sys.stdout.buffer,mode='w|gz') as archive:
             raise RuntimeError('Raw results remain on the Spark; automatic collection failed')
         with tarfile.open(fileobj=io.BytesIO(collected.stdout), mode='r:gz') as archive:
             safe_extract(archive, output / 'results')
-        receipt['status'] = 'complete' if result.returncode == 0 else 'stopped_or_failed'
+        if result.returncode == 0:
+            required = ['run-metadata.json', 'summary.json', 'report.md', 'comparison.csv']
+            if any(not (output / 'results' / name).is_file() for name in required):
+                raise RuntimeError('Successful remote run is missing required raw results or reports')
+            final_metadata = json.loads((output / 'results' / 'run-metadata.json').read_text())
+            if final_metadata.get('status') != 'complete':
+                raise RuntimeError('Remote benchmark did not record a complete experiment')
+        receipt['status'] = 'collected' if result.returncode == 0 else 'stopped_or_failed'
         write_json(output / 'remote-run.json', receipt)
         if result.returncode:
             raise RuntimeError('Remote benchmark stopped; inspect collected results and driver.log')
+    receipt['status'] = 'complete'
+    write_json(output / 'remote-run.json', receipt)
     return output

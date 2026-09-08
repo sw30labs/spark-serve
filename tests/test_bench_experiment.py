@@ -10,6 +10,7 @@ from spark_bench.experiment import (
     levels_value,
     load_workload,
     trial_order,
+    validate_endpoint,
 )
 from spark_bench.runtime import SyntheticRunner
 
@@ -46,6 +47,13 @@ def test_workload_preserves_spanish_and_rejects_parser_loss(tmp_path):
 def test_invalid_sweep(value):
     with pytest.raises(ValueError):
         levels_value(value)
+
+
+@pytest.mark.parametrize('value', ['http://user:secret@node:8011', 'https://node/?token=secret',
+                                  'http://node/path', 'http://node/#secret', 'http://node\n'])
+def test_endpoint_never_records_credentials(value):
+    with pytest.raises(ValueError, match='without credentials'):
+        validate_endpoint(value)
 
 
 def test_trial_really_overlaps_and_saves_failures(tmp_path):
