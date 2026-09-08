@@ -359,3 +359,136 @@ def test_zero_counter_increment_is_measured_zero_not_unavailable(tmp_path):
     assert observed["observed_delta_us"] == 0
     assert observed["observed_delta_s"] == 0
     assert observed["availability"] == "available"
+
+
+def test_decision_report_exposes_scoped_capacity_cost_and_unresolved_bottleneck(tmp_path):
+    complete_matrix(tmp_path, node="spark-one", worker="spark-one-worker")
+    for directory in (tmp_path / "trials").iterdir():
+        record = json.loads((directory / "trial.json").read_text())
+        telemetry = {"timestamp_s": record["started_at"] + 1, "cpu": {"total_percent": 30},
+                     "memory": {"available_bytes": 64 * 2**30, "used_bytes": 32 * 2**30},
+                     "gpus": [{"temperature_gpu_c": 80, "temperature_tlimit_c": 8,
+                               "utilization_gpu_percent": 99, "power_draw_watts": 110,
+                               "memory_used_bytes": 16 * 2**30}]}
+        (directory / "telemetry.jsonl").write_text(json.dumps(telemetry))
+    result = analyze(tmp_path)
+    report = (tmp_path / "report.md").read_text()
+    for label in ("BASELINE", "BEST TESTED", "SPEEDUP", "COST", "BOTTLENECK", "CONCLUSION",
+                  "RECOMMENDED CAPACITY", "NEXT EXPERIMENT"):
+        assert f"**{label}:**" in report
+    assert "**BASELINE:** C1, 360.000 successful jobs/hour" in report
+    assert "**BEST TESTED:** C2, 720.000 successful jobs/hour" in report
+    assert "p50/p95 10.000/10.000 s" in report
+    assert "16.000 GiB (available)/32.000 GiB (available)" in report
+    assert "110.000 W (available)/110.000 W (available)" in report
+    assert "core temperature peak 80.000 °C" in report
+    assert "failures 0/8 ({})" in report
+    assert "**BOTTLENECK:** unresolved" in report
+    assert "even 99%, does not establish" in report
+    assert "1 dispatcher(s), 2 concurrent job(s) per tested Spark" in report
+    assert "Ceiling not found" in report
+    assert "Extend above C2" in report
+    assert result["recommendations"][0]["candidate_concurrency"] == 2
+
+
+@pytest.mark.parametrize("metadata_updates", [{"synthetic": True}, {"status": "stopped"}, {"iterations": 3}])
+def test_decision_report_withholds_supported_capacity_for_provisional_evidence(tmp_path, metadata_updates):
+    complete_matrix(tmp_path, **metadata_updates)
+    result = analyze(tmp_path)
+    report = (tmp_path / "report.md").read_text()
+    assert result["hypothesis_result"] == "not_assessed"
+    assert "**CONCLUSION:** pending / not_assessed" in report
+    assert "**RECOMMENDED CAPACITY:** pending; no supported capacity." in report
+    assert "C2 with 1 dispatcher(s) is a provisional" in report
+    assert "GPU power mean/max unavailable W (unavailable)" in report
+    assert "1 dispatcher(s), 2 concurrent job(s) per tested Spark" not in report
+    if metadata_updates.get("synthetic"):
+        assert "harness candidate only" in report
+        assert "hardware scaling and ceiling remain unassessed" in report
+        assert "Ceiling not found" not in report
+
+
+def test_csv_reports_marginal_throughput_per_added_slot_when_levels_skip(tmp_path):
+    metadata(tmp_path, concurrency_levels=[1, 2, 4])
+    for concurrency in (1, 2, 4):
+        for iteration in range(2):
+            trial(tmp_path, concurrency, iteration)
+    result = analyze(tmp_path)
+    highest = next(item for item in result["comparisons"] if item["concurrency"] == 4)
+    assert highest["previous_concurrency"] == 2
+    assert highest["marginal_jobs_per_hour"] == 720
+    assert highest["marginal_jobs_per_hour_per_slot"] == 360
+    with (tmp_path / "comparison.csv").open() as handle:
+        rows = list(csv.DictReader(handle))
+    baseline = next(row for row in rows if row["concurrency"] == "1")
+    upper = next(row for row in rows if row["concurrency"] == "4")
+    assert float(upper["scaling_efficiency"]) == 1
+    assert float(upper["marginal_speedup"]) == 2
+    assert float(upper["marginal_jobs_per_hour_per_slot"]) == 360
+    assert upper["previous_concurrency"] == "2"
+    assert baseline["marginal_jobs_per_hour_per_slot"] == ""
+    assert baseline["previous_concurrency"] == ""
+    assert "Extend above C4" in (tmp_path / "report.md").read_text()
+
+
+def test_fast_failing_level_is_observed_best_but_never_recommended(tmp_path):
+    metadata(tmp_path)
+    for iteration in range(2):
+        trial(tmp_path, 1, iteration)
+        trial(tmp_path, 2, iteration,
+              statuses=["failed_integrity", "succeeded", "succeeded", "succeeded"])
+    result = analyze(tmp_path)
+    report = (tmp_path / "report.md").read_text()
+    assert result["recommendations"][0]["candidate_concurrency"] == 1
+    assert "**BEST TESTED:** C2, 540.000 successful jobs/hour (highest observed rate; does not meet acceptance criteria)" in report
+    assert 'failures 2/8 ({"failed_integrity": 2})' in report
+    assert "1 dispatcher(s), 1 concurrent job(s) per tested Spark" in report
+    assert "Ceiling not found" not in report
+
+
+def test_report_does_not_borrow_baselines_across_workloads_or_dispatchers(tmp_path):
+    metadata(tmp_path)
+    for iteration in range(2):
+        trial(tmp_path, 1, iteration, workloads=("short",))
+        trial(tmp_path, 2, iteration, workloads=("representative",))
+        trial(tmp_path, 2, iteration, dispatchers=2, workloads=("short",))
+    analyze(tmp_path)
+    report = (tmp_path / "report.md").read_text()
+    assert report.count("**BASELINE:**") == 3
+    assert report.count("unavailable; no matching C1 baseline.") == 2
+    assert report.count("**RECOMMENDED CAPACITY:** pending; no supported capacity.") == 3
+
+
+def test_no_measured_trials_still_has_pending_decision_fields(tmp_path):
+    metadata(tmp_path, status="stopped")
+    analyze(tmp_path)
+    report = (tmp_path / "report.md").read_text()
+    assert "**BEST TESTED:** pending / not_assessed; unavailable; no measured throughput." in report
+    assert "**RECOMMENDED CAPACITY:** pending; no supported capacity." in report
+
+
+def test_positive_limit_counters_are_observations_not_a_bottleneck_verdict(tmp_path):
+    metadata(tmp_path)
+    for iteration in range(2):
+        trial(tmp_path, 1, iteration)
+        trial(tmp_path, 2, iteration,
+              telemetry=thermal_samples([10_000_000, 11_000_000], start=2200 + iteration * 10000))
+    analyze(tmp_path)
+    report = (tmp_path / "report.md").read_text()
+    assert "**BOTTLENECK:** unresolved" in report
+    assert "Observed limit-event counters: sw_thermal 2.000000 s (available)" in report
+    assert "these do not identify the dominant bottleneck" in report
+
+
+def test_interior_best_does_not_claim_a_ceiling_or_request_automatic_extension(tmp_path):
+    metadata(tmp_path, concurrency_levels=[1, 2, 4])
+    for concurrency, duration in ((1, 40), (2, 20), (4, 25)):
+        for iteration in range(2):
+            trial(tmp_path, concurrency, iteration, duration=duration)
+    result = analyze(tmp_path)
+    report = (tmp_path / "report.md").read_text()
+    assert result["recommendations"][0]["candidate_concurrency"] == 2
+    assert "**BEST TESTED:** C2" in report
+    assert "Ceiling not found" not in report
+    assert "Extend above C4" not in report
+    assert "Repeat the candidate and neighboring levels" in report

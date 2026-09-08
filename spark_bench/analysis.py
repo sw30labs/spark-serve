@@ -512,6 +512,10 @@ def analyze(root: Path, *, min_speedup=1.10, max_latency_ratio=3.0, max_failure_
             item["p95_latency_ratio_vs_c1"] = latency / base_latency if latency is not None and base_latency else None
             item["marginal_jobs_per_hour"] = rate - previous["jobs_per_hour"] if previous and rate is not None and previous["jobs_per_hour"] is not None else None
             item["previous_concurrency"] = previous["concurrency"] if previous else None
+            added_slots = (item["concurrency"] - previous["concurrency"] if previous and
+                           isinstance(item["concurrency"], int) and isinstance(previous["concurrency"], int) else None)
+            item["marginal_jobs_per_hour_per_slot"] = (item["marginal_jobs_per_hour"] / added_slots
+                if added_slots and added_slots > 0 and item["marginal_jobs_per_hour"] is not None else None)
             item["marginal_speedup"] = rate / previous["jobs_per_hour"] if previous and rate is not None and previous["jobs_per_hour"] else None
             item["scaling_efficiency"] = item["speedup_vs_c1"] / item["concurrency"] if item["speedup_vs_c1"] is not None and item["concurrency"] else None
             baseline_audio = {(row["workload_id"], row["seed"]): row["mean"]
@@ -566,10 +570,118 @@ def analyze(root: Path, *, min_speedup=1.10, max_latency_ratio=3.0, max_failure_
     return summary
 
 
+def _cost(item):
+    if item is None:
+        return "unavailable"
+    metrics = item["telemetry"]["metrics"]
+
+    def resource(name, statistic, unit, scale=1):
+        metric = metrics[name]
+        value = metric[statistic]
+        return f"{_display(value / scale if value is not None else None)} {unit} ({metric['availability']})"
+
+    return (f"C{item['concurrency']}: p50/p95 {_display(item['latency_s']['p50'])}/"
+        f"{_display(item['latency_s']['p95'])} s; GPU/host memory peak "
+        f"{resource('gpu_memory_used_bytes', 'max', 'GiB', 2**30)}/"
+        f"{resource('memory_used_bytes', 'max', 'GiB', 2**30)}; host memory available minimum "
+        f"{resource('memory_available_bytes', 'min', 'GiB', 2**30)}; GPU power mean/max "
+        f"{resource('gpu_power_watts', 'mean', 'W')}/{resource('gpu_power_watts', 'max', 'W')}; "
+        f"core temperature peak {resource('gpu_temperature_c', 'max', '°C')}; "
+        f"T.Limit minimum {resource('gpu_temperature_tlimit_c', 'min', '°C')}; "
+        f"failures {sum(item['failures_by_category'].values())}/{item['job_count']} "
+        f"({json.dumps(item['failures_by_category'], sort_keys=True)}), retries {item['retry_count']}")
+
+
+def _decision_report(summary):
+    """Present observed rates and existing recommendations without reselecting capacity."""
+    report = ["## Decision fields", ""]
+    cohorts = summary["recommendations"] or [None]
+    for recommendation in cohorts:
+        groups = ([item for item in summary["comparisons"] if
+                   (item["corpus_id"], item["dispatcher_count"]) ==
+                   (recommendation["corpus_id"], recommendation["dispatcher_count"])] if recommendation else [])
+        if recommendation:
+            report += [f"Corpus {recommendation['corpus_id']}; {recommendation['dispatcher_count']} configured dispatcher(s).", ""]
+        baseline = next((item for item in groups if item["concurrency"] == 1), None)
+        best = max((item for item in groups if item["jobs_per_hour"] is not None),
+                   key=lambda item: (item["jobs_per_hour"], -(item["concurrency"] or 0)), default=None)
+        provisional = summary["evidence_status"] != "complete" or not recommendation or recommendation["provisional"]
+        pending = "pending / not_assessed; " if provisional else ""
+        candidate = recommendation["candidate_concurrency"] if recommendation else None
+        baseline_text = (f"C1, {_display(baseline['jobs_per_hour'])} successful jobs/hour, "
+                         f"{baseline['complete_trial_count']} complete trial(s)." if baseline else
+                         "unavailable; no matching C1 baseline.")
+        if best:
+            best_text = (f"C{best['concurrency']}, {_display(best['jobs_per_hour'])} successful jobs/hour "
+                         "(highest observed rate; " + ("meets" if best["eligible"] else "does not meet")
+                         + " acceptance criteria" + ("; provisional" if provisional else "") + ").")
+            speedup_text = (f"{_display(best['speedup_vs_c1'])}× matching C1; scaling efficiency "
+                           f"{_display(best['scaling_efficiency'])}; ")
+            speedup_text += (f"marginal speedup {_display(best['marginal_speedup'])}× "
+                f"from C{best['previous_concurrency']}; "
+                f"{_display(best['marginal_jobs_per_hour_per_slot'])} additional jobs/hour per added slot."
+                if best["previous_concurrency"] is not None else "marginal comparison unavailable (no lower matching level).")
+        else:
+            best_text, speedup_text = "unavailable; no measured throughput.", "unavailable; comparison pending."
+        cost = _cost(baseline)
+        if best is not None and best is not baseline:
+            cost += " → " + _cost(best)
+        if baseline is None and best is None:
+            cost = "unavailable; no measured comparison."
+        limits = []
+        if best:
+            limits = [f"{name.removeprefix('clock_event_').removesuffix('_us')} "
+                      f"{_display(counter['observed_delta_s'], 6)} s ({counter['availability']})"
+                      for name, counter in best["telemetry"]["throttle_counters"].items()
+                      if counter["observed_delta_s"] is not None and counter["observed_delta_s"] > 0]
+        bottleneck = "unresolved; GPU utilization, even 99%, does not establish compute or memory-bandwidth saturation."
+        if limits:
+            bottleneck += " Observed limit-event counters: " + "; ".join(limits) + "; these do not identify the dominant bottleneck."
+        else:
+            bottleneck += " No supporting limit-event evidence establishes a cause; missing counters remain unavailable."
+        boundary = bool(best and best["eligible"] and summary["requested_levels"] and
+                        best["concurrency"] == max(summary["requested_levels"]) and
+                        best["marginal_speedup"] is not None and
+                        best["marginal_speedup"] >= summary["thresholds"]["min_speedup"])
+        if provisional:
+            conclusion = f"pending / not_assessed: {summary['evidence_status']} evidence; no hardware H0 verdict."
+            capacity = "pending; no supported capacity."
+            if candidate is not None:
+                capacity += (f" C{candidate} with {recommendation['dispatcher_count']} dispatcher(s) is a provisional "
+                             + ("harness candidate only." if summary["synthetic"] else "candidate only."))
+        else:
+            conclusion = (f"C{candidate} improves acceptable throughput over C1 within this measured corpus, node, runtime "
+                          "and dispatcher topology." if candidate and candidate > 1 else
+                          "H0 not rejected within this tested envelope; C1 is not established as universally optimal.")
+            capacity = (f"{recommendation['dispatcher_count']} dispatcher(s), {candidate} concurrent job(s) per tested Spark "
+                        "for this corpus/runtime; other nodes and dispatcher topologies are not established."
+                        if candidate is not None else "none; no tested level meets the acceptance criteria.")
+        if boundary and not summary["synthetic"]:
+            conclusion += (" Ceiling not found: the highest requested level still shows useful marginal scaling"
+                           + (" in provisional observations." if provisional else "."))
+        if summary["synthetic"]:
+            next_step = "Run the same full owned corpus and paired seeds in an isolated, guarded real sweep; hardware scaling and ceiling remain unassessed."
+        elif provisional:
+            next_step = "Resolve the listed evidence gaps and complete repeated levels with the same full corpus and paired seeds before recommending capacity."
+            if boundary:
+                next_step += " Then extend above the current highest level in a separate guarded sweep."
+        elif boundary:
+            next_step = (f"Extend above C{best['concurrency']} in a separate guarded, repeated sweep using the same full corpus "
+                         "and paired seeds, with enough jobs to exercise each new level; do not call the current boundary an optimum.")
+        else:
+            next_step = "Repeat the candidate and neighboring levels with more jobs/trials; correlate stage timing with SM/tensor, measured bandwidth and limit counters to identify the bottleneck."
+        report += [f"- **BASELINE:** {pending}{baseline_text}", f"- **BEST TESTED:** {pending}{best_text}",
+                   f"- **SPEEDUP:** {pending}{speedup_text}", f"- **COST:** {cost}",
+                   f"- **BOTTLENECK:** {bottleneck}", f"- **CONCLUSION:** {conclusion}",
+                   f"- **RECOMMENDED CAPACITY:** {capacity}", f"- **NEXT EXPERIMENT:** {next_step}", ""]
+    return report
+
+
 def _write_outputs(root, summary):
     columns = ["corpus_id", "dispatcher_count", "concurrency", "trial_count", "complete_trial_count", "job_count",
         "successes", "makespan_s", "jobs_per_hour", "audio_seconds_per_hour", "failure_rate", "retry_count",
-        "max_active_observed", "speedup_vs_c1", "p95_latency_ratio_vs_c1", "marginal_jobs_per_hour", "eligible"]
+        "max_active_observed", "speedup_vs_c1", "scaling_efficiency", "p95_latency_ratio_vs_c1", "previous_concurrency",
+        "marginal_speedup", "marginal_jobs_per_hour", "marginal_jobs_per_hour_per_slot", "eligible"]
     quantiles = ["mean", "p50", "p95", "min", "max"]
     output = io.StringIO(newline="")
     writer = csv.DictWriter(output, fieldnames=columns + ["latency_s_" + key for key in quantiles] + ["failures_by_category"])
@@ -589,6 +701,7 @@ def _write_outputs(root, summary):
                "Planned level order: " + json.dumps(metadata.get("order", "unavailable")) + ".", ""]
     if summary["synthetic"]:
         report += ["**SYNTHETIC HARNESS DATA — no hardware capacity conclusion.**", ""]
+    report += _decision_report(summary)
     report += ["| Corpus | Dispatchers | C | Trials (complete) | Success/jobs | Jobs/hour | p50 / p95 latency (s) | Speedup | Failure rate | Actual overlap |",
                "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
     for item in summary["comparisons"]:
