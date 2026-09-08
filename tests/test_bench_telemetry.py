@@ -129,6 +129,47 @@ class TelemetryTests(unittest.TestCase):
         self.assertEqual(result["processes"][0]["cpu_percent"], 50)
         self.assertEqual(sum(call[1] == "--help-query-gpu" for call in self.nvidia.calls), 1)
 
+    def test_thermal_margin_and_cumulative_counter_deltas_keep_units_and_identity(self):
+        self.nvidia.values.update({
+            "temperature.gpu.tlimit": "7",
+            "clocks_event_reasons_counters.sw_power_cap": "8709900223 us",
+            "clocks_event_reasons_counters.sw_thermal_slowdown": "139309258",
+        })
+        first = self.sampler.sample()["gpus"][0]
+        self.assertEqual(first["temperature_tlimit_c"], 7)
+        self.assertEqual(first["clock_event_sw_power_cap_us"], 8709900223)
+        self.assertIsNone(first["clock_event_sw_power_cap_delta_us"])
+        self.assertEqual(first["availability"]["clock_event_sw_power_cap_delta_us"], "baseline_required")
+        self.clock.now += 2
+        self.nvidia.values["clocks_event_reasons_counters.sw_power_cap"] = "8710400223 us"
+        self.nvidia.values["temperature.gpu.tlimit"] = "-1"
+        second = self.sampler.sample()["gpus"][0]
+        self.assertEqual(second["temperature_tlimit_c"], -1)
+        self.assertEqual(second["clock_event_sw_power_cap_delta_us"], 500000)
+        self.assertEqual(second["clock_event_sw_thermal_delta_us"], 0)
+        self.assertIsNone(second["clock_event_hw_thermal_us"])
+        self.assertIsNone(second["clock_event_hw_thermal_delta_us"])
+        self.nvidia.values["clocks_event_reasons_counters.sw_power_cap"] = "10 us"
+        reset = self.sampler.sample()["gpus"][0]
+        self.assertIsNone(reset["clock_event_sw_power_cap_delta_us"])
+        self.assertEqual(reset["availability"]["clock_event_sw_power_cap_delta_us"], "counter_reset")
+        self.nvidia.values["uuid"] = "GPU-replacement"
+        self.nvidia.values["clocks_event_reasons_counters.sw_power_cap"] = "1000 us"
+        replaced = self.sampler.sample()["gpus"][0]
+        self.assertIsNone(replaced["clock_event_sw_power_cap_delta_us"])
+
+    def test_counter_unavailable_gap_is_not_bridged(self):
+        field = "clocks_event_reasons_counters.sw_thermal_slowdown"
+        self.nvidia.values[field] = "100"
+        self.sampler.sample()
+        self.nvidia.values[field] = "N/A"
+        missing = self.sampler.sample()["gpus"][0]
+        self.assertIsNone(missing["clock_event_sw_thermal_delta_us"])
+        self.nvidia.values[field] = "400"
+        resumed = self.sampler.sample()["gpus"][0]
+        self.assertIsNone(resumed["clock_event_sw_thermal_delta_us"])
+        self.assertEqual(resumed["availability"]["clock_event_sw_thermal_delta_us"], "baseline_required")
+
     def test_counter_resets_and_reused_pid_do_not_create_false_rates(self):
         self.sampler.sample()
         self.clock.now += 1

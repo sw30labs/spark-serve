@@ -4,6 +4,11 @@ GPU ``utilization_memory_percent`` is the fraction of a sampling period when
 device memory was busy, NOT measured bandwidth or SM occupancy. Unsupported
 counters stay null. On unified-memory Sparks, /proc/meminfo is the authoritative
 node memory view; nvidia-smi memory.used is often unavailable.
+
+T.Limit is remaining thermal headroom in Celsius, not an absolute temperature.
+Clock-event counters are cumulative microseconds and can predate a benchmark.
+Delta fields cover only adjacent samples of the same UUID; analysis must bound
+those deltas to a trial and must not charge initial cumulative totals to it.
 """
 
 from __future__ import annotations
@@ -36,6 +41,7 @@ GPU_FIELDS = {
     "memory_used_bytes": (("memory.used",), 1024**2),
     "memory_free_bytes": (("memory.free",), 1024**2),
     "temperature_gpu_c": (("temperature.gpu",), 1),
+    "temperature_tlimit_c": (("temperature.gpu.tlimit",), 1),
     "power_draw_watts": (("power.draw",), 1),
     "power_limit_watts": (("power.limit",), 1),
     "clock_sm_mhz": (("clocks.current.sm", "clocks.sm"), 1),
@@ -47,8 +53,15 @@ GPU_FIELDS = {
     "clock_event_hw_thermal": (("clocks_event_reasons.hw_thermal_slowdown", "clocks_throttle_reasons.hw_thermal_slowdown"), None),
     "clock_event_sw_thermal": (("clocks_event_reasons.sw_thermal_slowdown", "clocks_throttle_reasons.sw_thermal_slowdown"), None),
     "clock_event_hw_slowdown": (("clocks_event_reasons.hw_slowdown", "clocks_throttle_reasons.hw_slowdown"), None),
+    "clock_event_sw_power_cap_us": (("clocks_event_reasons_counters.sw_power_cap",), 1),
+    "clock_event_sw_thermal_us": (("clocks_event_reasons_counters.sw_thermal_slowdown",), 1),
+    "clock_event_hw_thermal_us": (("clocks_event_reasons_counters.hw_thermal_slowdown",), 1),
+    "clock_event_hw_power_brake_us": (("clocks_event_reasons_counters.hw_power_brake_slowdown",), 1),
+    "clock_event_sync_boost_us": (("clocks_event_reasons_counters.sync_boost",), 1),
 }
 ADVANCED_COUNTERS = ("sm_activity_percent", "sm_occupancy_percent", "tensor_activity_percent", "memory_bandwidth_bytes_per_second")
+GPU_COUNTER_KEYS = tuple(key for key in GPU_FIELDS if key.endswith("_us"))
+GPU_COUNTER_DELTA_KEYS = tuple(key.removesuffix("_us") + "_delta_us" for key in GPU_COUNTER_KEYS)
 
 
 def _number(value: str, scale: float = 1) -> float | None:
@@ -123,6 +136,7 @@ class TelemetrySampler:
         if self._gpu_fields is None:
             self._discover_gpu()
         if not self._gpu_fields:
+            self._previous["gpu_counters"] = {}
             errors.append({"source": "nvidia-smi", "error": self._gpu_error})
             return [], [], False
         output, error = self._command([
@@ -143,11 +157,40 @@ class TelemetrySampler:
                 for key, raw in zip(self._gpu_fields, row, strict=True):
                     raw = raw.strip()
                     scale = GPU_FIELDS[key][1]
+                    # Some driver revisions append "us" to clock counters even
+                    # with nounits. Accept that documented unit only.
+                    if key in GPU_COUNTER_KEYS:
+                        raw = raw.removesuffix(" us")
                     value = (None if raw in ("N/A", "[N/A]", "[Not Supported]", "Not Supported", "") else raw) if scale is None else _number(raw, scale)
                     gpu[key] = value
                     availability[key] = "available" if value is not None else "unavailable_on_device"
                 gpu["availability"] = availability
                 gpus.append(gpu)
+        previous = self._previous.get("gpu_counters", {})
+        current = {}
+        for gpu in gpus:
+            uuid = gpu.get("uuid")
+            old = previous.get(uuid, {}) if uuid else {}
+            for key, delta_key in zip(GPU_COUNTER_KEYS, GPU_COUNTER_DELTA_KEYS, strict=True):
+                value = gpu[key]
+                baseline = old.get(key)
+                delta, reason = None, "baseline_required"
+                if value is None:
+                    reason = "counter_unavailable"
+                elif uuid is None:
+                    reason = "gpu_identity_unavailable"
+                elif baseline is not None:
+                    if value >= baseline:
+                        delta, reason = value - baseline, "available"
+                    else:
+                        reason = "counter_reset"
+                gpu[delta_key] = delta
+                gpu["availability"][delta_key] = reason
+            if uuid:
+                current[uuid] = {key: gpu[key] for key in GPU_COUNTER_KEYS}
+        # An absent GPU/query failure clears continuity. Never bridge gaps or
+        # attribute a different GPU's lifetime counts to this interval.
+        self._previous["gpu_counters"] = current
         app_output, app_error = self._command([
             "nvidia-smi", "--query-compute-apps=gpu_uuid,pid,process_name,used_gpu_memory",
             "--format=csv,noheader,nounits",
@@ -383,7 +426,7 @@ CSV_FIELDS = (
     "cpu_total_percent", "node_memory_total_bytes", "node_memory_available_bytes", "node_memory_used_bytes",
     "node_swap_used_bytes", "network_rx_bytes_per_second", "network_tx_bytes_per_second",
     "disk_read_bytes_per_second", "disk_write_bytes_per_second", "errors_json",
-)
+) + ("temperature_tlimit_c", *GPU_COUNTER_KEYS, *GPU_COUNTER_DELTA_KEYS)
 
 
 def flat_rows(sample):
@@ -391,6 +434,7 @@ def flat_rows(sample):
     for gpu in sample.get("gpus") or [{}]:
         row = {key: sample.get(key) for key in CSV_FIELDS[:5]}
         row.update({key: gpu.get(key) for key in CSV_FIELDS[7:21]})
+        row.update({key: gpu.get(key) for key in ("temperature_tlimit_c", *GPU_COUNTER_KEYS, *GPU_COUNTER_DELTA_KEYS)})
         row.update(gpu_index=gpu.get("index"), gpu_uuid=gpu.get("uuid"),
                    cpu_total_percent=sample.get("cpu", {}).get("total_percent"),
                    errors_json=json.dumps(sample.get("errors", []), separators=(",", ":")))
