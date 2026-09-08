@@ -368,7 +368,8 @@ def analyze(root: Path, *, min_speedup=1.10, max_latency_ratio=3.0, max_failure_
         issues.append("measured trials overlap on the same node")
     if any(not trial["complete"] for trial in trials):
         issues.append("incomplete measured trials or outcomes")
-    synthetic = metadata.get("synthetic") is True or str(metadata.get("synthetic")).lower() == "true"
+    synthetic = (metadata.get("synthetic") is True or str(metadata.get("synthetic")).lower() == "true"
+                 or any(job.get("synthetic") is True for trial in trials for job in trial["_jobs"]))
     cohorts = defaultdict(list)
     for comparison in comparisons:
         cohorts[(comparison["corpus_id"], str(comparison["dispatcher_count"]))].append(comparison)
@@ -483,6 +484,12 @@ def _write_outputs(root, summary):
         writer.writerow(row)
     report = ["# YuE concurrency comparison", "", f"Evidence: **{summary['evidence_status']}**. Hypothesis: **{summary['hypothesis_result']}**.", "",
         "H0 means C1 has the best acceptable throughput in the tested envelope. H0 not rejected is not proof that C1 is universally optimal.", ""]
+    metadata = summary["metadata"]
+    report += [(f"Node: {metadata.get('node', 'unavailable')}. Worker: {metadata.get('worker', 'unavailable')}. "
+                f"Runtime manifest: {metadata.get('runtime_manifest', 'unavailable')}."),
+               (f"Requested levels: {summary['requested_levels']}; iterations: {metadata.get('iterations', 'unavailable')}; "
+                f"jobs per trial: {metadata.get('jobs_per_level', 'unavailable')}."),
+               "Planned level order: " + json.dumps(metadata.get("order", "unavailable")) + ".", ""]
     if summary["synthetic"]:
         report += ["**SYNTHETIC HARNESS DATA — no hardware capacity conclusion.**", ""]
     report += ["| Corpus | Dispatchers | C | Trials (complete) | Success/jobs | Jobs/hour | p50 / p95 latency (s) | Speedup | Failure rate | Actual overlap |",
