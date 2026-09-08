@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import inspect
 import json
 import os
 import re
@@ -17,6 +18,64 @@ import time
 import uuid
 from pathlib import Path
 from urllib.parse import urlsplit
+
+
+def classify_gpu_processes(compute: str, proc_root="/proc") -> dict:
+    """Keep all contexts visible; exempt only the verified, small desktop daemon.
+
+    nvidia-smi reports GNOME remote desktop's encoder context as compute. It is
+    not a heavy inference engine. Process names alone never establish identity:
+    require the kernel executable link, the exact observed user-service cgroup,
+    and a reported allocation at or below the fixed 1 GiB ceiling. Any missing,
+    unsupported, malformed, or inconsistent evidence remains blocking.
+    """
+    import csv
+    import math
+    import os
+    import re
+    from pathlib import Path
+
+    expected_executable = "/usr/libexec/gnome-remote-desktop-daemon"
+    desktop_memory_limit_mib = 1024
+    processes, desktop, blocking = [], [], []
+    for line in compute.splitlines():
+        if not line.strip() or line.strip().startswith("No running processes"):
+            continue
+        record = {"raw": line, "classification": "unverified_compute"}
+        try:
+            columns = next(csv.reader([line], skipinitialspace=True))
+            if len(columns) != 3:
+                raise ValueError("expected PID, executable, memory")
+            pid = int(columns[0].strip())
+            if pid < 1:
+                raise ValueError("invalid PID")
+            name = columns[1].strip()
+            memory = float(columns[2].strip())
+            if not math.isfinite(memory) or memory < 0:
+                raise ValueError("invalid reported memory")
+            record.update(pid=pid, reported_executable=name, used_gpu_memory_mib=memory)
+            # Read /proc only for this exact reported system executable. An
+            # arbitrary process that copies its short name cannot qualify.
+            if name == expected_executable and memory <= desktop_memory_limit_mib:
+                proc = Path(proc_root) / str(pid)
+                executable = os.path.realpath(os.readlink(proc / "exe"))
+                cgroups = (proc / "cgroup").read_text().splitlines()
+                verified_group = next((group for group in cgroups if re.fullmatch(
+                    r"0::/user\.slice/user-([0-9]+)\.slice/user@\1\.service/app\.slice/gnome-remote-desktop-handover\.service",
+                    group)), None)
+                record.update(executable=executable, cgroup=verified_group)
+                if executable == expected_executable and verified_group:
+                    record["classification"] = "verified_desktop_context"
+                    record["memory_limit_mib"] = desktop_memory_limit_mib
+        except (OSError, ValueError, StopIteration, csv.Error) as exc:
+            record["verification_error"] = type(exc).__name__
+        processes.append(record)
+        if record["classification"] == "verified_desktop_context":
+            desktop.append(record)
+        else:
+            blocking.append(record)
+    return {"gpu_processes": processes, "desktop_gpu_contexts": desktop,
+            "blocking_gpu_processes": blocking}
 
 
 class ControllerError(RuntimeError):
@@ -346,20 +405,20 @@ raise SystemExit(p.returncode)
         return errors
 
     def audit(self, host: str) -> dict:
-        script = """import json, socket, subprocess, sys
+        script = inspect.getsource(classify_gpu_processes) + "\n" + """import json, socket, subprocess, sys
 def run(args):
     p = subprocess.run(args, text=True, capture_output=True, timeout=30)
     if p.returncode: raise RuntimeError(p.stderr.strip() or "command failed")
     return p.stdout.strip()
 ids = run(["docker", "ps", "-aq"]).split()
 containers = json.loads(run(["docker", "inspect", *ids])) if ids else []
-compute = run(["nvidia-smi", "--query-compute-apps=pid,process_name", "--format=csv,noheader,nounits"])
+compute = run(["nvidia-smi", "--query-compute-apps=pid,process_name,used_gpu_memory", "--format=csv,noheader,nounits"])
 listening = []
 for port in json.loads(sys.argv[1]):
     with socket.socket() as probe:
         probe.settimeout(1)
         if probe.connect_ex(("127.0.0.1", port)) == 0: listening.append(port)
-print(json.dumps({"listening_ports": listening, "containers": [{"id": c["Id"], "name": c["Name"].lstrip("/"), "running": c["State"]["Running"], "gpu": bool(c["HostConfig"].get("DeviceRequests")) or any("nvidia" in str(d) for d in c["HostConfig"].get("Devices") or []), "labels": c["Config"].get("Labels") or {}} for c in containers], "gpu_processes": [line for line in compute.splitlines() if line.strip() and not line.startswith("No running processes")] }))
+print(json.dumps({"listening_ports": listening, "containers": [{"id": c["Id"], "name": c["Name"].lstrip("/"), "running": c["State"]["Running"], "gpu": bool(c["HostConfig"].get("DeviceRequests")) or any("nvidia" in str(d) for d in c["HostConfig"].get("Devices") or []), "labels": c["Config"].get("Labels") or {}} for c in containers], **classify_gpu_processes(compute) }))
 """
         return self.remote(
             host,
@@ -424,7 +483,11 @@ print(json.dumps({"listening_ports": listening, "containers": [{"id": c["Id"], "
                     f"{host}: unmanaged listener remains on ports {audit['listening_ports']}; stop or reconcile it before switching"
                 )
             gpu = [c["name"] for c in audit["containers"] if c["running"] and c["gpu"]]
-            if gpu or audit["gpu_processes"]:
+            desktop = audit.get("desktop_gpu_contexts", [])
+            if desktop:
+                self.emit("desktop_gpu_context", host=host, contexts=desktop,
+                          output="verified GNOME remote desktop contexts retained")
+            if gpu or audit.get("blocking_gpu_processes", audit["gpu_processes"]):
                 raise ControllerError(
                     f"{host}: GPU still in use ({', '.join(gpu) or 'compute processes'}); stop or reconcile that workload before switching"
                 )
