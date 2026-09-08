@@ -287,3 +287,37 @@ Architecture alone, free memory, or 99% utilization cannot settle H0. No real
 throughput number or optimal capacity has yet been established in this document.
 Measured runs and their final decision report belong in the output directory;
 production remains at capacity 1 until separately authorized and implemented.
+
+## First live attempt and thermal-guard adjustment
+
+The first Sparkone attempt, `b20260908172750-309fa2` on 2026-09-08,
+stopped its unmeasured C1 warmup after 581.4 seconds when the configured 5°C
+minimum T.Limit margin was reached. Its 291 telemetry samples contained no
+collection errors. The lowest observed margin was 4°C at a core temperature
+of 81°C; maximum observed core temperature was 84°C. All five recorded
+cumulative clock-event counters were unchanged across the attempt. Stage1
+produced an aligned 17.38-second section and Stage2 had started when the guard
+cancelled the job. No completed song or measured trial resulted: this attempt
+is **not assessed**, with no baseline throughput or H0 conclusion. The exact
+container was removed and both production factories were verified admitted
+and idle afterward. Evidence is retained under the attempt's output directory
+and `preflight/launch-verification.json` in the local live-run collection.
+
+A separate follow-up attempt can change only the explicit experiment guard
+from `--min-temperature-margin-c 5` to `--min-temperature-margin-c 0`, retaining
+the same corpus, references, seeds, model settings, trial order, job counts,
+warmup, 2-second telemetry interval, 90°C absolute-temperature guard, 12 GiB
+available-memory reserve, and 1 GiB swap-growth guard. This adjustment tests
+whether the positive-headroom stop prevented useful measurement before any
+observed throttling. NVIDIA defines a T.Limit reading of zero or below as a
+point where thermal conditions may cause clock optimization; it is not a
+shutdown threshold. The guard adjustment follows that documented boundary,
+without changing device clocks, power limits, cooling, or production admission
+capacity. See the [NVIDIA temperature documentation](https://docs.nvidia.com/deploy/nvidia-smi/index.html#temperature).
+
+The follow-up must use a new output directory and record its changed guard.
+It must still abort at zero or negative headroom, preserve any stopped output,
+and report measured throttle-counter increments. A zero-margin guard provides
+less advance headroom, and sampling cannot prevent a brief boundary crossing.
+If that attempt also stops, it remains incomplete; do not relax guards silently
+or combine the two attempts into a completed throughput comparison.
