@@ -62,13 +62,15 @@ def _jsonl(path, issues):
 def _failure(job):
     status = job.get("status")
     error = str(job.get("error") or "").lower()
+    if job.get("cuda_oom") or job.get("oom_killed"):
+        return "out_of_memory"
     if status == "failed_integrity" or "failed_integrity" in error:
         return "failed_integrity"
     if status == "succeeded":
         return None
     if status in {"timeout", "cancelled"}:
         return status
-    if job.get("cuda_oom") or "out of memory" in error or "cuda oom" in error or "oomkill" in error:
+    if "out of memory" in error or "cuda oom" in error or "oomkill" in error:
         return "out_of_memory"
     if status == "failed":
         return "infrastructure_or_unknown"
@@ -127,6 +129,8 @@ _TELEMETRY_FIELDS = {
     "disk_read_bytes_per_second": ("disk", "total_read_bytes_per_second"),
     "disk_write_bytes_per_second": ("disk", "total_write_bytes_per_second"),
 }
+
+_REQUIRED_TELEMETRY = ("memory_available_bytes", "gpu_temperature_c", "cpu_percent", "gpu_utilization_percent")
 
 
 def _telemetry(rows):
@@ -249,6 +253,13 @@ def _trial(directory):
     telemetry = _jsonl(directory / "telemetry.jsonl", telemetry_issues)
     telemetry = [row for row in telemetry if (stamp := _timestamp(row)) is None
                  or not valid_epoch or start <= stamp <= end]
+    telemetry_metrics = _telemetry(telemetry)
+    telemetry_unavailable = [name for name in _REQUIRED_TELEMETRY
+                             if telemetry_metrics["metrics"][name]["availability"] == "unavailable"]
+    if not telemetry or not any(_timestamp(row) is not None for row in telemetry):
+        telemetry_unavailable.append("timestamped trial telemetry")
+    if telemetry_issues:
+        issues.extend("incomplete telemetry: " + issue for issue in telemetry_issues)
     corpus = sorted(Counter((str(job.get("workload_id") or "unknown"), str(job.get("seed")))
                             for job in jobs).items())
     corpus_id = hashlib.sha256(json.dumps(corpus).encode()).hexdigest()[:12]
@@ -265,6 +276,7 @@ def _trial(directory):
             "issues": sorted(set(issues)), "corpus_id": corpus_id,
             "workload_counts": dict(Counter(str(job.get("workload_id") or "unknown") for job in jobs)),
             "timing_notes": sorted(set(timing_notes)), "telemetry_issues": telemetry_issues,
+            "telemetry_sample_count": len(telemetry), "telemetry_required_unavailable": telemetry_unavailable,
             "_jobs": jobs, "_telemetry": telemetry}
 
 
@@ -350,6 +362,8 @@ def analyze(root: Path, *, min_speedup=1.10, max_latency_ratio=3.0, max_failure_
     levels = metadata.get("concurrency_levels", metadata.get("levels", []))
     levels = sorted({level for level in levels if isinstance(level, int) and not isinstance(level, bool) and level >= 1})
     issues = []
+    if metadata.get("status") not in {"complete", "completed", "succeeded", "ok"}:
+        issues.append(f"run metadata status is {metadata.get('status') or 'missing'}; run incomplete")
     if not levels:
         issues.append("requested concurrency levels are missing from metadata")
     if 1 not in levels:
@@ -363,7 +377,7 @@ def analyze(root: Path, *, min_speedup=1.10, max_latency_ratio=3.0, max_failure_
         issues.append("duplicate measured trial identity")
     intervals = sorted((trial["started_at"], trial["finished_at"]) for trial in trials
                        if trial["started_at"] is not None and trial["finished_at"] is not None)
-    consecutive = zip(intervals, intervals[1:])  # noqa: RUF007 — macOS system Python 3.9 compatibility
+    consecutive = zip(intervals, intervals[1:], strict=False)  # noqa: RUF007 — adjacent intervals intentionally have unequal lengths
     if any(next_start < finish for (_, finish), (next_start, _) in consecutive) and not any(trial["timing_notes"] for trial in trials):
         issues.append("measured trials overlap on the same node")
     if any(not trial["complete"] for trial in trials):
@@ -398,9 +412,13 @@ def analyze(root: Path, *, min_speedup=1.10, max_latency_ratio=3.0, max_failure_
         elif any(item["trial_count"] < iterations for item in groups):
             cohort_issues.append("missing requested trial repetitions")
         expected_jobs = metadata.get("jobs_per_level")
-        if isinstance(expected_jobs, int) and any(trial["expected_jobs"] != expected_jobs for item in groups
-                                                 for trial in grouped[(item["corpus_id"], str(item["dispatcher_count"]), str(item["concurrency"]))]):
+        cohort_trials = [trial for item in groups
+                         for trial in grouped[(item["corpus_id"], str(item["dispatcher_count"]), str(item["concurrency"]))]]
+        if isinstance(expected_jobs, int) and any(trial["expected_jobs"] != expected_jobs for trial in cohort_trials):
             cohort_issues.append("incomplete corpus: expected_jobs differs from metadata jobs_per_level")
+        unavailable_telemetry = sorted({name for trial in cohort_trials for name in trial["telemetry_required_unavailable"]})
+        if unavailable_telemetry:
+            cohort_issues.append("required resource telemetry unavailable in measured trials: " + ", ".join(unavailable_telemetry))
         if baseline and (not baseline["jobs_per_hour"] or baseline["latency_s"]["p95"] is None):
             cohort_issues.append("missing usable C1 success rate or latency")
         if baseline and baseline["failure_rate"] is not None and baseline["failure_rate"] > max_failure_rate:
@@ -464,6 +482,7 @@ def analyze(root: Path, *, min_speedup=1.10, max_latency_ratio=3.0, max_failure_
             "Successful-job latency quantiles exclude failed and censored jobs; failure rates are reported separately.",
             "Corpus matching includes workload IDs, seeds and counts; dispatcher topologies are compared separately.",
             "No conclusion about saturation or untested concurrency levels follows from these results."]}
+    summary["limitations"].append("Capacity evidence requires measured memory availability, temperature, CPU utilization and GPU utilization in every trial; advanced counters may remain explicitly unavailable.")
     summary["limitations"].append("A mean duration drop over 20% for a matching workload/seed triggers manual quality review, not an automatic capacity recommendation.")
     _write_outputs(root, summary)
     return summary

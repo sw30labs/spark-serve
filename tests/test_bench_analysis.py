@@ -15,7 +15,7 @@ analyze = _analysis.analyze
 
 def metadata(root, **updates):
     value = {"concurrency_levels": [1, 2], "iterations": 2, "jobs_per_level": 4,
-             "workload_sha256": "owned-corpus", "synthetic": False}
+             "workload_sha256": "owned-corpus", "synthetic": False, "status": "complete"}
     value.update(updates)
     (root / "run-metadata.json").write_text(json.dumps(value))
 
@@ -45,7 +45,11 @@ def trial(root, concurrency, iteration=0, *, dispatchers=1, workloads=("short", 
               "measured": measured, "expected_jobs": 4, "status": "completed", "stop_reason": ""}
     (directory / "trial.json").write_text(json.dumps(record))
     (directory / "jobs.jsonl").write_text("\n".join(json.dumps(job) for job in jobs) + "\n")
-    (directory / "telemetry.jsonl").write_text("\n".join(json.dumps(row) for row in telemetry or []))
+    if telemetry is None:
+        telemetry = [{"timestamp_s": start + 1, "cpu": {"total_percent": 30},
+                      "memory": {"available_bytes": 64000000000},
+                      "gpus": [{"temperature_gpu_c": 60, "utilization_gpu_percent": 75}]}]
+    (directory / "telemetry.jsonl").write_text("\n".join(json.dumps(row) for row in telemetry))
     return directory
 
 
@@ -253,3 +257,36 @@ def test_missing_requested_repetitions_and_shortened_output_need_more_evidence(t
     parallel = next(row for row in result["comparisons"] if row["concurrency"] == 2)
     assert parallel["material_shortening"]
     assert not parallel["eligible"]
+
+
+@pytest.mark.parametrize("oom_flag", ["cuda_oom", "oom_killed"])
+def test_explicit_oom_is_categorized_even_when_diagnostics_also_fail(tmp_path, oom_flag):
+    complete_matrix(tmp_path)
+    path = tmp_path / "trials/d1-c2-r0/jobs.jsonl"
+    jobs = [json.loads(line) for line in path.read_text().splitlines()]
+    jobs[0].update(status="failed_integrity", error="FAILED_INTEGRITY: partial diagnostics", **{oom_flag: True})
+    path.write_text("\n".join(json.dumps(job) for job in jobs))
+    result = analyze(tmp_path)
+    parallel = next(row for row in result["comparisons"] if row["concurrency"] == 2)
+    assert parallel["failures_by_category"] == {"out_of_memory": 1}
+    assert parallel["successes"] == 7
+
+
+@pytest.mark.parametrize("mode", ["missing_file", "empty", "invalid", "missing_required_counters", "failed_run"])
+def test_run_and_resource_evidence_required_for_capacity_conclusion(tmp_path, mode):
+    complete_matrix(tmp_path)
+    telemetry = tmp_path / "trials/d1-c2-r0/telemetry.jsonl"
+    if mode == "missing_file":
+        telemetry.unlink()
+    elif mode == "empty":
+        telemetry.write_text("")
+    elif mode == "invalid":
+        telemetry.write_text('{"partial":')
+    elif mode == "missing_required_counters":
+        telemetry.write_text(json.dumps({"timestamp_s": 2201, "cpu": {"total_percent": 30}}))
+    else:
+        metadata(tmp_path, status="failed")
+    result = analyze(tmp_path)
+    assert result["evidence_status"] in {"incomplete", "underpowered"}
+    assert result["hypothesis_result"] == "not_assessed"
+    assert all(row["provisional"] for row in result["recommendations"])
