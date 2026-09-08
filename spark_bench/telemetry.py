@@ -20,10 +20,9 @@ import socket
 import subprocess
 import threading
 import time
-from datetime import datetime, timezone
+from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable
-
 
 # nvidia-smi emits MiB, MHz, W, C with nounits. Aliases avoid dependence on
 # whether a driver names clock-event counters "throttle" or "event" reasons.
@@ -141,7 +140,7 @@ class TelemetrySampler:
                 gpu = {key: None for key in (*GPU_FIELDS, *ADVANCED_COUNTERS)}
                 availability = {key: "unsupported" for key in GPU_FIELDS}
                 availability.update({key: "requires_profiler_or_dcgm" for key in ADVANCED_COUNTERS})
-                for key, raw in zip(self._gpu_fields, row):
+                for key, raw in zip(self._gpu_fields, row, strict=True):
                     raw = raw.strip()
                     scale = GPU_FIELDS[key][1]
                     value = (None if raw in ("N/A", "[N/A]", "[Not Supported]", "Not Supported", "") else raw) if scale is None else _number(raw, scale)
@@ -361,7 +360,7 @@ class TelemetrySampler:
         self._previous["time"] = start
         return {
             "schema_version": 1,
-            "timestamp_wall": datetime.fromtimestamp(wall_start, timezone.utc).isoformat(),
+            "timestamp_wall": datetime.fromtimestamp(wall_start, UTC).isoformat(),
             "monotonic_s": start, "interval_s": elapsed, "hostname": socket.gethostname(),
             "collection_duration_s": self.monotonic() - start,
             "gpus": gpus, "cpu": cpu, "load_average": load, "memory": memory,

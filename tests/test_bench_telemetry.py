@@ -9,7 +9,11 @@ import time
 import unittest
 from pathlib import Path
 
-from spark_bench.telemetry import GPU_FIELDS, TelemetryCollector, TelemetrySampler, flat_rows
+from spark_bench.telemetry import (
+    TelemetryCollector,
+    TelemetrySampler,
+    flat_rows,
+)
 
 
 class FakeClock:
