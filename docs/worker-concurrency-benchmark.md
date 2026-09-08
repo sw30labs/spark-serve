@@ -130,6 +130,15 @@ OOMKilled flag), timeout, loss of durable outcomes/telemetry, low available
 memory, swap growth or excessive GPU temperature. Defaults are 12 GiB free,
 1 GiB swap growth, and 85°C maximum; configure them explicitly for a host.
 These are experimental stop thresholds, not hardware specification claims.
+The independent `--min-temperature-margin-c 5` guard also stops when available
+driver-reported T.Limit headroom reaches 5°C or less. T.Limit is separate from
+core temperature; it must not be added to core temperature to infer an absolute
+limit. If the driver cannot report T.Limit, that optional guard is unavailable
+and the absolute-temperature and other guards still apply. The planned live
+sweep explicitly uses `--max-temperature-c 90 --min-temperature-margin-c 5`;
+the committed absolute-temperature default remains 85°C. An early guard stop
+leaves the sweep incomplete, with no H0 verdict and only provisional capacity
+candidates; skipped higher levels are not evidence of an optimum.
 Only benchmark-owned containers are cancelled. Failed WAVs, code arrays and
 logs are retained. There is no automatic retry or silence trimming.
 
