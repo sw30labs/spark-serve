@@ -16,6 +16,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .common import append_json, digest_file, write_json
+from .provenance import collect_provenance
 from .runtime import DockerRunner, NodeLease, SyntheticRunner, load_factory
 
 
@@ -263,6 +264,7 @@ def run_experiment(args):
     workload = freeze_workload(workload, root, synthetic=args.synthetic)
     run_id = 'b' + time.strftime('%Y%m%d%H%M%S') + '-' + os.urandom(3).hex()
     metadata = {'version': 1, 'run_id': run_id, 'synthetic': args.synthetic, 'node': socket.gethostname(),
+                'provenance': collect_provenance(),
                 'worker': args.worker or socket.gethostname(), 'endpoint': args.endpoint,
                 'architecture': 'one experimental dispatcher; independent model process/container per job',
                 'concurrency_definition': 'active inference containers per physical Spark',

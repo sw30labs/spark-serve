@@ -230,6 +230,21 @@ separately from absolute core temperature. T.Limit is driver-reported remaining
 thermal margin; adding it to the core temperature does not establish an absolute
 safe temperature limit.
 
+New runs also record `run-metadata.json.provenance`: SHA256 fingerprints of the
+deployed `spark_bench/*.py` files and controller source, host kernel/machine and
+Python version, and the host NVIDIA driver version when queryable. Missing
+files or unsupported queries remain explicit inventory gaps. This inventory
+does not include environment variables or private configuration. Source hashes
+describe bytes present at capture time; they do not prove which bytes a running
+interpreter loaded if someone later changes its source files.
+
+The provenance record checks NVIDIA sampling-field support and whether `dcgmi`,
+`ncu`, and `nsys` are on PATH without executing any profiler. Tool presence does
+not prove that SM, tensor, or actual memory-bandwidth metrics are available on
+GB10: those require a separate controlled capability/profiling run. No profiling
+instrumentation is attached to a measured concurrency sweep. A tool absent
+from PATH is not necessarily absent from the machine.
+
 Where supported, cumulative clock-event counters expose microseconds spent under
 software power caps, software/hardware thermal slowdown, hardware power braking,
 and synchronization boost. Analysis recomputes increments within each measured
@@ -321,3 +336,14 @@ and report measured throttle-counter increments. A zero-margin guard provides
 less advance headroom, and sampling cannot prevent a brief boundary crossing.
 If that attempt also stops, it remains incomplete; do not relax guards silently
 or combine the two attempts into a completed throughput comparison.
+
+The separate zero-margin attempt launched from commit
+`2a5b9c788a24f85e1cc6ce576f5b3034158c383d` before automatic provenance capture
+was added. Its original `launch.json` records that commit, and its remote
+`src/` directory remains preserved. A read-only post-launch capture at
+2026-09-08 21:56:37 UTC verified all nine source hashes against that commit;
+the local `provenance-sidecar.json` records this comparison without modifying
+the running sweep or its original metadata. It recorded Linux
+`6.17.0-1032-nvidia`, aarch64, CPython 3.12.3, and host NVIDIA driver 580.173.02.
+`nsys` was on PATH; `dcgmi` and `ncu` were not. No profiler was executed and
+advanced-counter availability remains unverified beyond the current sampler.
