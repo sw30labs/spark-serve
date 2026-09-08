@@ -138,6 +138,9 @@ unchanged. Use `--ssh-host` to drain one configured Spark and hold workload owne
 through the experiment. See [the benchmark guide](docs/worker-concurrency-benchmark.md)
 for workload setup, guards, raw results and the criteria for a capacity recommendation.
 
+The [September 8 handover](docs/handover-2026-09-08.md) records the cooling pause,
+preserved evidence, active replay and commands for resuming both investigations.
+
 Add a model by copying a `[models.<id>]` table. `wrapper = "vllm"` for a stock
 `vllm/vllm-openai:*` image (ENTRYPOINT already `vllm serve`). `wrapper = "dsv4"`
 for the Aiden GB10 DeepSeek image.
