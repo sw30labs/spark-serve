@@ -112,6 +112,7 @@ def _timestamp(record):
 
 _TELEMETRY_FIELDS = {
     "gpu_temperature_c": ("gpus", "temperature_gpu_c"),
+    "gpu_temperature_tlimit_c": ("gpus", "temperature_tlimit_c"),
     "gpu_power_watts": ("gpus", "power_draw_watts"),
     "gpu_power_limit_watts": ("gpus", "power_limit_watts"),
     "gpu_utilization_percent": ("gpus", "utilization_gpu_percent"),
@@ -132,8 +133,77 @@ _TELEMETRY_FIELDS = {
 
 _REQUIRED_TELEMETRY = ("memory_available_bytes", "gpu_temperature_c", "cpu_percent", "gpu_utilization_percent")
 
+_THROTTLE_COUNTERS = (
+    "clock_event_sw_power_cap_us", "clock_event_sw_thermal_us", "clock_event_hw_thermal_us",
+    "clock_event_hw_power_brake_us", "clock_event_sync_boost_us",
+)
 
-def _telemetry(rows):
+
+def _throttle_deltas(rows):
+    """Count only adjacent observed increments, never driver-lifetime totals."""
+    counters = {field: {"observed_delta_us": None, "observed_interval_s": 0.0,
+        "valid_intervals": 0, "reset_intervals": 0, "unavailable_intervals": 0,
+        "time_discontinuities": 0} for field in _THROTTLE_COUNTERS}
+    previous = {}
+    for row in rows:
+        stamp = _number(row.get("monotonic_s"))
+        basis = "monotonic" if stamp is not None else "epoch"
+        stamp = stamp if stamp is not None else _timestamp(row)
+        current = {}
+        for gpu in row.get("gpus") or []:
+            identity = gpu.get("uuid") if isinstance(gpu, dict) else None
+            if not isinstance(identity, str) or not identity:
+                for counter in counters.values():
+                    counter["unavailable_intervals"] += 1
+                continue
+            key = (str(row.get("hostname") or ""), identity)
+            values = {field: _number(gpu.get(field)) for field in _THROTTLE_COUNTERS}
+            current[key] = (basis, stamp, values)
+            old = previous.get(key)
+            if old is None:
+                continue
+            old_basis, old_stamp, old_values = old
+            for field, counter in counters.items():
+                value, old_value = values[field], old_values[field]
+                if value is None or old_value is None or value < 0 or old_value < 0:
+                    counter["unavailable_intervals"] += 1
+                elif stamp is None or old_stamp is None or basis != old_basis or stamp <= old_stamp:
+                    counter["time_discontinuities"] += 1
+                elif value < old_value:
+                    counter["reset_intervals"] += 1
+                else:
+                    counter["observed_delta_us"] = (counter["observed_delta_us"] or 0) + value - old_value
+                    counter["observed_interval_s"] += stamp - old_stamp
+                    counter["valid_intervals"] += 1
+        for _missing in previous.keys() - current.keys():
+            for counter in counters.values():
+                counter["unavailable_intervals"] += 1
+        # A missing sample or changed GPU cannot bridge counter lifetimes.
+        previous = current
+    for counter in counters.values():
+        delta = counter["observed_delta_us"]
+        counter["observed_delta_s"] = delta / 1_000_000 if delta is not None else None
+        incomplete = any(counter[key] for key in ("reset_intervals", "unavailable_intervals", "time_discontinuities"))
+        counter["availability"] = "unavailable" if delta is None else "partial" if incomplete else "available"
+    return counters
+
+
+def _combine_throttle_deltas(trials):
+    combined = {}
+    for field in _THROTTLE_COUNTERS:
+        samples = [trial[field] for trial in trials]
+        deltas = [sample["observed_delta_us"] for sample in samples if sample["observed_delta_us"] is not None]
+        total = sum(deltas) if deltas else None
+        combined[field] = {"observed_delta_us": total, "observed_delta_s": total / 1_000_000 if total is not None else None,
+            **{key: sum(sample[key] for sample in samples) for key in
+               ("observed_interval_s", "valid_intervals", "reset_intervals", "unavailable_intervals", "time_discontinuities")},
+            "trial_count": len(samples), "available_trials": len(deltas),
+            "availability": "unavailable" if not deltas else
+                "available" if all(sample["availability"] == "available" for sample in samples) else "partial"}
+    return combined
+
+
+def _telemetry(rows, *, counter_trials=None):
     metrics = {}
     for name, (section, field) in _TELEMETRY_FIELDS.items():
         values, available = [], 0
@@ -160,9 +230,14 @@ def _telemetry(rows):
                 for key, value in availability.items():
                     counters[f"{prefix}.{key}"].add(json.dumps(value, sort_keys=True))
     return {"sample_count": len(rows), "metrics": metrics,
+            "throttle_counters": _combine_throttle_deltas(counter_trials if counter_trials is not None else [_throttle_deltas(rows)]),
             "counter_availability": {key: [json.loads(value) for value in sorted(values)]
                                      for key, values in sorted(counters.items())},
-            "notes": ["GPU memory utilization is not measured memory bandwidth; missing counters are unavailable."]}
+            "notes": ["GPU memory utilization is not measured memory bandwidth; missing counters are unavailable.",
+                "T.Limit is signed driver-reported thermal headroom; it is not an absolute temperature limit or a value to add to core temperature.",
+                "Throttle counters are cumulative microseconds. Only adjacent increments for the same host/GPU UUID within a trial are counted; the first sample and cross-trial gaps are excluded.",
+                "Counter decreases, time restarts and missing identity/values break continuity. Partial deltas are observed lower bounds; an unobserved driver reset with no visible decrease cannot be ruled out.",
+                "Throttle categories can overlap. Their durations must not be summed as total throttled wall time."]}
 
 
 def _trial(directory):
@@ -277,6 +352,8 @@ def _trial(directory):
             "workload_counts": dict(Counter(str(job.get("workload_id") or "unknown") for job in jobs)),
             "timing_notes": sorted(set(timing_notes)), "telemetry_issues": telemetry_issues,
             "telemetry_sample_count": len(telemetry), "telemetry_required_unavailable": telemetry_unavailable,
+            "thermal_headroom_min_c": telemetry_metrics["metrics"]["gpu_temperature_tlimit_c"]["min"],
+            "throttle_counters": telemetry_metrics["throttle_counters"],
             "_jobs": jobs, "_telemetry": telemetry}
 
 
@@ -319,7 +396,8 @@ def _aggregate(trials):
              "overlap_basis": sorted({trial["overlap_basis"] for trial in trials}),
              "reported_max_active_observed": max((value for job in jobs
                  if (value := _number(job.get("max_active_observed"))) is not None), default=None),
-             "telemetry": _telemetry([row for trial in trials for row in trial["_telemetry"]]),
+             "telemetry": _telemetry([row for trial in trials for row in trial["_telemetry"]],
+                                     counter_trials=[_throttle_deltas(trial["_telemetry"]) for trial in trials]),
              "issues": sorted({issue for trial in trials for issue in trial["issues"]}),
              "timing_notes": sorted({note for trial in trials for note in trial["timing_notes"]})}
     group["workloads"] = {workload: {"job_count": sum(job.get("workload_id") == workload for job in jobs),
@@ -337,10 +415,10 @@ def _aggregate(trials):
     return group
 
 
-def _display(value):
+def _display(value, digits=3):
     if value is None:
         return "unavailable"
-    return f"{value:.3f}" if isinstance(value, float) else str(value)
+    return f"{value:.{digits}f}" if isinstance(value, float) else str(value)
 
 
 def analyze(root: Path, *, min_speedup=1.10, max_latency_ratio=3.0, max_failure_rate=0.0) -> dict:
@@ -531,7 +609,14 @@ def _write_outputs(root, summary):
         report.append(f"- {item['corpus_id']} / D{item['dispatcher_count']} / C{item['concurrency']}: " + "; ".join(
             f"{name}: {_display(item['telemetry']['metrics'][name]['max'])} ({item['telemetry']['metrics'][name]['availability']})"
             for name in ("gpu_temperature_c", "gpu_power_watts", "gpu_memory_used_bytes", "memory_used_bytes")))
+        headroom = item["telemetry"]["metrics"]["gpu_temperature_tlimit_c"]
+        report.append(f"  T.Limit headroom minimum: {_display(headroom['min'])} °C ({headroom['availability']}). "
+            + "Observed throttle seconds within trials: " + "; ".join(
+                f"{field.removeprefix('clock_event_').removesuffix('_us')}: {_display(counter['observed_delta_s'], 6)} "
+                f"({counter['availability']}; resets={counter['reset_intervals']})"
+                for field, counter in item["telemetry"]["throttle_counters"].items()) + ".")
     report += ["", "Missing telemetry is unavailable, never zero. Detailed counter availability and per-workload results are in summary.json.",
+               "T.Limit is signed thermal headroom, not an absolute threshold. Throttle deltas exclude the initial lifetime totals, trial gaps and reset/gap intervals; partial values are lower bounds. Categories may overlap.",
                "", "## Interpretation limits", ""] + ["- " + note for note in summary["limitations"]]
     for name, content in (("comparison.csv", output.getvalue()), ("report.md", "\n".join(report) + "\n"),
                           ("summary.json", json.dumps(summary, indent=2, sort_keys=True, allow_nan=False) + "\n")):

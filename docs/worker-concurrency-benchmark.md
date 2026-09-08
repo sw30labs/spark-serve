@@ -216,6 +216,26 @@ records in `results/`. Large WAV/token evidence remains on the Spark at the
 recorded path. Logs contain no credentials, full process command lines or binary
 reference data. Analysis can be rerun from the compact records at any time.
 
+Resource summaries report the minimum signed `temperature_tlimit_c` headroom
+separately from absolute core temperature. T.Limit is driver-reported remaining
+thermal margin; adding it to the core temperature does not establish an absolute
+safe temperature limit.
+
+Where supported, cumulative clock-event counters expose microseconds spent under
+software power caps, software/hardware thermal slowdown, hardware power braking,
+and synchronization boost. Analysis recomputes increments within each measured
+trial for consecutive observations of the same host/GPU UUID. It never charges
+the first driver-lifetime total, a sampler-provided first delta, or activity in
+the gap between trials. Counter decreases, clock restarts, missing observations,
+and GPU identity changes break continuity; only observed valid intervals are
+summed. Partial sums are lower bounds, and missing counters remain unavailable.
+A driver reset that leaves no visible counter decrease cannot be inferred from
+these samples. These event categories may overlap and must not be added together
+as total throttled wall time. Counter increases can reveal throttling between
+samples even when each sampled instantaneous event flag is inactive. These
+advanced counters and headroom remain optional evidence, without changing the
+required basic-resource telemetry gate.
+
 ## Analysis and capacity recommendation methodology
 
 Comparisons match the exact workload-ID/seed multiset and dispatcher topology to

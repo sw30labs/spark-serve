@@ -290,3 +290,72 @@ def test_run_and_resource_evidence_required_for_capacity_conclusion(tmp_path, mo
     assert result["evidence_status"] in {"incomplete", "underpowered"}
     assert result["hypothesis_result"] == "not_assessed"
     assert all(row["provisional"] for row in result["recommendations"])
+
+
+def thermal_samples(values, *, start=2100, uuids=None, monotonic=None, headroom=None):
+    rows = []
+    for index, value in enumerate(values):
+        gpu = {"uuid": uuids[index] if uuids is not None else "GPU-one",
+               "temperature_gpu_c": 82 - index, "utilization_gpu_percent": 95,
+               "temperature_tlimit_c": headroom[index] if headroom is not None else 10 - index,
+               "clock_event_sw_thermal_us": value,
+               "clock_event_sw_thermal_delta_us": 999999999,
+               "clock_event_sw_thermal": "Not Active"}
+        rows.append({"hostname": "spark-one", "timestamp_s": start + 1 + index,
+                     "monotonic_s": monotonic[index] if monotonic is not None else 100 + index,
+                     "cpu": {"total_percent": 30}, "memory": {"available_bytes": 64000000000},
+                     "gpus": [gpu]})
+    return rows
+
+
+def test_throttle_deltas_exclude_lifetime_totals_and_between_trial_activity(tmp_path):
+    metadata(tmp_path)
+    trial(tmp_path, 1, 0, telemetry=thermal_samples([10_000_000, 11_000_000], headroom=[18, 7]))
+    trial(tmp_path, 1, 1, telemetry=thermal_samples([90_000_000, 92_000_000], start=12100,
+                                                 monotonic=[100, 102], headroom=[9, -2]))
+    for iteration in range(2):
+        trial(tmp_path, 2, iteration)
+    result = analyze(tmp_path)
+    assert result["evidence_status"] == "complete"  # Advanced counters stay optional.
+    baseline = next(row for row in result["comparisons"] if row["concurrency"] == 1)
+    counters = baseline["telemetry"]["throttle_counters"]
+    observed = counters["clock_event_sw_thermal_us"]
+    assert observed["observed_delta_us"] == 3_000_000
+    assert observed["observed_delta_s"] == 3
+    assert observed["valid_intervals"] == 2
+    assert observed["availability"] == "available"
+    assert counters["clock_event_sw_power_cap_us"]["observed_delta_us"] is None
+    assert baseline["telemetry"]["metrics"]["gpu_temperature_tlimit_c"]["min"] == -2
+    assert "T.Limit headroom minimum: -2.000" in (tmp_path / "report.md").read_text()
+    # The sampled flags never report an active event, but cumulative deltas do.
+    assert observed["observed_delta_us"] > 0
+
+
+@pytest.mark.parametrize(("values", "options", "expected", "resets", "discontinuities"), [
+    ([100, 105, 2, 7], {}, 10, 1, 0),
+    ([100, None, 300, 305], {}, 5, 0, 0),
+    ([100, 105, 700, 705], {"monotonic": [10, 11, 1, 2]}, 10, 0, 1),
+    ([100, 500, 700, 705], {"uuids": ["GPU-a", "GPU-b", "GPU-a", "GPU-a"]}, 5, 0, 0),
+    ([100, 500], {"uuids": [None, None]}, None, 0, 0),
+    ([100], {}, None, 0, 0),
+])
+def test_counter_resets_missing_data_and_identity_changes_never_charge_lifetime(
+    tmp_path, values, options, expected, resets, discontinuities,
+):
+    metadata(tmp_path)
+    trial(tmp_path, 1, telemetry=thermal_samples(values, **options))
+    telemetry = analyze(tmp_path)["comparisons"][0]["telemetry"]
+    observed = telemetry["throttle_counters"]["clock_event_sw_thermal_us"]
+    assert observed["observed_delta_us"] == expected
+    assert observed["reset_intervals"] == resets
+    assert observed["time_discontinuities"] == discontinuities
+    assert observed["availability"] == ("unavailable" if expected is None else "partial")
+
+
+def test_zero_counter_increment_is_measured_zero_not_unavailable(tmp_path):
+    metadata(tmp_path)
+    trial(tmp_path, 1, telemetry=thermal_samples([100, 100]))
+    observed = analyze(tmp_path)["comparisons"][0]["telemetry"]["throttle_counters"]["clock_event_sw_thermal_us"]
+    assert observed["observed_delta_us"] == 0
+    assert observed["observed_delta_s"] == 0
+    assert observed["availability"] == "available"
