@@ -459,6 +459,10 @@ class TelemetryCollector:
             self._thread.join(timeout=20)
             if self._thread.is_alive():
                 raise RuntimeError("telemetry collector did not stop within timeout")
+        self.raise_if_failed()
+
+    def raise_if_failed(self):
+        """Nonblocking check for a controller to stop when raw capture fails."""
         if self._error is not None:
             raise RuntimeError("telemetry collection failed") from self._error
 

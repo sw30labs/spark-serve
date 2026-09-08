@@ -209,6 +209,8 @@ class TelemetryTests(unittest.TestCase):
         collector = TelemetryCollector(self.root / "broken", sampler=Broken()).start()
         collector._thread.join(timeout=2)
         with self.assertRaisesRegex(RuntimeError, "collection failed"):
+            collector.raise_if_failed()
+        with self.assertRaisesRegex(RuntimeError, "collection failed"):
             collector.stop()
 
 
