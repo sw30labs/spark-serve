@@ -299,6 +299,21 @@ At least two complete independent measured trials per requested level, two
 workload types, matched C1, real inference overlap and nonsynthetic records are
 required for a nonprovisional inference. Missing levels, censored outcomes,
 infrastructure failures, lost telemetry and incomplete runs remain visible.
+Each completed repetition must itself attain its requested concurrency; a high
+peak in another repetition cannot substitute for it. Required memory, core
+temperature, CPU and GPU utilization metrics must each have at least three
+distinct valid samples, at least 80% temporal coverage, and no gap longer than
+three configured telemetry intervals. Coverage includes both trial edges and
+allows each sample to support only half an interval on either side. The
+centralized policy is recorded in `summary.json` and can be explicitly supplied
+through `analyze(..., telemetry_coverage_policy=...)`; a missing interval setting
+uses the recorded policy's 2-second fallback. Monotonic sample time is preferred;
+older trials without a monotonic start anchor use their first paired wall/monotonic
+sample to locate the trial boundary. Timestamp reversals or repeated timestamps
+prevent a complete coverage verdict. Sparse historical runs keep their original
+numerical throughput but become provisional until sufficient evidence exists.
+Per-metric sample counts, temporal coverage and maximum gaps are retained for
+each trial and summarized across repetitions.
 The conservative default candidate needs >=10% aggregate speedup, no failures,
 and p95 latency no worse than 3x baseline. Missing resource evidence prevents a
 strong bottleneck claim. Thresholds for analysis can be supplied to `analyze()`;

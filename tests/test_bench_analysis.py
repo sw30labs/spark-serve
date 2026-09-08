@@ -15,7 +15,7 @@ analyze = _analysis.analyze
 
 def metadata(root, **updates):
     value = {"concurrency_levels": [1, 2], "iterations": 2, "jobs_per_level": 4,
-             "workload_sha256": "owned-corpus", "synthetic": False, "status": "complete"}
+             "workload_sha256": "owned-corpus", "synthetic": False, "status": "complete", "telemetry_interval_s": 2}
     value.update(updates)
     (root / "run-metadata.json").write_text(json.dumps(value))
 
@@ -46,9 +46,10 @@ def trial(root, concurrency, iteration=0, *, dispatchers=1, workloads=("short", 
     (directory / "trial.json").write_text(json.dumps(record))
     (directory / "jobs.jsonl").write_text("\n".join(json.dumps(job) for job in jobs) + "\n")
     if telemetry is None:
-        telemetry = [{"timestamp_s": start + 1, "cpu": {"total_percent": 30},
+        telemetry = [{"timestamp_s": start + offset, "monotonic_s": start + offset, "cpu": {"total_percent": 30},
                       "memory": {"available_bytes": 64000000000},
-                      "gpus": [{"temperature_gpu_c": 60, "utilization_gpu_percent": 75}]}]
+                      "gpus": [{"temperature_gpu_c": 60, "utilization_gpu_percent": 75}]}
+                     for offset in range(1, int(span), 2)]
     (directory / "telemetry.jsonl").write_text("\n".join(json.dumps(row) for row in telemetry))
     return directory
 
@@ -310,9 +311,9 @@ def thermal_samples(values, *, start=2100, uuids=None, monotonic=None, headroom=
 
 def test_throttle_deltas_exclude_lifetime_totals_and_between_trial_activity(tmp_path):
     metadata(tmp_path)
-    trial(tmp_path, 1, 0, telemetry=thermal_samples([10_000_000, 11_000_000], headroom=[18, 7]))
-    trial(tmp_path, 1, 1, telemetry=thermal_samples([90_000_000, 92_000_000], start=12100,
-                                                 monotonic=[100, 102], headroom=[9, -2]))
+    trial(tmp_path, 1, 0, telemetry=thermal_samples([10_000_000] + [11_000_000] * 39, headroom=[18] + [7] * 39))
+    trial(tmp_path, 1, 1, telemetry=thermal_samples([90_000_000] + [92_000_000] * 39, start=12100,
+                                                 headroom=[9] + [-2] * 39))
     for iteration in range(2):
         trial(tmp_path, 2, iteration)
     result = analyze(tmp_path)
@@ -322,7 +323,7 @@ def test_throttle_deltas_exclude_lifetime_totals_and_between_trial_activity(tmp_
     observed = counters["clock_event_sw_thermal_us"]
     assert observed["observed_delta_us"] == 3_000_000
     assert observed["observed_delta_s"] == 3
-    assert observed["valid_intervals"] == 2
+    assert observed["valid_intervals"] == 78
     assert observed["availability"] == "available"
     assert counters["clock_event_sw_power_cap_us"]["observed_delta_us"] is None
     assert baseline["telemetry"]["metrics"]["gpu_temperature_tlimit_c"]["min"] == -2
@@ -370,7 +371,9 @@ def test_decision_report_exposes_scoped_capacity_cost_and_unresolved_bottleneck(
                      "gpus": [{"temperature_gpu_c": 80, "temperature_tlimit_c": 8,
                                "utilization_gpu_percent": 99, "power_draw_watts": 110,
                                "memory_used_bytes": 16 * 2**30}]}
-        (directory / "telemetry.jsonl").write_text(json.dumps(telemetry))
+        (directory / "telemetry.jsonl").write_text("\n".join(json.dumps({**telemetry,
+            "timestamp_s": record["started_at"] + offset})
+            for offset in range(1, int(record["finished_at"] - record["started_at"]), 2)))
     result = analyze(tmp_path)
     report = (tmp_path / "report.md").read_text()
     for label in ("BASELINE", "BEST TESTED", "SPEEDUP", "COST", "BOTTLENECK", "CONCLUSION",
@@ -587,3 +590,79 @@ def test_c1_winner_still_requires_multiwave_check_when_higher_levels_had_short_b
     assert "Small batches at C=[4]" in report
     assert "at least 16 same-mix jobs per trial" in report
     assert "Small-batch candidate; sustained queue capacity requires" in report
+
+
+def test_one_repetition_reaching_concurrency_cannot_mask_serialized_repetition(tmp_path):
+    complete_matrix(tmp_path)
+    path = tmp_path / "trials/d1-c2-r1/jobs.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    start = rows[0]["started_at"]
+    for row, offset in zip(rows, [1, 5, 11, 15], strict=True):
+        row.update(inference_started_at=start + offset, inference_finished_at=start + offset + 3)
+    path.write_text("\n".join(json.dumps(row) for row in rows))
+    result = analyze(tmp_path)
+    parallel = next(item for item in result["comparisons"] if item["concurrency"] == 2)
+    assert parallel["max_active_observed"] == 2  # Historical group metric is unchanged.
+    assert parallel["jobs_per_hour"] == 720
+    assert parallel["complete_trial_count"] == 1
+    assert result["hypothesis_result"] == "not_assessed"
+    assert any("not exercised in this trial" in issue for issue in parallel["issues"])
+
+
+def test_single_good_telemetry_sample_cannot_validate_a_long_completed_trial(tmp_path):
+    complete_matrix(tmp_path)
+    path = tmp_path / "trials/d1-c2-r0/telemetry.jsonl"
+    path.write_text(path.read_text().splitlines()[0])
+    result = analyze(tmp_path)
+    observed = next(item for item in result["trials"] if item["trial_id"] == "d1-c2-r0")
+    coverage = observed["telemetry_coverage"]["metrics"]["cpu_percent"]
+    assert coverage["valid_samples"] == 1
+    assert coverage["coverage_fraction"] == .1
+    assert coverage["maximum_gap_s"] == 19
+    assert not coverage["sufficient"]
+    assert observed["makespan_s"] == 20
+    assert result["hypothesis_result"] == "not_assessed"
+    assert all(item["provisional"] for item in result["recommendations"])
+
+
+def test_required_metric_gap_is_rejected_even_with_over_eighty_percent_support(tmp_path):
+    complete_matrix(tmp_path)
+    path = tmp_path / "trials/d1-c1-r0/telemetry.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    for row in rows:
+        if row["timestamp_s"] in [2109, 2111, 2113]:
+            row["cpu"]["total_percent"] = None
+    path.write_text("\n".join(json.dumps(row) for row in rows))
+    result = analyze(tmp_path)
+    observed = next(item for item in result["trials"] if item["trial_id"] == "d1-c1-r0")
+    metrics = observed["telemetry_coverage"]["metrics"]
+    assert metrics["cpu_percent"]["coverage_fraction"] == .85
+    assert metrics["cpu_percent"]["maximum_gap_s"] == 8
+    assert metrics["gpu_temperature_c"]["coverage_fraction"] == 1
+    assert result["hypothesis_result"] == "not_assessed"
+    # An explicit recorded analysis policy can permit the larger gap; raw data
+    # and numerical throughput do not change between policy evaluations.
+    relaxed = analyze(tmp_path, telemetry_coverage_policy={"max_gap_intervals": 4})
+    assert relaxed["telemetry_coverage_policy"]["max_gap_intervals"] == 4
+    assert relaxed["hypothesis_result"] == "h0_falsified"
+    assert [item["jobs_per_hour"] for item in relaxed["comparisons"]] == [item["jobs_per_hour"] for item in result["comparisons"]]
+
+
+def test_duplicate_timestamps_do_not_inflate_valid_sample_count(tmp_path):
+    complete_matrix(tmp_path)
+    path = tmp_path / "trials/d1-c2-r0/telemetry.jsonl"
+    first = path.read_text().splitlines()[0]
+    path.write_text("\n".join([first] * 100))
+    result = analyze(tmp_path)
+    observed = next(item for item in result["trials"] if item["trial_id"] == "d1-c2-r0")
+    assert observed["telemetry_coverage"]["metrics"]["cpu_percent"]["valid_samples"] == 1
+    assert observed["telemetry_coverage"]["time_discontinuities"] == 99
+    assert result["hypothesis_result"] == "not_assessed"
+
+
+@pytest.mark.parametrize("policy", [{"unknown": 1}, {"min_coverage_fraction": 0},
+                                   {"max_gap_intervals": .5}, {"min_valid_samples": 1},
+                                   {"default_interval_s": float("nan")}])
+def test_invalid_telemetry_coverage_policy_rejected_before_reading_results(tmp_path, policy):
+    with pytest.raises(ValueError, match="telemetry coverage policy"):
+        analyze(tmp_path, telemetry_coverage_policy=policy)

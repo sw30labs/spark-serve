@@ -188,6 +188,57 @@ _TELEMETRY_FIELDS = {
 }
 
 _REQUIRED_TELEMETRY = ("memory_available_bytes", "gpu_temperature_c", "cpu_percent", "gpu_utilization_percent")
+_TELEMETRY_COVERAGE_POLICY = {"min_coverage_fraction": .8, "max_gap_intervals": 3.0,
+                              "min_valid_samples": 3, "default_interval_s": 2.0}
+
+
+def _telemetry_coverage(rows, raw_trial, duration, interval_s, policy):
+    """Bound each sample's support to half the requested interval on each side."""
+    epoch_start = _number(raw_trial.get("started_at"))
+    mono_start = _number(raw_trial.get("started_monotonic"))
+    use_mono = any(_number(row.get("monotonic_s")) is not None for row in rows)
+    boundary_source = "recorded_trial_monotonic_start" if mono_start is not None else "trial_epoch_start"
+    if use_mono and mono_start is None and epoch_start is not None:
+        anchor = next((row for row in rows if _number(row.get("monotonic_s")) is not None
+                       and _timestamp(row) is not None), None)
+        if anchor is not None:
+            mono_start = anchor["monotonic_s"] - (_timestamp(anchor) - epoch_start)
+            boundary_source = "first_paired_sample_anchor_to_trial_epoch_start"
+    origin = mono_start if use_mono else epoch_start
+    stamps = [(_number(row.get("monotonic_s")) if use_mono else _timestamp(row)) for row in rows]
+    finite_stamps = [stamp for stamp in stamps if stamp is not None]
+    discontinuities = sum(right <= left for left, right in zip(finite_stamps, finite_stamps[1:], strict=False))
+    result = {"basis": "monotonic" if use_mono else "epoch", "boundary_source": boundary_source,
+              "expected_interval_s": interval_s, "duration_s": duration, "policy": dict(policy),
+              "time_discontinuities": discontinuities, "metrics": {}, "sufficient": True}
+    for name in _REQUIRED_TELEMETRY:
+        section, field = _TELEMETRY_FIELDS[name]
+        valid = []
+        for row, stamp in zip(rows, stamps, strict=True):
+            parts = row.get(section) or ([] if section == "gpus" else {})
+            parts = parts if isinstance(parts, list) else [parts]
+            available = any(isinstance(part, dict) and _number(part.get(field)) is not None for part in parts)
+            if (available and stamp is not None and origin is not None and duration is not None
+                    and 0 <= stamp - origin <= duration):
+                valid.append(stamp - origin)
+        valid = sorted(set(valid))
+        covered = 0.0
+        previous_end = 0.0
+        for stamp in valid:
+            left, right = max(0, stamp - interval_s / 2), min(duration, stamp + interval_s / 2)
+            covered += max(0, right - max(left, previous_end))
+            previous_end = max(previous_end, right)
+        fraction = covered / duration if duration and duration > 0 else None
+        boundaries = [0, *valid, duration] if duration is not None else []
+        maximum_gap = max((right - left for left, right in zip(boundaries, boundaries[1:], strict=False)), default=None)
+        sufficient = bool(fraction is not None and fraction >= policy["min_coverage_fraction"]
+                          and len(valid) >= policy["min_valid_samples"] and maximum_gap is not None
+                          and maximum_gap <= policy["max_gap_intervals"] * interval_s and not discontinuities)
+        result["metrics"][name] = {"valid_samples": len(valid), "total_samples": len(rows),
+            "covered_s": covered if fraction is not None else None, "coverage_fraction": fraction,
+            "maximum_gap_s": maximum_gap, "sufficient": sufficient}
+        result["sufficient"] = result["sufficient"] and sufficient
+    return result
 
 _THROTTLE_COUNTERS = (
     "clock_event_sw_power_cap_us", "clock_event_sw_thermal_us", "clock_event_hw_thermal_us",
@@ -296,7 +347,7 @@ def _telemetry(rows, *, counter_trials=None):
                 "Throttle categories can overlap. Their durations must not be summed as total throttled wall time."]}
 
 
-def _trial(directory):
+def _trial(directory, *, telemetry_interval_s=2.0, coverage_policy=None):
     issues = []
     timing_notes = []
     try:
@@ -381,6 +432,8 @@ def _trial(directory):
     occupancy = _inference_occupancy(inference_jobs, concurrency, *keys, missing_intervals=missing_inference)
     if maximum is not None and isinstance(concurrency, int) and maximum > concurrency:
         issues.append("actual overlap exceeds configured concurrency")
+    elif maximum is not None and isinstance(concurrency, int) and maximum < concurrency:
+        issues.append(f"requested concurrency not exercised in this trial: observed {maximum}, requested {concurrency}")
     telemetry_issues = []
     telemetry = _jsonl(directory / "telemetry.jsonl", telemetry_issues)
     telemetry = [row for row in telemetry if (stamp := _timestamp(row)) is None
@@ -392,6 +445,11 @@ def _trial(directory):
         telemetry_unavailable.append("timestamped trial telemetry")
     if telemetry_issues:
         issues.extend("incomplete telemetry: " + issue for issue in telemetry_issues)
+    coverage = _telemetry_coverage(telemetry, raw, makespan, telemetry_interval_s,
+                                   coverage_policy or _TELEMETRY_COVERAGE_POLICY)
+    for name, observation in coverage["metrics"].items():
+        if not observation["sufficient"]:
+            issues.append("insufficient required telemetry coverage: " + name)
     corpus = sorted(Counter((str(job.get("workload_id") or "unknown"), str(job.get("seed")))
                             for job in jobs).items())
     corpus_id = hashlib.sha256(json.dumps(corpus).encode()).hexdigest()[:12]
@@ -414,6 +472,7 @@ def _trial(directory):
             "timing_notes": sorted(set(timing_notes)), "telemetry_issues": telemetry_issues,
             "telemetry_sample_count": len(telemetry), "telemetry_required_unavailable": telemetry_unavailable,
             "thermal_headroom_min_c": telemetry_metrics["metrics"]["gpu_temperature_tlimit_c"]["min"],
+            "telemetry_coverage": coverage,
             "throttle_counters": telemetry_metrics["throttle_counters"],
             "_jobs": jobs, "_telemetry": telemetry}
 
@@ -468,6 +527,16 @@ def _aggregate(trials):
     waves = [trial["batch_waves"] for trial in trials if trial["batch_waves"] is not None]
     group["batch_waves_min"] = min(waves) if waves else None
     group["multiwave_followup_recommended"] = any(trial["multiwave_followup_recommended"] for trial in trials)
+    group["telemetry_coverage"] = {"trial_count": len(trials), "metrics": {}}
+    for name in _REQUIRED_TELEMETRY:
+        observations = [(trial["trial_id"], trial["telemetry_coverage"]["metrics"][name]) for trial in trials]
+        fractions = [item["coverage_fraction"] for _, item in observations if item["coverage_fraction"] is not None]
+        gaps = [item["maximum_gap_s"] for _, item in observations if item["maximum_gap_s"] is not None]
+        group["telemetry_coverage"]["metrics"][name] = {
+            "minimum_trial_coverage_fraction": min(fractions) if fractions else None,
+            "maximum_gap_s": max(gaps) if gaps else None,
+            "valid_samples": sum(item["valid_samples"] for _, item in observations),
+            "insufficient_trials": [identity for identity, item in observations if not item["sufficient"]]}
     group["workloads"] = {workload: {"job_count": sum(job.get("workload_id") == workload for job in jobs),
         "successes": sum(job.get("workload_id") == workload for job in successful),
         "jobs_per_hour": per_hour(sum(job.get("workload_id") == workload for job in successful)),
@@ -489,7 +558,8 @@ def _display(value, digits=3):
     return f"{value:.{digits}f}" if isinstance(value, float) else str(value)
 
 
-def analyze(root: Path, *, min_speedup=1.10, max_latency_ratio=3.0, max_failure_rate=0.0) -> dict:
+def analyze(root: Path, *, min_speedup=1.10, max_latency_ratio=3.0, max_failure_rate=0.0,
+            telemetry_coverage_policy=None) -> dict:
     """Write comparison.csv, report.md, summary.json without executing workloads."""
     root = Path(root)
     for name, value, minimum in (("min_speedup", min_speedup, 1), ("max_latency_ratio", max_latency_ratio, 0),
@@ -498,9 +568,22 @@ def analyze(root: Path, *, min_speedup=1.10, max_latency_ratio=3.0, max_failure_
             raise ValueError(f"invalid {name}")
     if max_failure_rate > 1:
         raise ValueError("max_failure_rate must be at most 1")
+    policy = dict(_TELEMETRY_COVERAGE_POLICY)
+    if telemetry_coverage_policy is not None:
+        if not isinstance(telemetry_coverage_policy, dict) or set(telemetry_coverage_policy) - set(policy):
+            raise ValueError("unknown telemetry coverage policy fields")
+        policy.update(telemetry_coverage_policy)
+    if (_number(policy["min_coverage_fraction"]) is None or not 0 < policy["min_coverage_fraction"] <= 1
+            or _number(policy["max_gap_intervals"]) is None or policy["max_gap_intervals"] < 1
+            or not isinstance(policy["min_valid_samples"], int) or isinstance(policy["min_valid_samples"], bool)
+            or policy["min_valid_samples"] < 2 or _number(policy["default_interval_s"]) is None
+            or policy["default_interval_s"] <= 0):
+        raise ValueError("invalid telemetry coverage policy")
     metadata = _json(root / "run-metadata.json")
+    telemetry_interval = _number(metadata.get("telemetry_interval_s"))
+    telemetry_interval = telemetry_interval if telemetry_interval is not None and telemetry_interval > 0 else policy["default_interval_s"]
     trials = [trial for directory in sorted((root / "trials").glob("*")) if directory.is_dir()
-              if (trial := _trial(directory)) is not None]
+              if (trial := _trial(directory, telemetry_interval_s=telemetry_interval, coverage_policy=policy)) is not None]
     grouped = defaultdict(list)
     for trial in trials:
         grouped[(trial["corpus_id"], str(trial["dispatcher_count"]), str(trial["concurrency"]))].append(trial)
@@ -624,6 +707,7 @@ def analyze(root: Path, *, min_speedup=1.10, max_latency_ratio=3.0, max_failure_
         "hypothesis": "C1 provides the best acceptable finite-batch throughput within the tested workloads, node, runtime and dispatcher topology.",
         "throughput_scope": "finite fixed-corpus batches; limited fill/drain waves can differ from a continuously backlogged queue",
         "thresholds": {"min_speedup": min_speedup, "max_latency_ratio": max_latency_ratio, "max_failure_rate": max_failure_rate},
+        "telemetry_coverage_policy": policy,
         "requested_levels": levels, "issues": sorted(set(issues)), "comparisons": comparisons,
         "recommendations": recommendations,
         "trials": [{key: value for key, value in trial.items() if not key.startswith("_")} for trial in trials],
@@ -637,6 +721,7 @@ def analyze(root: Path, *, min_speedup=1.10, max_latency_ratio=3.0, max_failure_
     summary["limitations"].append("A mean duration drop over 20% for a matching workload/seed triggers manual quality review, not an automatic capacity recommendation.")
     summary["limitations"].append(f"Fewer than {_FOLLOWUP_MIN_BATCH_WAVES} job waves per trial (jobs/concurrency) flags a multiwave follow-up. This is an experimental-design heuristic, not a change to historical rates or acceptance thresholds; even more waves alone do not prove sustained saturation.")
     summary["limitations"].append("Occupancy averages and underfilled fractions use each trial's first-to-last inference-container interval. They include interior idle gaps but exclude initial/final lifecycle overhead and gaps between trials; throughput still includes all measured trial time.")
+    summary["limitations"].append("Every completed trial must exercise its requested inference overlap. Required resource metrics each need at least three distinct valid samples, at least 80% time support and no gap over three configured intervals by default. A sample supports only half an interval on each side; sparse historical runs retain numerical rates but remain provisional under the recorded coverage policy.")
     _write_outputs(root, summary)
     return summary
 
@@ -810,6 +895,10 @@ def _write_outputs(root, summary):
         report.append(f"- {item['corpus_id']} / D{item['dispatcher_count']} / C{item['concurrency']}: " + "; ".join(
             f"{name}: {_display(item['telemetry']['metrics'][name]['max'])} ({item['telemetry']['metrics'][name]['availability']})"
             for name in ("gpu_temperature_c", "gpu_power_watts", "gpu_memory_used_bytes", "memory_used_bytes")))
+        report.append("  Required-metric temporal coverage (minimum across trials): " + "; ".join(
+            f"{name}={_display(observation['minimum_trial_coverage_fraction'])}, "
+            f"max gap {_display(observation['maximum_gap_s'])} s, valid samples {observation['valid_samples']}"
+            for name, observation in item["telemetry_coverage"]["metrics"].items()) + ".")
         headroom = item["telemetry"]["metrics"]["gpu_temperature_tlimit_c"]
         report.append(f"  T.Limit headroom minimum: {_display(headroom['min'])} °C ({headroom['availability']}). "
             + "Observed throttle seconds within trials: " + "; ".join(
