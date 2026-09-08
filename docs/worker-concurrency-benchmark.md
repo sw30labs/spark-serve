@@ -269,6 +269,32 @@ per-workload results so aggregate mixes cannot hide a short-song substitution.
 Matched-seed audio shortening greater than 20% requires review and prevents an
 unqualified recommendation; it is a structural heuristic, not musical scoring.
 
+Throughput here is the makespan of a finite fixed-corpus batch. In the current
+four-job sweep, C4 starts all four jobs together; when its two short jobs finish,
+the two longer jobs may continue without replacement work. This fill/drain
+pattern can understate the capacity of a continuously backlogged queue and
+differs by concurrency level even though the corpus is identical. Report the
+batch result as measured; do not reinterpret it as maximum sustained capacity.
+
+Each trial and aggregate now report `inference_occupancy`: seconds at each
+active-container count, the duration-weighted mean count, and the fraction of
+time below configured concurrency. These windows run from the first inference
+container start to the last finish, including interior idle gaps. Initial/final
+lifecycle overhead remains in throughput but outside the occupancy window;
+inter-trial gaps are never added to either trial's occupancy. Unclosed intervals
+remain unavailable, and an aggregate with missing trials is labeled partial.
+Container overlap includes loading and CPU stages, so it does not establish
+simultaneous CUDA kernel execution.
+
+Fewer than four job waves per trial (`jobs / concurrency`) flags a multiwave
+follow-up, without changing recorded rates or the existing acceptance tests.
+For a sustained-capacity recommendation after the current sweep, repeat the
+candidate and neighboring levels with the same workload proportions and at
+least 16 jobs per level when testing through C4. Inspect the dwell distribution
+and thermal stability; four waves provide more measurement opportunity but
+do not by themselves prove sustained saturation. The present H0 result, if
+complete, remains scoped to the tested finite batches.
+
 At least two complete independent measured trials per requested level, two
 workload types, matched C1, real inference overlap and nonsynthetic records are
 required for a nonprovisional inference. Missing levels, censored outcomes,

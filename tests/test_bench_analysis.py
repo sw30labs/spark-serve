@@ -492,3 +492,98 @@ def test_interior_best_does_not_claim_a_ceiling_or_request_automatic_extension(t
     assert "Ceiling not found" not in report
     assert "Extend above C4" not in report
     assert "Repeat the candidate and neighboring levels" in report
+
+
+def occupancy(windows, concurrency):
+    return _analysis._inference_occupancy(
+        [{"start": start, "end": end} for start, end in windows], concurrency, "start", "end")
+
+
+def test_occupancy_reveals_short_job_tail_despite_reaching_peak_concurrency():
+    observed = occupancy([(0, 10), (0, 10), (0, 30), (0, 30)], 4)
+    assert observed["availability"] == "available"
+    assert observed["dwell_s_by_active_jobs"] == {"2": 20, "4": 10}
+    assert observed["observed_window_s"] == 30
+    assert observed["active_job_seconds"] == 80
+    assert observed["mean_active_jobs"] == pytest.approx(8 / 3)
+    assert observed["underfilled_fraction"] == pytest.approx(2 / 3)
+    assert observed["full_fraction"] == pytest.approx(1 / 3)
+
+
+def test_occupancy_handles_shared_boundaries_and_interior_idle_gaps():
+    adjacent = occupancy([(0, 5), (5, 10)], 1)
+    assert adjacent["dwell_s_by_active_jobs"] == {"1": 10}
+    assert adjacent["underfilled_fraction"] == 0
+    gaps = occupancy([(0, 5), (10, 15)], 2)
+    assert gaps["dwell_s_by_active_jobs"] == {"0": 5, "1": 10}
+    assert gaps["mean_active_jobs"] == pytest.approx(2 / 3)
+    assert gaps["underfilled_fraction"] == 1
+
+
+def test_occupancy_combines_time_weighted_windows_without_cross_trial_gaps():
+    long = occupancy([(0, 10), (0, 10), (0, 30), (0, 30)], 4)
+    short = occupancy([(1000, 1010)] * 4, 4)
+    combined = _analysis._combine_occupancy([{"inference_occupancy": long}, {"inference_occupancy": short}], 4)
+    assert combined["observed_window_s"] == 40
+    assert combined["mean_active_jobs"] == 3  # Weighted by30s+10s, not a mean of two trial means.
+    assert combined["underfilled_fraction"] == .5
+    assert combined["available_trials"] == combined["trial_count"] == 2
+    assert combined["dwell_s_by_active_jobs"] == {"2": 20, "4": 20}
+
+
+def test_censored_occupancy_is_unavailable_and_partial_aggregate_labeled():
+    incomplete = occupancy([(0, 10), (0, None)], 2)
+    assert incomplete["availability"] == "unavailable"
+    assert incomplete["mean_active_jobs"] is None
+    assert occupancy([(5, 4)], 1)["observed_window_s"] is None
+    combined = _analysis._combine_occupancy([
+        {"inference_occupancy": occupancy([(0, 10)] * 2, 2)},
+        {"inference_occupancy": incomplete}], 2)
+    assert combined["availability"] == "partial"
+    assert combined["available_trials"] == 1
+    assert combined["observed_window_s"] == 10
+
+
+def test_finite_batch_flag_and_dwell_metrics_preserve_original_rates(tmp_path):
+    metadata(tmp_path, concurrency_levels=[1, 4])
+    for concurrency in (1, 4):
+        for iteration in range(2):
+            trial(tmp_path, concurrency, iteration)
+    result = analyze(tmp_path)
+    baseline, high = sorted(result["comparisons"], key=lambda row: row["concurrency"])
+    assert baseline["jobs_per_hour"] == 360
+    assert high["jobs_per_hour"] == 1440
+    assert high["speedup_vs_c1"] == 4
+    assert high["inference_mean_active_jobs"] == 4
+    assert high["inference_underfilled_fraction"] == 0
+    assert high["inference_window_s"] == 16
+    assert high["batch_waves_min"] == 1
+    assert high["multiwave_followup_recommended"] is True
+    assert baseline["multiwave_followup_recommended"] is False
+    assert result["evidence_status"] == "complete"
+    assert result["hypothesis_result"] == "h0_falsified"
+    assert result["recommendations"][0]["candidate_concurrency"] == 4
+    assert all("inference_occupancy" in row for row in result["trials"])
+    report = (tmp_path / "report.md").read_text()
+    assert "finite-batch throughput" in report
+    assert "**LOAD SHAPE:** C4: mean active inference containers 4.000" in report
+    assert "at least 16 same-mix jobs per trial" in report
+    assert "Small-batch candidate; sustained queue capacity requires" in report
+    with (tmp_path / "comparison.csv").open() as handle:
+        row = next(row for row in csv.DictReader(handle) if row["concurrency"] == "4")
+    assert float(row["inference_underfilled_fraction"]) == 0
+    assert float(row["inference_mean_active_jobs"]) == 4
+
+
+def test_c1_winner_still_requires_multiwave_check_when_higher_levels_had_short_batches(tmp_path):
+    metadata(tmp_path, concurrency_levels=[1, 4])
+    for iteration in range(2):
+        trial(tmp_path, 1, iteration)
+        trial(tmp_path, 4, iteration, duration=50)
+    result = analyze(tmp_path)
+    assert result["hypothesis_result"] == "h0_not_rejected"
+    assert result["recommendations"][0]["candidate_concurrency"] == 1
+    report = (tmp_path / "report.md").read_text()
+    assert "Small batches at C=[4]" in report
+    assert "at least 16 same-mix jobs per trial" in report
+    assert "Small-batch candidate; sustained queue capacity requires" in report

@@ -97,6 +97,62 @@ def _overlap(jobs, trial_end, start_key="started_at", end_key="finished_at"):
     return maximum, censored
 
 
+_FOLLOWUP_MIN_BATCH_WAVES = 4
+
+
+def _occupancy_summary(dwell, concurrency, *, availability):
+    window = sum(dwell.values())
+    job_seconds = sum(int(count) * seconds for count, seconds in dwell.items())
+    underfilled = sum(seconds for count, seconds in dwell.items() if int(count) < concurrency)
+    return {"availability": availability, "dwell_s_by_active_jobs": dict(sorted(dwell.items(), key=lambda item: int(item[0]))),
+            "observed_window_s": window if window else None,
+            "active_job_seconds": job_seconds if window else None,
+            "mean_active_jobs": job_seconds / window if window else None,
+            "underfilled_s": underfilled if window else None,
+            "underfilled_fraction": underfilled / window if window else None,
+            "full_fraction": dwell.get(str(concurrency), 0) / window if window else None,
+            "window_definition": "first inference-container start to last finish in each trial; includes interior idle gaps, excludes outer startup/cleanup and inter-trial gaps",
+            "scope": "overlapping inference-container lifetimes, including model loading and CPU stages; not proof of simultaneous CUDA kernels"}
+
+
+def _inference_occupancy(jobs, concurrency, start_key, end_key, *, missing_intervals=False):
+    """Duration-weighted occupancy; a brief maximum cannot hide a long empty tail."""
+    if not isinstance(concurrency, int) or concurrency < 1:
+        return _occupancy_summary({}, 1, availability="unavailable")
+    events = defaultdict(int)
+    for job in jobs:
+        start, end = _number(job.get(start_key)), _number(job.get(end_key))
+        if start is None or end is None or end <= start:
+            missing_intervals = True
+            continue
+        events[start] += 1
+        events[end] -= 1
+    if missing_intervals or len(events) < 2:
+        return _occupancy_summary({}, concurrency, availability="unavailable")
+    dwell = defaultdict(float)
+    active = 0
+    previous = min(events)
+    for stamp, delta in sorted(events.items()):
+        if stamp > previous:
+            dwell[str(active)] += stamp - previous
+        active += delta
+        previous = stamp
+    return _occupancy_summary(dwell, concurrency, availability="available")
+
+
+def _combine_occupancy(trials, concurrency):
+    complete = [trial["inference_occupancy"] for trial in trials
+                if trial["inference_occupancy"]["availability"] == "available"]
+    dwell = defaultdict(float)
+    for occupancy in complete:
+        for count, seconds in occupancy["dwell_s_by_active_jobs"].items():
+            dwell[count] += seconds
+    result = _occupancy_summary(dwell, concurrency or 1,
+        availability="available" if len(complete) == len(trials) else "partial" if complete else "unavailable")
+    result.update(available_trials=len(complete), trial_count=len(trials))
+    return result
+
+
 def _timestamp(record):
     for key in ("timestamp_wall", "timestamp", "timestamp_s", "time"):
         value = record.get(key)
@@ -322,6 +378,7 @@ def _trial(directory):
     missing_inference = any(_failure(job) is None and (_number(job.get(keys[0])) is None
                             or _number(job.get(keys[1])) is None) for job in jobs)
     maximum = None if not inference_jobs or censored or missing_inference else inference_maximum
+    occupancy = _inference_occupancy(inference_jobs, concurrency, *keys, missing_intervals=missing_inference)
     if maximum is not None and isinstance(concurrency, int) and maximum > concurrency:
         issues.append("actual overlap exceeds configured concurrency")
     telemetry_issues = []
@@ -346,6 +403,10 @@ def _trial(directory):
             "inference_max_active_observed": maximum, "request_max_active_observed": request_maximum,
             "request_censored_intervals": request_censored,
             "overlap_basis": "inference_monotonic" if keys == mono_keys else "inference_epoch" if inference_jobs else "unavailable",
+            "inference_occupancy": occupancy,
+            "batch_waves": expected / concurrency if isinstance(expected, int) and isinstance(concurrency, int) else None,
+            "multiwave_followup_recommended": isinstance(expected, int) and isinstance(concurrency, int)
+                and expected < _FOLLOWUP_MIN_BATCH_WAVES * concurrency,
             "censored_intervals": censored, "status": raw.get("status"),
             "stop_reason": raw.get("stop_reason"), "complete": not issues,
             "issues": sorted(set(issues)), "corpus_id": corpus_id,
@@ -400,6 +461,13 @@ def _aggregate(trials):
                                      counter_trials=[_throttle_deltas(trial["_telemetry"]) for trial in trials]),
              "issues": sorted({issue for trial in trials for issue in trial["issues"]}),
              "timing_notes": sorted({note for trial in trials for note in trial["timing_notes"]})}
+    group["inference_occupancy"] = _combine_occupancy(trials, group["concurrency"])
+    group["inference_mean_active_jobs"] = group["inference_occupancy"]["mean_active_jobs"]
+    group["inference_underfilled_fraction"] = group["inference_occupancy"]["underfilled_fraction"]
+    group["inference_window_s"] = group["inference_occupancy"]["observed_window_s"]
+    waves = [trial["batch_waves"] for trial in trials if trial["batch_waves"] is not None]
+    group["batch_waves_min"] = min(waves) if waves else None
+    group["multiwave_followup_recommended"] = any(trial["multiwave_followup_recommended"] for trial in trials)
     group["workloads"] = {workload: {"job_count": sum(job.get("workload_id") == workload for job in jobs),
         "successes": sum(job.get("workload_id") == workload for job in successful),
         "jobs_per_hour": per_hour(sum(job.get("workload_id") == workload for job in successful)),
@@ -553,7 +621,8 @@ def analyze(root: Path, *, min_speedup=1.10, max_latency_ratio=3.0, max_failure_
             item["provisional"] = False
     summary = {"schema_version": 1, "synthetic": synthetic, "metadata": metadata,
         "evidence_status": evidence, "hypothesis_result": hypothesis,
-        "hypothesis": "C1 provides the best acceptable throughput within the tested workloads, node, runtime and dispatcher topology.",
+        "hypothesis": "C1 provides the best acceptable finite-batch throughput within the tested workloads, node, runtime and dispatcher topology.",
+        "throughput_scope": "finite fixed-corpus batches; limited fill/drain waves can differ from a continuously backlogged queue",
         "thresholds": {"min_speedup": min_speedup, "max_latency_ratio": max_latency_ratio, "max_failure_rate": max_failure_rate},
         "requested_levels": levels, "issues": sorted(set(issues)), "comparisons": comparisons,
         "recommendations": recommendations,
@@ -566,6 +635,8 @@ def analyze(root: Path, *, min_speedup=1.10, max_latency_ratio=3.0, max_failure_
             "No conclusion about saturation or untested concurrency levels follows from these results."]}
     summary["limitations"].append("Capacity evidence requires measured memory availability, temperature, CPU utilization and GPU utilization in every trial; advanced counters may remain explicitly unavailable.")
     summary["limitations"].append("A mean duration drop over 20% for a matching workload/seed triggers manual quality review, not an automatic capacity recommendation.")
+    summary["limitations"].append(f"Fewer than {_FOLLOWUP_MIN_BATCH_WAVES} job waves per trial (jobs/concurrency) flags a multiwave follow-up. This is an experimental-design heuristic, not a change to historical rates or acceptance thresholds; even more waves alone do not prove sustained saturation.")
+    summary["limitations"].append("Occupancy averages and underfilled fractions use each trial's first-to-last inference-container interval. They include interior idle gaps but exclude initial/final lifecycle overhead and gaps between trials; throughput still includes all measured trial time.")
     _write_outputs(root, summary)
     return summary
 
@@ -628,6 +699,12 @@ def _decision_report(summary):
             cost += " → " + _cost(best)
         if baseline is None and best is None:
             cost = "unavailable; no measured comparison."
+        occupancy = best["inference_occupancy"] if best else None
+        load_shape = (f"C{best['concurrency']}: mean active inference containers {_display(occupancy['mean_active_jobs'])}; "
+            f"underfilled fraction {_display(occupancy['underfilled_fraction'])}; "
+            f"minimum job waves/trial {_display(best['batch_waves_min'])} ({occupancy['availability']}). "
+            "First-to-last inference interval; these are container lifetimes, not simultaneous CUDA-kernel measurements."
+            if best else "unavailable; no completed inference intervals.")
         limits = []
         if best:
             limits = [f"{name.removeprefix('clock_event_').removesuffix('_us')} "
@@ -650,11 +727,11 @@ def _decision_report(summary):
                 capacity += (f" C{candidate} with {recommendation['dispatcher_count']} dispatcher(s) is a provisional "
                              + ("harness candidate only." if summary["synthetic"] else "candidate only."))
         else:
-            conclusion = (f"C{candidate} improves acceptable throughput over C1 within this measured corpus, node, runtime "
+            conclusion = (f"C{candidate} improves acceptable finite-batch throughput over C1 within this measured corpus, node, runtime "
                           "and dispatcher topology." if candidate and candidate > 1 else
                           "H0 not rejected within this tested envelope; C1 is not established as universally optimal.")
             capacity = (f"{recommendation['dispatcher_count']} dispatcher(s), {candidate} concurrent job(s) per tested Spark "
-                        "for this corpus/runtime; other nodes and dispatcher topologies are not established."
+                        "for this finite-batch corpus/runtime; other nodes and dispatcher topologies are not established."
                         if candidate is not None else "none; no tested level meets the acceptance criteria.")
         if boundary and not summary["synthetic"]:
             conclusion += (" Ceiling not found: the highest requested level still shows useful marginal scaling"
@@ -670,8 +747,16 @@ def _decision_report(summary):
                          "and paired seeds, with enough jobs to exercise each new level; do not call the current boundary an optimum.")
         else:
             next_step = "Repeat the candidate and neighboring levels with more jobs/trials; correlate stage timing with SM/tensor, measured bandwidth and limit counters to identify the bottleneck."
+        small_batch_levels = [item["concurrency"] for item in groups if item["multiwave_followup_recommended"]]
+        if best and small_batch_levels:
+            followup_jobs = _FOLLOWUP_MIN_BATCH_WAVES * max(summary["requested_levels"] or [best["concurrency"]])
+            next_step += (f" Small batches at C={small_batch_levels} do not establish steady backlogged throughput: repeat candidate/neighboring "
+                f"levels with at least {followup_jobs} same-mix jobs per trial ({_FOLLOWUP_MIN_BATCH_WAVES} waves at the highest tested C), "
+                "then inspect occupancy dwell times and thermal stability before assigning sustained production capacity.")
+            if not provisional:
+                capacity += " Small-batch candidate; sustained queue capacity requires the multiwave follow-up."
         report += [f"- **BASELINE:** {pending}{baseline_text}", f"- **BEST TESTED:** {pending}{best_text}",
-                   f"- **SPEEDUP:** {pending}{speedup_text}", f"- **COST:** {cost}",
+                   f"- **SPEEDUP:** {pending}{speedup_text}", f"- **COST:** {cost}", f"- **LOAD SHAPE:** {load_shape}",
                    f"- **BOTTLENECK:** {bottleneck}", f"- **CONCLUSION:** {conclusion}",
                    f"- **RECOMMENDED CAPACITY:** {capacity}", f"- **NEXT EXPERIMENT:** {next_step}", ""]
     return report
@@ -681,7 +766,9 @@ def _write_outputs(root, summary):
     columns = ["corpus_id", "dispatcher_count", "concurrency", "trial_count", "complete_trial_count", "job_count",
         "successes", "makespan_s", "jobs_per_hour", "audio_seconds_per_hour", "failure_rate", "retry_count",
         "max_active_observed", "speedup_vs_c1", "scaling_efficiency", "p95_latency_ratio_vs_c1", "previous_concurrency",
-        "marginal_speedup", "marginal_jobs_per_hour", "marginal_jobs_per_hour_per_slot", "eligible"]
+        "marginal_speedup", "marginal_jobs_per_hour", "marginal_jobs_per_hour_per_slot", "eligible",
+        "inference_mean_active_jobs", "inference_underfilled_fraction", "inference_window_s",
+        "batch_waves_min", "multiwave_followup_recommended"]
     quantiles = ["mean", "p50", "p95", "min", "max"]
     output = io.StringIO(newline="")
     writer = csv.DictWriter(output, fieldnames=columns + ["latency_s_" + key for key in quantiles] + ["failures_by_category"])
@@ -693,6 +780,7 @@ def _write_outputs(root, summary):
         writer.writerow(row)
     report = ["# YuE concurrency comparison", "", f"Evidence: **{summary['evidence_status']}**. Hypothesis: **{summary['hypothesis_result']}**.", "",
         "H0 means C1 has the best acceptable throughput in the tested envelope. H0 not rejected is not proof that C1 is universally optimal.", ""]
+    report += ["Rates describe finite fixed-corpus batch makespan. Short batches can spend much of their duration below configured concurrency; they do not establish steady backlogged queue capacity.", ""]
     metadata = summary["metadata"]
     report += [(f"Node: {metadata.get('node', 'unavailable')}. Worker: {metadata.get('worker', 'unavailable')}. "
                 f"Runtime manifest: {metadata.get('runtime_manifest', 'unavailable')}."),
