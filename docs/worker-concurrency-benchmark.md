@@ -212,6 +212,7 @@ trials/r01-c01/
     trial.json                   # expected jobs, measured flag, monotonic makespan
     jobs.jsonl                   # one outcome per job, including failures/not-launched
     telemetry.jsonl / telemetry.csv
+    guard-samples.jsonl          # exact independent guard observations and decisions
     jobs/<job-id>/
         job.json / container.json / generation_request.json
         worker.log / output.wav
@@ -224,6 +225,17 @@ The Mac wrapper stores `remote-run.json`, `driver.log` and collected compact
 records in `results/`. Large WAV/token evidence remains on the Spark at the
 recorded path. Logs contain no credentials, full process command lines or binary
 reference data. Analysis can be rerun from the compact records at any time.
+
+New trials record `started_monotonic` and persist every independently sampled
+resource-guard observation, thresholds, swap baseline, decision, reason and
+evaluation timestamps in `guard-samples.jsonl`. A stopping observation is also
+attached as `trial.json.guard_trigger`; its receipt is appended before signalling
+cancellation. A guard-log write failure stops in-flight work and preserves the
+observation in `trial.json` if that file remains writable. The time-series
+collector samples independently: its nearest row cannot substitute for a
+missing historical guard observation. The 2026-09-08 margin-zero attempt was
+launched before these receipts existed, so its exact final trigger remains
+unavailable.
 
 Resource summaries report the minimum signed `temperature_tlimit_c` headroom
 separately from absolute core temperature. T.Limit is driver-reported remaining
@@ -388,3 +400,40 @@ the running sweep or its original metadata. It recorded Linux
 `6.17.0-1032-nvidia`, aarch64, CPython 3.12.3, and host NVIDIA driver 580.173.02.
 `nsys` was on PATH; `dcgmi` and `ncu` were not. No profiler was executed and
 advanced-counter availability remains unverified beyond the current sampler.
+
+## Second live attempt: stopped during the baseline
+
+Run `b20260908174636-ea4a41` completed its excluded short warmup in 932.07s
+and one measured short job in 939.11s. The next representative C1 job was
+cancelled after 1773.92s by the zero-headroom guard; two further baseline jobs
+were never launched. The partial trial ended at 2026-09-08 22:48:30 UTC,
+and restoration completed at 22:48:35. C2–C4 were not reached. This is
+**not assessed**, with no completed representative baseline or H0 verdict.
+
+The partial C1 trial contains 1,357 telemetry samples and no collection errors.
+Recorded GPU core temperature peaked at 86°C, minimum available unified memory
+was 85.01 GiB, swap did not grow, and CPU utilization averaged 6.64% across
+20 cores. Within-trial clock counters increased by 1.208540s of software
+thermal slowdown and 0.020770s of hardware thermal slowdown; power-capping,
+power-braking and synchronization counters did not increase. At 22:36:07,
+one recorded T.Limit reading was −1°C (GPU core 83°C, SM clock 2353 MHz),
+recovering to +18°C two seconds later. These observations establish brief
+thermal regulation, not sustained throttling. Unmapped ACPI sensors also
+reached 92.3°C; GPU core temperature does not describe every component.
+
+The final guard observation was sampled independently and not persisted in
+this version. Its exact value and timestamp cannot be reconstructed from the
+collector's nearby samples. A read-only hardware query afterward reported
+maximum-operating T.Limit = 0°C; shutdown and hardware-slowdown T.Limit
+specifications were unavailable. Those missing limits and the brief recovery
+do not justify another guard relaxation. Verify operating conditions and
+sensor meaning before considering a separately controlled baseline-only
+follow-up. The [Spark hardware guide](https://docs.nvidia.com/dgx/dgx-spark/hardware.html)
+specifies a 5–30°C ambient operating range; it is not an internal GPU limit.
+
+The cancelled container's immutable ID was verified absent, no benchmark
+containers remained, and Spark One was admitted and idle under its original
+generation. Spark Two remained admitted with the independent silence replay
+running. Compact evidence is retained in the local attempt's
+`sparkone/thermal-stop-independent-review.json`; full intermediate artifacts
+remain on the Spark. Production capacity remains one.

@@ -123,8 +123,62 @@ def test_thermal_headroom_stops_below_absolute_temperature_limit(tmp_path, monke
     assert stop.is_set() is should_stop
     assert bool(launched) is not should_stop
     assert trial['status'] == ('stopped' if should_stop else 'complete')
+    receipts = [json.loads(line) for line in (tmp_path / 'trial' / 'guard-samples.jsonl').read_text().splitlines()]
+    assert receipts[0]['sample'] == sample
+    assert receipts[0]['baseline_swap_used_bytes'] == 0
+    assert receipts[0]['thresholds'] == {'max_temperature_c': 90, 'min_temperature_margin_c': 5,
+                                        'min_free_gb': 12, 'max_swap_growth_gb': 1}
+    assert receipts[0]['decision'] == ('stop' if should_stop else 'continue')
+    assert receipts[0]['evaluated_monotonic'] >= trial['started_monotonic']
     if should_stop:
         assert 'thermal headroom' in trial['stop_reason']
+        assert trial['guard_trigger'] == receipts[0]
+        assert trial['guard_trigger']['reason'] == trial['stop_reason']
+    else:
+        assert 'guard_trigger' not in trial
+
+
+@pytest.mark.parametrize('triggering_headroom', [None, -1])
+def test_guard_fsync_failure_stops_inflight_and_preserves_exact_sample(tmp_path, monkeypatch, triggering_headroom):
+    monkeypatch.setattr(telemetry, 'TelemetryCollector', NoTelemetry)
+    stop = threading.Event()
+    runner = BlockedRunner(stop, first_completes=False)
+    safe_sample = {'timestamp_wall': '2026-09-08T22:00:00+00:00', 'monotonic_s': 100,
+                   'memory': {'available_bytes': 40 * 1024**3, 'swap_used_bytes': 256},
+                   'gpus': [{'temperature_gpu_c': 76, 'temperature_tlimit_c': 6}]}
+    next_sample = {**safe_sample, 'monotonic_s': 102,
+                   'gpus': [{'temperature_gpu_c': 81, 'temperature_tlimit_c': triggering_headroom}]}
+    samples = iter([safe_sample, next_sample])
+    monkeypatch.setattr(telemetry, 'TelemetrySampler', lambda: SimpleNamespace(sample=lambda: next(samples)))
+    original_append = experiment.append_json
+    def fail_second_guard(path, value):
+        if path.name == 'guard-samples.jsonl' and value['sequence'] == 2:
+            assert runner.second_started.is_set()
+            assert not stop.is_set(), 'Guard signalled cancellation before attempting to persist the decision'
+            raise OSError('guard fsync failed')
+        original_append(path, value)
+    monkeypatch.setattr(experiment, 'append_json', fail_second_guard)
+    with pytest.raises(OSError, match='guard fsync failed'):
+        execute_trial(tmp_path / 'trial', jobs(count=1, concurrency=1), runner, concurrency=1,
+                      stop_event=stop, telemetry_interval=.01, max_temperature_c=90,
+                      min_temperature_margin_c=0)
+    assert stop.is_set()
+    assert runner.saw_stop == [True]
+    trial = json.loads((tmp_path / 'trial' / 'trial.json').read_text())
+    assert trial['status'] == 'stopped'
+    assert trial['guard_persistence_error'] == 'OSError'
+    assert trial['guard_persistence_failed_sample']['sample'] == next_sample
+    receipts = [json.loads(line) for line in (tmp_path / 'trial' / 'guard-samples.jsonl').read_text().splitlines()]
+    assert len(receipts) == 1
+    assert receipts[0]['sample'] == safe_sample
+    if triggering_headroom is not None:
+        assert trial['guard_trigger']['sample'] == next_sample
+        assert trial['guard_trigger']['decision'] == 'stop'
+        assert trial['guard_trigger']['baseline_swap_used_bytes'] == 256
+        assert 'thermal headroom' in trial['stop_reason']
+    else:
+        assert 'guard_trigger' not in trial
+        assert trial['stop_reason'] == 'Guard evidence persistence failed'
 
 
 def test_failed_production_restoration_exits_nonzero_and_preserves_metadata(tmp_path, monkeypatch):

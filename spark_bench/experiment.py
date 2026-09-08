@@ -159,13 +159,18 @@ def execute_trial(root, jobs, runner, *, concurrency, stop_event, telemetry_inte
     start = time.time()
     start_mono = time.monotonic()
     trial = {'trial_id': root.name, 'concurrency': concurrency, 'dispatcher_count': 1,
-             'started_at': start, 'finished_at': None, 'measured': not jobs[0]['warmup'],
+             'started_at': start, 'started_monotonic': start_mono, 'finished_at': None,
+             'measured': not jobs[0]['warmup'],
              'expected_jobs': len(jobs), 'status': 'running', 'stop_reason': None}
     write_json(root / 'trial.json', trial)
     sampler = TelemetrySampler()
     outcomes = []
     collector = TelemetryCollector(root, interval_s=telemetry_interval)
     baseline_swap = None
+    guard_sequence = 0
+    guard_thresholds = {'min_free_gb': min_free_gb, 'max_temperature_c': max_temperature_c,
+                        'max_swap_growth_gb': max_swap_growth_gb,
+                        'min_temperature_margin_c': min_temperature_margin_c}
     next_check = 0
     if hasattr(runner, 'max_active'):
         runner.max_active = 0
@@ -201,8 +206,26 @@ def execute_trial(root, jobs, runner, *, concurrency, stop_event, telemetry_inte
                         reason = 'GPU thermal headroom reached configured minimum'
                     elif swap is not None and baseline_swap is not None and swap - baseline_swap > max_swap_growth_gb * 1024**3:
                         reason = 'Swap growth exceeded configured guard'
+                    guard_sequence += 1
+                    receipt = {'version': 1, 'sequence': guard_sequence, 'sample': sample,
+                               'evaluated_at': time.time(), 'evaluated_monotonic': time.monotonic(),
+                               'thresholds': guard_thresholds, 'baseline_swap_used_bytes': baseline_swap,
+                               'decision': 'stop' if reason else 'continue', 'reason': reason}
                     if reason:
                         trial['stop_reason'] = reason
+                        # Preserve the exact observation even if appending the guard log fails.
+                        trial['guard_trigger'] = receipt
+                    try:
+                        append_json(root / 'guard-samples.jsonl', receipt)
+                    except Exception as exc:
+                        trial['guard_persistence_error'] = type(exc).__name__
+                        trial['guard_persistence_failed_sample'] = receipt
+                        if not trial['stop_reason']:
+                            trial['stop_reason'] = 'Guard evidence persistence failed'
+                        # Disk failure cannot leave an unobserved workload running.
+                        stop_event.set()
+                        raise
+                    if reason:
                         stop_event.set()
                     next_check = time.monotonic() + telemetry_interval
                 while index < len(jobs) and len(pending) < concurrency and not stop_event.is_set():
