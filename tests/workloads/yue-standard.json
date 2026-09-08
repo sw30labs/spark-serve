@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "rights_basis": "operator_owned",
+  "attestation": "local/attestation.txt",
+  "vocal": "local/vocal.wav",
+  "instrumental": "local/instrumental.wav",
+  "workloads": [
+    {
+      "id": "short",
+      "genre": "folk warm voice acoustic guitar steady drums",
+      "lyrics": "[verse]\nLa canción cruza la ciudad\nUn corazón despierta al sol\nTambién está la música aquí\nY el niño canta junto a mí\n",
+      "run_n_segments": 2,
+      "max_new_tokens": 3000
+    },
+    {
+      "id": "representative",
+      "genre": "folk warm voice acoustic guitar steady drums",
+      "lyrics": "[verse]\nLa canción cruza la ciudad\nUn corazón despierta al sol\nTambién está la música aquí\nY el niño canta junto a mí\n[chorus]\n¡Qué difícil olvidar!\n¿Cómo vuelve aquella luz?\nSí, aún guardo la ilusión\nSin vergüenza de cantar\n[verse]\nLa noche deja de llover\nLos pasos vuelven al andén\nEl viento trae otra canción\nY el día encuentra nuestra voz\n",
+      "run_n_segments": 3,
+      "max_new_tokens": 3000
+    }
+  ]
+}

@@ -129,6 +129,15 @@ Two workers improve throughput under load; they do not split a single song acros
 the fabric. Each factory still loads the model pipeline for each render. Single-song
 latency and aggregate speedup need measurement on the installed Sparks.
 
+### Measure YuE concurrency capacity
+
+`python3 -m spark_bench concurrency` runs a controlled C1…CN experiment with the
+same seeded corpus, per-job audio-integrity gates, raw telemetry and reproducible
+throughput/latency analysis. Its isolated dispatcher leaves production concurrency
+unchanged. Use `--ssh-host` to drain one configured Spark and hold workload ownership
+through the experiment. See [the benchmark guide](docs/worker-concurrency-benchmark.md)
+for workload setup, guards, raw results and the criteria for a capacity recommendation.
+
 Add a model by copying a `[models.<id>]` table. `wrapper = "vllm"` for a stock
 `vllm/vllm-openai:*` image (ENTRYPOINT already `vllm serve`). `wrapper = "dsv4"`
 for the Aiden GB10 DeepSeek image.

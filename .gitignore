@@ -6,3 +6,5 @@ gui/SparkServeApp.app/
 gui-poc/
 models.toml
 GUI_RESEARCH.md
+benchmark-results/
+tests/workloads/local/
