@@ -13,6 +13,7 @@ nnodes = 2
 tensor_parallel = 2
 port = 8000
 lan_url = "http://192.168.1.10:8000"
+worker_lan_url = "http://spark-worker.lan:8000"
 hf_cache_host = "/home/YOU/.cache/huggingface"
 container = "vllm_cluster"
 executor = "mp"
@@ -202,52 +203,74 @@ args = [
 
 
 # ---------------------------------------------------------------------------
-# Model C — Nemotron-3-Super-120B NVFP4 (NVIDIA single-Spark recipe)
-# Solo on sparkone: nnodes=1, TP=1. Do NOT default to TP=2.
-# Flip with: ./spark-serve up nemotron-super
-# Flip back:  ./spark-serve up ds4   (or ds4-vision)
-# Playbook: docs/nemotron-super.md
+# Model C — Nemotron-3-Super-120B NVFP4 (official vLLM single-Spark recipe)
+# Independent worker: ./spark-serve up nemotron-super --node worker
+# Prepare that node first: ./spark-serve pull nemotron-super --node worker
+# Playbook: docs/nemotron-super.md. TP1; leaves the other node's model running.
 # ---------------------------------------------------------------------------
 [models.nemotron-super]
 aliases = ["nemotron-super", "nemotron3-super", "n3s"]
 label = "Nemotron-3-Super-120B NVFP4"
-image = "vllm/vllm-openai:cu130-nightly"
+image = "spark-serve-nemotron-super-nvfp4:0.1.0"
+recipe = "nemotron-super-nvfp4"
 hf_id = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
+serve_path = "/cache/huggingface/hub/models--nvidia--NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4/snapshots/ff433f5493e25d631c9f12b5d55c674229923d02"
 served_name = "nemotron-3-super"
 wrapper = "vllm"
 nnodes = 1
 tensor_parallel = 1
+hf_mount = "/cache/huggingface"
 drop_caches = true
+shm_size = "32g"
+docker_extra = ["--ulimit", "memlock=-1:-1"]
+ready_timeout = 3600
 max_model_len = 262144
+max_num_seqs = 8
+gpu_memory_utilization = 0.80
 hermes_provider = "spark"
 hermes_context_length = 262144
-notes = "NVIDIA single-Spark NVFP4 recipe. Solo on sparkone (nnodes=1, TP=1). Not Aiden DS4 image. Hunt local caches before Hub pull; rsync to sparktwo only if you later switch to TP=2."
+preflight_args = ["/opt/spark-serve/nemotron-super/verify.py", "/cache/huggingface/hub/models--nvidia--NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4/snapshots/ff433f5493e25d631c9f12b5d55c674229923d02"]
+notes = "NVIDIA NVFP4. Independent single Spark, 262K context, reasoning + tools, MTP 3. Pinned vLLM 0.28.0; FP32 Mamba state."
 
 [models.nemotron-super.env]
 HF_HOME = "/cache/huggingface"
 HF_HUB_OFFLINE = "1"
-VLLM_CACHE_ROOT = "/cache/huggingface/vllm-cache"
-VLLM_NVFP4_GEMM_BACKEND = "marlin"
+TRANSFORMERS_OFFLINE = "1"
+VLLM_CACHE_ROOT = "/cache/huggingface/nemotron-super-vllm-cache"
+XDG_CACHE_HOME = "/cache/huggingface/nemotron-super-runtime-cache"
+FLASHINFER_WORKSPACE_BASE = "/cache/huggingface/nemotron-super-runtime-cache"
+TRITON_CACHE_DIR = "/cache/huggingface/nemotron-super-runtime-cache/triton"
+TORCH_EXTENSIONS_DIR = "/cache/huggingface/nemotron-super-runtime-cache/torch_extensions"
+CUDA_CACHE_PATH = "/cache/huggingface/nemotron-super-runtime-cache/cuda"
+NCCL_NET = "Socket"
+NCCL_IB_DISABLE = "1"
+CUTE_DSL_ARCH = "sm_121a"
+TORCH_CUDA_ARCH_LIST = "12.1a"
+FLASHINFER_CUDA_ARCH_LIST = "12.1a"
+VLLM_FLOAT32_MATMUL_PRECISION = "high"
 VLLM_ALLOW_LONG_MAX_MODEL_LEN = "1"
-VLLM_FLASHINFER_ALLREDUCE_BACKEND = "trtllm"
-VLLM_USE_FLASHINFER_MOE_FP4 = "0"
 
 [models.nemotron-super.vllm]
-# Flags after `<hf_id>`. Rank/master are injected by the CLI (nnodes=1 → no worker).
+# Pinned vLLM recipe; native ModelOpt and MoE backend selection.
 args = [
   "--served-model-name", "nemotron-3-super",
   "--host", "0.0.0.0",
   "--port", "8000",
-  "--trust-remote-code",
-  "--dtype", "auto",
-  "--quantization", "fp4",
-  "--moe-backend", "marlin",
   "--tensor-parallel-size", "1",
   "--max-model-len", "262144",
-  "--gpu-memory-utilization", "0.90",
+  "--gpu-memory-utilization", "0.80",
+  "--max-num-seqs", "8",
+  "--load-format", "fastsafetensors",
+  "--attention-backend", "flashinfer",
+  "--max-num-batched-tokens", "16384",
   "--kv-cache-dtype", "fp8",
+  "--mamba-cache-mode", "align",
+  "--mamba-ssm-cache-dtype", "float32",
+  "--speculative-config", '{"method":"mtp","num_speculative_tokens":3}',
+  "--enable-prefix-caching",
+  "--reasoning-parser", "nemotron_v3",
   "--enable-auto-tool-choice",
-  "--tool-call-parser", "hermes",
+  "--tool-call-parser", "qwen3_xml",
 ]
 
 # ---------------------------------------------------------------------------

@@ -1,8 +1,8 @@
 # spark-serve
 
-Mac CLI + SwiftUI helper that switches between catalogued vLLM models and
-independent YuE song workers on a two-node [NVIDIA DGX Spark](https://www.nvidia.com/en-us/products/workstations/dgx-spark/)
-cluster is serving.
+Mac CLI + SwiftUI helper for catalogued vLLM models and independent YuE song
+workers on a two-node [NVIDIA DGX Spark](https://www.nvidia.com/en-us/products/workstations/dgx-spark/)
+cluster. Single-node models can run independently on each Spark.
 
 **This is not how you set up a cluster.** Cabling, ConnectX-7 / QSFP, pairing
 the Sparks, SSH, and the fabric are NVIDIA's docs, not this repo. Start at the
@@ -12,12 +12,16 @@ This project assumes that cluster already exists and the Mac can SSH to both
 nodes. It controls workload ownership and starts, drains, stops, and swaps the
 serving backend.
 
-The live OpenAI-compatible endpoint stays on the head node's LAN port 8000.
+Each single-node model exposes an OpenAI-compatible endpoint on its Spark's LAN
+port 8000. Distributed models expose their endpoint on the head.
 YuE uses one HTTP worker per Spark on port 8011. All SSH / Docker / NCCL work lives in the Python CLI. The GUI is a thin
 `Process` wrapper around that CLI.
 
 <p align="center">
-  <img src="docs/gui.png" alt="spark-serve GUI: catalog cards, Start/Stop, foreign occupant on port 8000" width="720">
+  <a href="docs/screenshots/qwen-nemotron-serving.png">
+    <img src="docs/screenshots/qwen-nemotron-serving.png" alt="Spark Serve showing Qwen on sparkone and Nemotron on sparktwo, both serving, with Hermes using Qwen" width="720">
+  </a><br>
+  <em>Qwen and Nemotron serving independently on two Sparks, with Hermes connected to Qwen.</em>
 </p>
 
 ```
@@ -40,6 +44,7 @@ cp models.example.toml models.toml   # then edit [cluster]
    - `head` / `worker` — SSH hostnames
    - `master_addr` — QSFP / RoCE IP of the head (not the LAN NIC)
    - `lan_url` — URL clients use, e.g. `http://<head-lan-ip>:8000`
+   - `worker_lan_url` — the second Spark's distinct model endpoint
    - `hf_cache_host` — Hugging Face cache on the Sparks
 
 `models.toml` is gitignored on purpose. Do not commit LAN IPs or SSH hostnames.
@@ -50,6 +55,11 @@ cp models.example.toml models.toml   # then edit [cluster]
 both GPUs are free, start the worker (rank 1, `--headless`) and head (rank 0),
 then retarget Hermes after readiness. Single-node recipes such as
 `nemotron-super` and `qwen38` preserve their `nnodes=1` and TP=1 settings.
+They default to the head, preserving any independent worker workload. Select
+`--node worker` to use the second Spark. For example, keep Qwen on the head while
+running `./spark-serve up nemotron-super --node worker`, then choose the client
+with `./spark-serve use --node head` or `--node worker`. See
+[independent Spark control](docs/independent-sparks.md) for setup and recovery.
 
 Qwen3.8-Flash-Next uses NVIDIA NVFP4 weights, native 262K context, images and
 tools on one Spark. Run `./spark-serve pull qwen38` to prepare its pinned
@@ -66,7 +76,8 @@ in `~/.local/state/spark-serve` (`SPARK_SERVE_STATE_DIR` overrides it). Discover
 is revoked before draining. Active renders keep running: the command reports
 their job IDs and exits without starting a conflicting workload. Retry after
 completion, or explicitly use `--cancel-jobs`. A failed/interrupted transition
-stays visible and the next command reconciles both nodes before starting anything.
+stays visible. A solo change reconciles its selected node; distributed allocations
+require both nodes together before a conflicting workload can start.
 Each node also keeps a generation lock in `~/.local/state/spark-serve`; delayed SSH
 commands for an older transition cannot admit a worker or launch a model after a
 new transition starts. Commands hold that lock through their side effects,
@@ -94,7 +105,7 @@ GPU containers, or remaining host compute processes block a mode switch. Stop
 foreign workloads separately; Spark Serve does not claim ownership from a name
 prefix or a port number.
 
-`status --json` retains vLLM fields and adds `mode`, `phase`, `transition_error`,
+`status --json` retains vLLM fields and adds per-node `nodes`, `active_node`, `mode`, `phase`, `transition_error`,
 `yue_workers`, and `ready_workers`. Distributed vLLM readiness requires the expected
 container on **both** nodes plus the expected served ID; a head-only response is
 sufficient only for an explicitly single-node recipe. YuE readiness requires the
@@ -197,6 +208,46 @@ or `SPARK_SERVE_HOME`. The app's `PATH` includes `~/miniconda3/bin` so the
 `python3` shebang works under a GUI environment.
 
 Requires Command Line Tools (`swiftc`); full Xcode is not needed.
+
+### Screenshots
+
+Captured September 13, 2026. Screenshots display at reduced widths; click any
+image, including the overview above, to open the original at full resolution.
+
+<p align="center">
+  <a href="docs/screenshots/nemotron-starting.png">
+    <img src="docs/screenshots/nemotron-starting.png" alt="Qwen remains serving on sparkone while Nemotron starts on sparktwo, with startup progress in the activity log" width="420">
+  </a><br>
+  <em>Starting Nemotron on sparktwo while Qwen continues serving on sparkone.</em>
+</p>
+
+<p align="center">
+  <a href="docs/screenshots/hermes-qwen-session.png">
+    <img src="docs/screenshots/hermes-qwen-session.png" alt="Hermes terminal session using Qwen3.8-Flash-Next, showing tool-call progress and context usage" width="720">
+  </a><br>
+  <em>A Hermes session using Qwen3.8-Flash-Next, with tool-call progress and context usage visible.</em>
+</p>
+
+<p align="center">
+  <a href="docs/screenshots/hermes-qwen-nemotron-sessions.png">
+    <img src="docs/screenshots/hermes-qwen-nemotron-sessions.png" alt="Two Hermes terminals: Qwen3.8-Flash-Next working on a coding task above, and Nemotron-3-Super answering a story prompt below" width="720">
+  </a><br>
+  <em>Two Hermes sessions: Qwen working on a coding task above, and Nemotron answering a story prompt below.</em>
+</p>
+
+<p align="center">
+  <a href="docs/screenshots/nvidia-sync-two-sparks.png">
+    <img src="docs/screenshots/nvidia-sync-two-sparks.png" alt="NVIDIA Sync dashboard showing separate memory, GPU activity, temperature and power readings for sparkone and sparktwo" width="720">
+  </a><br>
+  <em>NVIDIA Sync tracks memory use and recent GPU activity separately for each Spark.</em>
+</p>
+
+<p align="center">
+  <a href="docs/screenshots/macos-dock.png">
+    <img src="docs/screenshots/macos-dock.png" alt="macOS Dock with local app shortcuts" width="560">
+  </a><br>
+  <em>macOS Dock with local app shortcuts.</em>
+</p>
 
 ## Offline verification
 

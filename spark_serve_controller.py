@@ -7,6 +7,7 @@ audio, credentials, or private catalog contents are put in discovery records.
 from __future__ import annotations
 
 import contextlib
+import copy
 import fcntl
 import inspect
 import json
@@ -288,6 +289,137 @@ class Controller:
         self.profile = yue_profile(cfg)
         self.state = read_state(self.directory)
         self.operation_generation = None
+        self.operation_hosts = None
+
+    def _workers(self):
+        """Lifecycle work is restricted to the current transition's hosts."""
+        return [worker for worker in self.profile["workers"]
+                if self.operation_hosts is None or worker["host"] in self.operation_hosts]
+
+    def _model(self, name):
+        key = str(name or "").lower()
+        if not key:
+            return None, None
+        for mid, model in self.cfg.get("models", {}).items():
+            if key in {mid.lower(), str(model.get("served_name", "")).lower(),
+                       *(str(alias).lower() for alias in model.get("aliases", []))}:
+                return mid, model
+        return None, None
+
+    def node_states(self) -> dict:
+        """Return ownership by actual SSH host, lazily adapting legacy state.
+
+        Reading never mutates a live service or writes a migration. The next
+        locked transition persists the map alongside the version-1 summary.
+        """
+        hosts = [worker["host"] for worker in self.profile["workers"]]
+        saved = self.state.get("nodes")
+        if isinstance(saved, dict):
+            return {host: copy.deepcopy(saved.get(host) or {
+                "mode": "unknown", "model": None, "phase": "unmanaged",
+                "generation": None, "error": "Node ownership has not been recorded",
+                "allocation_hosts": [], "allocation_id": None,
+            }) for host in hosts}
+        state = self.state
+        mode, phase = state.get("mode", "unknown"), state.get("phase", "unmanaged")
+        mid, model = self._model(state.get("model") or state.get("target"))
+        participants = hosts
+        if mode == "vllm" and model is not None and int(model.get("nnodes") or self.cfg["cluster"].get("nnodes") or 1) == 1:
+            participants = hosts[:1]
+        uncertain_group = (
+            phase not in ("ready", "stopped", "unmanaged")
+            and mode != "yue"
+            and (model is None or int(model.get("nnodes") or self.cfg["cluster"].get("nnodes") or 1) > 1)
+        )
+        result = {}
+        for worker in self.profile["workers"]:
+            host = worker["host"]
+            inactive = (mode == "none" and phase == "stopped") or (
+                mode == "vllm" and phase == "ready" and host not in participants)
+            record = {
+                "mode": "none" if inactive else mode,
+                "model": None if inactive else mid,
+                "phase": "stopped" if inactive else phase,
+                "generation": state.get("generation"),
+                "error": None if inactive else state.get("error"),
+                "allocation_hosts": hosts if uncertain_group else [] if inactive else ([host] if mode == "yue" else participants if mode == "vllm" else []),
+                "allocation_id": None if inactive else state.get("generation"),
+                "legacy": True,
+            }
+            if mode == "yue":
+                receipt = next((item for item in state.get("workers", [])
+                                if isinstance(item, dict) and item.get("url", "").rstrip("/") == worker["url"]), None)
+                if receipt:
+                    record["worker"] = copy.deepcopy(receipt)
+            result[host] = record
+        return result
+
+    def _save_selected(self, *, _hosts=None, **fields):
+        nodes = self.node_states()
+        for worker in self._workers():
+            if _hosts is not None and worker["host"] not in _hosts:
+                continue
+            record = nodes[worker["host"]]
+            record.update(copy.deepcopy(fields))
+            if (fields.get("phase") == "draining" or fields.get("mode") == "none"
+                    or (fields.get("phase") == "starting" and "allocation_id" in fields)):
+                record.pop("containers", None)
+                record.pop("served", None)
+            if fields.get("mode") in ("none", "vllm"):
+                record.pop("worker", None)
+        active = [record for record in nodes.values() if record.get("mode") != "none"]
+        modes = {record.get("mode", "unknown") for record in active}
+        mode = next(iter(modes)) if len(modes) == 1 else "mixed" if modes else "none"
+        models = {record.get("model") for record in active if record.get("mode") == "vllm"}
+        summary = {"mode": mode, "model": next(iter(models)) if len(models) == 1 else None}
+        # Legacy fields describe the latest operation. Node records preserve
+        # independent peer availability and errors even when that operation fails.
+        summary.update({key: fields[key] for key in ("phase", "target", "generation", "error", "cleanup_errors") if key in fields})
+        self.save(nodes=nodes, **summary)
+
+    def _check_scope(self, hosts):
+        """Reject splitting a distributed allocation before any remote mutation."""
+        if len(hosts) == len(self.profile["workers"]):
+            return
+        host = hosts[0]
+        nodes = self.node_states()
+        for record in nodes.values():
+            if (not isinstance(record, dict)
+                    or (record.get("mode") == "unknown"
+                        and (record.get("phase") != "unmanaged" or record.get("error")))):
+                # A new installation has genuinely unmanaged nodes, without an
+                # error. A failed read or incomplete persisted map instead lost
+                # evidence about whether the peer owns a distributed allocation.
+                raise ControllerError("Node ownership is unknown; select both nodes to reconcile it")
+            members = record.get("allocation_hosts") or []
+            if host in members and not set(members).issubset(hosts):
+                raise ControllerError(f"{host}: workload uses both Sparks; select both nodes to stop or replace it")
+        record = nodes[host]
+        known_solo = (record.get("mode") == "vllm"
+                      and record.get("allocation_hosts") == [host]
+                      and self._model(record.get("model"))[1] is not None)
+        # Inspect only the selected node. An offline unrelated peer must not
+        # prevent a local change. Labels recover allocations after lost state.
+        for container in self.audit(host)["containers"]:
+            if container["name"] not in self._owned_vllm_names():
+                continue
+            labels = container.get("labels") or {}
+            members = labels.get("ai.spark-serve.hosts")
+            command = " ".join(container.get("command") or [])
+            ranks = re.search(r"--nnodes(?:=|\s+)(\d+)", command)
+            if (ranks and int(ranks.group(1)) > 1) or "--headless" in command:
+                raise ControllerError(f"{host}: container is a distributed rank; select both nodes to reconcile it")
+            if members is not None:
+                try:
+                    members = json.loads(members)
+                    valid = (isinstance(members, list) and members and all(isinstance(item, str) for item in members)
+                             and host in members and len(set(members)) == len(members))
+                except (ValueError, TypeError):
+                    valid = False
+                if not valid or not set(members).issubset(hosts):
+                    raise ControllerError(f"{host}: container allocation requires both nodes or is unknown; select both nodes to reconcile it")
+            elif not known_solo:
+                raise ControllerError(f"{host}: untracked container may be a distributed rank; select both nodes to reconcile it")
 
     @contextlib.contextmanager
     def lock(self):
@@ -310,17 +442,29 @@ class Controller:
         atomic_json(self.directory / "controller.json", self.state)
 
     def revoke(self):
+        selected = {worker["host"] for worker in self._workers()}
+        remaining = [record["worker"] for host, record in self.node_states().items()
+                     if host not in selected and record.get("mode") == "yue"
+                     and record.get("phase") == "ready" and isinstance(record.get("worker"), dict)]
+        generations = {worker.get("generation") for worker in remaining}
+        # The version-1 Artist Twin contract requires one shared admission
+        # generation. We only preserve old receipts; scoped YuE starts are not
+        # supported until that consumer accepts independently admitted workers.
+        if remaining and (len(generations) != 1 or not next(iter(generations))):
+            raise ControllerError("YuE discovery generations disagree; select both nodes to reconcile admission")
         atomic_json(
             self.directory / "yue-workers.json",
             {
                 "version": 1,
-                "mode": "unavailable",
-                "generation": self.state.get("generation"),
-                "workers": [],
+                "mode": "yue" if remaining else "unavailable",
+                "generation": next(iter(generations)) if remaining else self.state.get("generation"),
+                "workers": remaining,
             },
         )
 
     def remote(self, host: str, script: str, *, json_output=False, fenced=True):
+        if self.operation_hosts is not None and host not in self.operation_hosts:
+            raise ControllerError(f"{host}: operation is restricted to the selected nodes")
         if fenced and self.operation_generation:
             script = guarded_remote_script(self.operation_generation, script)
         proc = self.ssh(self.cfg, host, script, check=False)
@@ -393,7 +537,7 @@ raise SystemExit(p.returncode)
 
     def fence_nodes(self, generation: str):
         errors = []
-        for worker in self.profile["workers"]:
+        for worker in self._workers():
             try:
                 self.remote(
                     worker["host"],
@@ -418,7 +562,7 @@ for port in json.loads(sys.argv[1]):
     with socket.socket() as probe:
         probe.settimeout(1)
         if probe.connect_ex(("127.0.0.1", port)) == 0: listening.append(port)
-print(json.dumps({"listening_ports": listening, "containers": [{"id": c["Id"], "name": c["Name"].lstrip("/"), "running": c["State"]["Running"], "gpu": bool(c["HostConfig"].get("DeviceRequests")) or any("nvidia" in str(d) for d in c["HostConfig"].get("Devices") or []), "labels": c["Config"].get("Labels") or {}} for c in containers], **classify_gpu_processes(compute) }))
+print(json.dumps({"listening_ports": listening, "containers": [{"id": c["Id"], "name": c["Name"].lstrip("/"), "running": c["State"]["Running"], "gpu": bool(c["HostConfig"].get("DeviceRequests")) or any("nvidia" in str(d) for d in c["HostConfig"].get("Devices") or []), "labels": c["Config"].get("Labels") or {}, "command": (c["Config"].get("Entrypoint") or []) + (c["Config"].get("Cmd") or [])} for c in containers], **classify_gpu_processes(compute) }))
 """
         return self.remote(
             host,
@@ -455,7 +599,7 @@ print(json.dumps({"listening_ports": listening, "containers": [{"id": c["Id"], "
     def stop_vllm(self):
         """Only exact catalog-owned IDs; do not kill arbitrary :8000 occupants."""
         names = self._owned_vllm_names()
-        for worker in self.profile["workers"]:
+        for worker in self._workers():
             host = worker["host"]
             before = self.audit(host)
             ids = [c["id"] for c in before["containers"] if c["name"] in names]
@@ -475,7 +619,7 @@ print(json.dumps({"listening_ports": listening, "containers": [{"id": c["Id"], "
             )
 
     def verify_idle(self):
-        for worker in self.profile["workers"]:
+        for worker in self._workers():
             host = worker["host"]
             audit = self.audit(host)
             if audit["listening_ports"]:
@@ -503,7 +647,7 @@ print(json.dumps({"listening_ports": listening, "containers": [{"id": c["Id"], "
         statuses, errors = [], []
         # Drain every reachable node even if another is unknown. New dispatch
         # has already been revoked; in-flight submissions meet worker fencing.
-        for worker in self.profile["workers"]:
+        for worker in self._workers():
             try:
                 statuses.append((worker, self.control(worker["host"], "drain")))
             except ControllerError as exc:
@@ -586,7 +730,7 @@ print(json.dumps({"listening_ports": listening, "containers": [{"id": c["Id"], "
 
     def start_yue(self, generation: str):
         ready = []
-        for worker in self.profile["workers"]:
+        for worker in self._workers():
             host = worker["host"]
             self.service(host, "restart")
             deadline = time.monotonic() + self.profile["ready_timeout"]
@@ -645,26 +789,54 @@ print(json.dumps({"listening_ports": listening, "containers": [{"id": c["Id"], "
         self.save(
             mode="yue", phase="ready", generation=generation, workers=ready, error=None
         )
+        nodes = self.node_states()
+        for worker in self._workers():
+            receipt = next(item for item in ready if item["url"] == worker["url"])
+            nodes[worker["host"]].update(
+                mode="yue", model="yue", phase="ready", generation=generation,
+                error=None, worker=receipt, allocation_hosts=[worker["host"]],
+                allocation_id=generation,
+            )
+        self.save(nodes=nodes)
         atomic_json(
             self.directory / "yue-workers.json",
             {"version": 1, "mode": "yue", "generation": generation, "workers": ready},
         )
         self.emit("ready", served="yue", ready_workers=len(ready), workers=ready)
 
-    def switch(self, target: str, start_vllm=None, *, cancel_jobs=False, no_wait=False, after_idle=None):
+    def switch(self, target: str, start_vllm=None, *, cancel_jobs=False, no_wait=False, after_idle=None, hosts=None):
+        configured = [worker["host"] for worker in self.profile["workers"]]
+        if hosts is None:
+            selected = configured
+        elif (not isinstance(hosts, list) or not hosts or len(set(hosts)) != len(hosts)
+              or any(host not in configured for host in hosts)):
+            raise ControllerError("Select one configured Spark host or both nodes")
+        else:
+            selected = [host for host in configured if host in hosts]
+        if target == "yue" and selected != configured:
+            raise ControllerError("Starting YuE currently requires both nodes; select both Sparks")
+        mid, model = self._model(target)
+        if target not in ("none", "yue") and model is None:
+            raise ControllerError(f"Unknown workload {target!r}")
+        nnodes = int((model or {}).get("nnodes") or self.cfg["cluster"].get("nnodes") or 1)
+        if model is not None and nnodes > len(selected):
+            raise ControllerError(f"{mid} requires both nodes; select both Sparks")
+        launch_hosts = selected[:1] if model is not None and nnodes == 1 else selected
         with self.lock():
+            self._check_scope(selected)
+            self.operation_hosts = selected
             generation = str(uuid.uuid4())
-            self.save(
-                target=target,
-                phase="draining",
-                generation=generation,
-                workers=[],
-                error=None,
-            )
-            self.revoke()
             self.operation_generation = generation
             started = False
             try:
+                self._save_selected(
+                    target=target,
+                    phase="draining",
+                    generation=generation,
+                    error=None,
+                    cleanup_errors=[],
+                )
+                self.revoke()
                 errors = self.fence_nodes(generation)
                 try:
                     self.stop_yue(cancel_jobs=cancel_jobs)
@@ -672,15 +844,20 @@ print(json.dumps({"listening_ports": listening, "containers": [{"id": c["Id"], "
                     errors.append(str(exc))
                 if errors:
                     raise ControllerError("; ".join(errors))
-                self.save(phase="stopping")
+                self._save_selected(phase="stopping")
                 self.stop_vllm()
                 self.verify_idle()
-                self.save(mode="none", phase="stopped")
+                self._save_selected(mode="none", model=None, phase="stopped", allocation_hosts=[], allocation_id=None, legacy=False)
                 if after_idle is not None:
                     after_idle()
                 if target == "none":
                     return
-                self.save(phase="starting")
+                self._save_selected(
+                    _hosts=launch_hosts, phase="starting", model=mid if model is not None else "yue",
+                    mode="vllm" if model is not None else "yue",
+                    allocation_hosts=launch_hosts if model is not None else [], allocation_id=generation,
+                    legacy=False,
+                )
                 started = True
                 if target == "yue":
                     self.emit(
@@ -697,19 +874,40 @@ print(json.dumps({"listening_ports": listening, "containers": [{"id": c["Id"], "
                     )
                     self.start_yue(generation)
                 else:
-                    start_vllm(generation)
-                    self.save(
+                    receipt = start_vllm(generation)
+                    if receipt is not None:
+                        containers = receipt.get("containers") if isinstance(receipt, dict) else None
+                        if (not isinstance(containers, list) or len(containers) != len(launch_hosts)
+                                or any(not isinstance(item, dict) or item.get("host") not in launch_hosts
+                                       or not isinstance(item.get("id"), str)
+                                       or not re.fullmatch(r"[0-9a-f]{64}", item["id"])
+                                       or item.get("rank") != launch_hosts.index(item["host"])
+                                       for item in containers)
+                                or {item["host"] for item in containers} != set(launch_hosts)):
+                            raise ControllerError("Model launch returned invalid immutable container receipts")
+                        if not no_wait and receipt.get("served") != model["served_name"]:
+                            raise ControllerError("Model launch receipt does not confirm the expected served model")
+                        nodes = self.node_states()
+                        for host in launch_hosts:
+                            nodes[host]["containers"] = [copy.deepcopy(item) for item in containers if item["host"] == host]
+                            nodes[host]["served"] = receipt.get("served")
+                        self.save(nodes=nodes)
+                    self._save_selected(
+                        _hosts=launch_hosts,
                         mode="vllm",
-                        model=target,
+                        model=mid,
                         phase="starting" if no_wait else "ready",
                         generation=generation,
                         error=None,
                     )
             except BaseException as exc:
-                self.revoke()
                 # Never turn a drain-pending render into an implicit cancel.
                 # Once old workloads were stopped, clean up any partial start.
                 cleanup = []
+                try:
+                    self.revoke()
+                except Exception as err:
+                    cleanup.append(str(err))
                 if started:
                     try:
                         self.stop_yue(cancel_jobs=False)
@@ -719,13 +917,16 @@ print(json.dumps({"listening_ports": listening, "containers": [{"id": c["Id"], "
                         self.stop_vllm()
                     except Exception as err:  # noqa: BLE001 — retain the original failure while reporting incomplete cleanup
                         cleanup.append(str(err))
-                self.save(phase="failed", error=str(exc), cleanup_errors=cleanup)
+                self._save_selected(phase="failed", error=str(exc), cleanup_errors=cleanup)
                 raise
             finally:
                 self.operation_generation = None
+                self.operation_hosts = None
 
     def status(self) -> dict:
         state = read_state(self.directory)
+        self.state = state
+        nodes = self.node_states()
         generation = state.get("generation")
         workers = []
         for worker in self.profile["workers"]:
@@ -745,11 +946,12 @@ print(json.dumps({"listening_ports": listening, "containers": [{"id": c["Id"], "
                     active_job=control.get("active_job"),
                     generation=control.get("generation"),
                 )
-                if state.get("mode") == "yue" and state.get("phase") == "ready":
+                owner = nodes[worker["host"]]
+                if owner.get("mode") == "yue" and owner.get("phase") == "ready":
                     health = self.health(worker)
                     item["ready"] = (
-                        health_ready(health, generation)
-                        and health_ready(control, generation)
+                        health_ready(health, owner.get("generation"))
+                        and health_ready(control, owner.get("generation"))
                         and control.get("worker_id") == health.get("worker_id")
                         and control.get("runtime_manifest")
                         == health.get("runtime_manifest")
@@ -767,4 +969,5 @@ print(json.dumps({"listening_ports": listening, "containers": [{"id": c["Id"], "
             "yue_workers": workers,
             "ready_workers": sum(w["ready"] for w in workers),
             "total_workers": len(workers),
+            "nodes": [dict(host=host, **record) for host, record in nodes.items()],
         }

@@ -35,6 +35,39 @@ struct Container: Codable {
     let running: Bool
 }
 
+struct SparkNodeStatus: Codable, Identifiable {
+    var id: String { node }
+    let node: String
+    let host: String
+    let url: String
+    let ready: Bool
+    let served: String?
+    let model: String?
+    let backend: String?
+    let phase: String?
+    let error: String?
+    let containers: [Container]
+    let ours_running: Bool
+    let port_busy: Bool
+    let foreign_served: String?
+    let allocation_hosts: [String]
+    let can_use: Bool?
+
+    var sharedModel: Bool { backend == "vllm" && allocation_hosts.count > 1 }
+    var canUseInHermes: Bool {
+        ready && (can_use ?? (backend == "vllm" && (!sharedModel || node == "head")))
+    }
+    var transitionLabel: String? {
+        switch phase {
+        case "starting": return "Starting model…"
+        case "draining": return "Finishing active jobs…"
+        case "stopping": return "Stopping model…"
+        case "rebooting": return "Restarting Spark…"
+        default: return nil
+        }
+    }
+}
+
 struct ClusterStatus: Codable {
     let head: String
     let worker: String
@@ -55,6 +88,8 @@ struct ClusterStatus: Codable {
     let ready_workers: Int?
     let total_workers: Int?
     let transition_error: String?
+    var nodes: [SparkNodeStatus]? = nil
+    var active_node: String? = nil
 }
 
 enum BootState {
@@ -114,6 +149,8 @@ final class CLIRunner: ObservableObject {
     @Published var rebootDialog = false
     @Published private var isStopping = false
     @Published private(set) var preparingModel: String?
+    @Published private(set) var transitionNode: String?
+    @Published private var activeCommand: String?
 
     private let home: URL?
     private let cliPath: String
@@ -121,6 +158,7 @@ final class CLIRunner: ObservableObject {
     @Published private var upProcess: Process?
     private var lineBuf = Data()
     private var lastDecodeError: String?
+    private var didReportHermesSelection = false
 
     var isBusy: Bool {
         if isStopping || upProcess != nil { return true }
@@ -132,6 +170,63 @@ final class CLIRunner: ObservableObject {
 
     var activeYueWorkers: [YueWorker] {
         status?.yue_workers?.filter { $0.busy } ?? []
+    }
+
+    var nodes: [SparkNodeStatus] { status?.nodes ?? [] }
+
+    func requiresBothSparks(_ model: ModelEntry) -> Bool {
+        model.backend == "yue" || model.topology != "single"
+    }
+
+    func hostName(_ node: String) -> String {
+        if node == "both" { return "both Sparks" }
+        return nodes.first(where: { $0.node == node })?.host
+            ?? (node == "worker" ? status?.worker : status?.head)
+            ?? (node == "worker" ? "sparktwo" : "sparkone")
+    }
+
+    func isChanging(_ node: SparkNodeStatus) -> Bool {
+        isBusy && activeCommand != "use"
+            && (transitionNode == "both" || transitionNode == node.node)
+    }
+
+    func isServing(_ node: SparkNodeStatus) -> Bool {
+        node.ready && (!isChanging(node) || preparingModel != nil)
+    }
+
+    func nodeActivity(_ node: SparkNodeStatus) -> String? {
+        guard isChanging(node) else { return nil }
+        if isStopping { return "Stopping model…" }
+        if preparingModel != nil { return "Checking selected model…" }
+        switch bootState {
+        case .launching: return "Starting selected model…"
+        case .booting(_, let elapsed): return "Starting · \(elapsed)s"
+        case .rebooting: return "Restarting Spark…"
+        default: return nil
+        }
+    }
+
+    func modelLabel(_ node: SparkNodeStatus) -> String {
+        models.first(where: { $0.id == node.model || $0.served_name == node.served })?.label
+            ?? node.served ?? node.model ?? (node.ours_running ? "Model server" : "No model loaded")
+    }
+
+    var servingModelIDs: Set<String> {
+        if status?.nodes != nil {
+            return Set(nodes.filter { isServing($0) }.compactMap { node in
+                node.model ?? models.first(where: { $0.served_name == node.served })?.id
+            })
+        }
+        if !activeYueWorkers.isEmpty { return ["yue"] }
+        if preparingModel != nil, status?.ready == true {
+            return Set(models.filter { $0.served_name == status?.served }.map(\.id))
+        }
+        switch bootState {
+        case .ready(let model, _): return [model]
+        case .idle where status?.ready == true:
+            return Set(models.filter { $0.served_name == status?.served }.map(\.id))
+        default: return []
+        }
     }
 
     private var yueIsDraining: Bool {
@@ -152,12 +247,19 @@ final class CLIRunner: ObservableObject {
     }
 
     var retainedServingNote: String? {
+        if preparingModel != nil, !nodes.isEmpty {
+            let hosts = nodes.filter { isServing($0) }.map(\.host)
+            return hosts.isEmpty ? nil : "Still serving on \(hosts.joined(separator: " and "))"
+        }
         guard preparingModel != nil, status?.ready == true, let served = status?.served else { return nil }
         return "Still serving \(served)"
     }
 
     private var serverNotResponding: Bool {
-        !isBusy && status?.ready == false
+        if !nodes.isEmpty {
+            return !isBusy && nodes.contains { !$0.ready && $0.ours_running && $0.transitionLabel == nil }
+        }
+        return !isBusy && status?.ready == false
             && (status?.vllm_running == true || status?.ours_running == true)
     }
 
@@ -166,6 +268,10 @@ final class CLIRunner: ObservableObject {
         if isBusy || yueIsDraining { return .orange }
         if transitionIsBlocked { return .red }
         if serverNotResponding { return .orange }
+        if !nodes.isEmpty {
+            if nodes.contains(where: { $0.ready }) { return .green }
+            return nodes.contains(where: { $0.ours_running || $0.error != nil }) ? .orange : .gray
+        }
         switch bootState {
         case .ready: return .green
         case .booting, .launching, .rebooting: return .orange
@@ -178,10 +284,12 @@ final class CLIRunner: ObservableObject {
     }
 
     var badgeText: String {
-        if isStopping { return "draining / stopping" }
+        if activeCommand == "use", isBusy { return "connecting Hermes…" }
+        if isStopping { return "stopping \(hostName(transitionNode ?? "both"))" }
         switch bootState {
         case .failed(let message): return message
-        case .booting(_, let elapsed): return "booting (\(elapsed)s)"
+        case .booting(_, let elapsed):
+            return transitionNode.map { "starting \(hostName($0)) (\(elapsed)s)" } ?? "booting (\(elapsed)s)"
         case .rebooting(let elapsed): return "rebooting Sparks (\(elapsed)s)"
         case .launching(let model): return preparingModel == nil ? "starting \(model)…" : "checking \(model)…"
         default: break
@@ -193,6 +301,10 @@ final class CLIRunner: ObservableObject {
             return activeYueWorkers.isEmpty ? "Switch blocked" : "YuE rendering · switch blocked"
         }
         if serverNotResponding { return "server not responding" }
+        if !nodes.isEmpty {
+            let count = nodes.filter { $0.ready }.count
+            return count == 0 ? "Sparks idle" : "\(count) \(count == 1 ? "Spark" : "Sparks") serving"
+        }
         if status?.mode == "yue", status?.phase == "ready" {
             let ready = status?.ready_workers ?? 0
             let total = status?.total_workers ?? 2
@@ -263,15 +375,19 @@ final class CLIRunner: ObservableObject {
         pollTimer = nil
     }
 
-    func startUp(model: String, noHermes: Bool = false) {
+    func startUp(model: String, node: String? = nil, noHermes: Bool = true) {
         guard !isBusy else { return }
+        let entry = models.first { $0.id == model }
+        let target = entry.map { requiresBothSparks($0) } == true ? "both" : (node ?? "head")
+        transitionNode = target
+        activeCommand = "up"
         preparingModel = nil
         bootState = .launching(model: model)
         logLines = []
         lineBuf = Data()
         lastDecodeError = nil
 
-        var args: [String] = ["up", model, "--json"]
+        var args: [String] = ["up", model, "--node", target, "--json"]
         if noHermes { args.append("--no-hermes") }
 
         let process = makeProcess(args)
@@ -285,6 +401,7 @@ final class CLIRunner: ObservableObject {
         } catch {
             bootState = .failed(message: "Failed to launch: \(error.localizedDescription)")
             upProcess = nil
+            activeCommand = nil
             return
         }
 
@@ -293,13 +410,17 @@ final class CLIRunner: ObservableObject {
         }
     }
 
-    func stop(cancelJobs: Bool = false) {
+    func stop(node: String = "both", cancelJobs: Bool = false) {
         guard !isBusy else {
             appendLog("A mode transition is already running. Wait for it to finish before stopping.")
             return
         }
         preparingModel = nil
-        let args = cancelJobs ? ["stop", "--cancel-jobs"] : ["stop"]
+        transitionNode = node
+        activeCommand = "stop"
+        bootState = .idle
+        var args = ["stop", "--node", node, "--json"]
+        if cancelJobs { args.append("--cancel-jobs") }
         appendLog("$ spark-serve \(args.joined(separator: " "))")
         isStopping = true
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -308,12 +429,48 @@ final class CLIRunner: ObservableObject {
             DispatchQueue.main.async {
                 for line in out.split(whereSeparator: \.isNewline) {
                     let s = String(line).trimmingCharacters(in: .whitespaces)
-                    if !s.isEmpty { self.appendLog(s) }
+                    if !s.isEmpty { self.parseEvent(s, model: "stop") }
                 }
                 self.isStopping = false
-                self.bootState = code == 0 ? .idle : .failed(message: "Stop needs attention; see log")
+                if code == 0 { self.bootState = .idle }
+                else if case .failed = self.bootState { }
+                else { self.bootState = .failed(message: "Stop needs attention; see log") }
+                self.activeCommand = nil
                 self.refresh()
             }
+        }
+    }
+
+    func useInHermes(node: String) {
+        guard !isBusy, nodes.first(where: { $0.node == node })?.canUseInHermes == true else { return }
+        activeCommand = "use"
+        transitionNode = node
+        preparingModel = nil
+        bootState = .idle
+        lineBuf = Data()
+        didReportHermesSelection = false
+        let process = makeProcess(["use", "--node", node, "--json"])
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        upProcess = process
+        appendLog("  connecting Hermes to \(hostName(node))…")
+        do { try process.run() }
+        catch {
+            bootState = .failed(message: "Could not connect Hermes: \(error.localizedDescription)")
+            upProcess = nil
+            activeCommand = nil
+            return
+        }
+        observeProcess(process, pipe: pipe, model: "use") { runner, code in
+            if code == 0 {
+                runner.bootState = .idle
+                if !runner.didReportHermesSelection {
+                    runner.appendLog("  Hermes now uses \(runner.hostName(node))")
+                }
+            } else if case .failed = runner.bootState { }
+            else { runner.bootState = .failed(message: "Hermes connection failed; see log") }
+            runner.activeCommand = nil
         }
     }
 
@@ -325,6 +482,8 @@ final class CLIRunner: ObservableObject {
     func reboot(cancelJobs: Bool, sudoPassword: String) {
         guard !isBusy else { return }
         preparingModel = nil
+        transitionNode = "both"
+        activeCommand = "reboot"
         bootState = .rebooting(elapsed: 0)
         logLines = []
         lineBuf = Data()
@@ -347,6 +506,7 @@ final class CLIRunner: ObservableObject {
         } catch {
             bootState = .failed(message: "Failed to reboot: \(error.localizedDescription)")
             upProcess = nil
+            activeCommand = nil
             return
         }
 
@@ -430,6 +590,7 @@ final class CLIRunner: ObservableObject {
                 self.flushStdout(model: model)
                 self.upProcess = nil
                 didExit(self, statusCode)
+                self.activeCommand = nil
                 self.refresh()
             }
         }
@@ -492,6 +653,15 @@ final class CLIRunner: ObservableObject {
             if let host = obj["host"] as? String {
                 appendLog("  stop \(host)")
             }
+        case "stopped":
+            let hosts = obj["hosts"] as? [String] ?? []
+            let target = hosts.isEmpty
+                ? hostName(obj["node"] as? String ?? transitionNode ?? "both")
+                : hosts.joined(separator: " and ")
+            appendLog("  stopped \(target)")
+        case "desktop_gpu_context":
+            let host = obj["host"] as? String ?? "Spark"
+            appendLog("  \(host): remote desktop session retained")
         case "reboot":
             if let host = obj["host"] as? String {
                 appendLog("  reboot \(host): \(obj["output"] as? String ?? "issued")")
@@ -535,6 +705,12 @@ final class CLIRunner: ObservableObject {
             if let detail = obj["detail"] as? String {
                 appendLog("  hermes: \(detail)")
             }
+        case "selected":
+            let host = obj["host"] as? String ?? hostName(obj["node"] as? String ?? "head")
+            let served = obj["served"] as? String
+            let label = models.first(where: { $0.served_name == served })?.label ?? served
+            appendLog("  Hermes uses \(host)\(label.map { ": \($0)" } ?? "")")
+            didReportHermesSelection = true
         case "waiting":
             if case .rebooting = bootState {
                 appendLog("  waiting for SSH …")
@@ -639,10 +815,10 @@ struct SparkServeApp: App {
         Window("spark-serve", id: "main") {
             MainView()
                 .environmentObject(runner)
-                .frame(minWidth: 640, minHeight: 600)
+                .frame(minWidth: 760, minHeight: 660)
         }
         .windowStyle(.titleBar)
-        .defaultSize(width: 820, height: 660)
+        .defaultSize(width: 1120, height: 800)
 
         MenuBarExtra {
             MenuBarView()
@@ -709,27 +885,43 @@ struct MenuBarView: View {
 
             Divider()
 
-            ForEach(runner.models) { m in
-                Button(action: {
-                    runner.openMainWindow()
-                    runner.startUp(model: m.id)
-                }) {
-                    HStack {
-                        Text("↑ \(m.label)")
-                        Spacer()
-                        Text(m.backend == "yue" ? "2 workers" : fmtCtx(m.ctx))
-                            .foregroundStyle(.secondary)
-                            .font(.caption)
-                    }
+            ForEach(runner.nodes) { node in
+                HStack {
+                    Circle().fill(runner.isServing(node) ? Color.green : Color.secondary).frame(width: 7, height: 7)
+                    Text(node.host).font(.caption.weight(.medium))
+                    Spacer()
+                    Text(runner.modelLabel(node)).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 }
-                .buttonStyle(.plain)
                 .padding(.horizontal, 8)
-                .disabled(runner.isBusy)
+            }
+
+            ForEach(runner.models) { m in
+                if runner.requiresBothSparks(m) {
+                    Button("\(m.label) · both Sparks") {
+                        runner.openMainWindow()
+                        runner.startUp(model: m.id, node: "both")
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.horizontal, 8)
+                    .disabled(runner.isBusy)
+                } else {
+                    Menu(m.label) {
+                        ForEach(["head", "worker"], id: \.self) { node in
+                            Button("Start on \(runner.hostName(node))") {
+                                runner.openMainWindow()
+                                runner.startUp(model: m.id, node: node)
+                            }
+                            .disabled(runner.nodes.first(where: { $0.node == node })?.sharedModel == true)
+                        }
+                    }
+                    .padding(.horizontal, 8)
+                    .disabled(runner.isBusy)
+                }
             }
 
             Divider()
 
-            Button("Stop cluster") {
+            Button("Stop both Sparks") {
                 runner.stop()
             }
             .buttonStyle(.plain)
@@ -758,7 +950,7 @@ struct MenuBarView: View {
             .padding(.horizontal, 8)
         }
         .padding(.vertical, 6)
-        .frame(width: 260)
+        .frame(width: 340)
     }
 
     private func fmtCtx(_ n: Int) -> String {
@@ -776,29 +968,35 @@ struct MainView: View {
     @State private var selectedModel: String?
     @State private var showNotes = true
     @State private var confirmCancelJobs = false
-    @State private var modelPickerHeight: CGFloat = 324
 
     var body: some View {
         VStack(spacing: 12) {
             header
             Divider()
-            modelPicker
-            controls
-            if let workers = runner.status?.yue_workers, runner.status?.mode == "yue" || workers.contains(where: { $0.busy || $0.accepting || $0.error != nil }) {
-                HStack(alignment: .top, spacing: 12) {
-                    ForEach(workers) { worker in
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("\(worker.host): \(worker.busy ? "rendering" : worker.ready ? "ready" : worker.accepting ? "validating" : "drained")")
-                                .font(.caption.weight(.medium))
-                            if let error = worker.error {
-                                Text(error).font(.caption2).foregroundStyle(.orange).lineLimit(2)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    if !runner.nodes.isEmpty {
+                        HStack(alignment: .top, spacing: 12) {
+                            ForEach(runner.nodes) { node in
+                                SparkNodePanel(node: node, selectedModel: selectedEntry)
+                                    .environmentObject(runner)
                             }
                         }
                     }
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Choose a model")
+                            .font(.headline)
+                        Text("Select a model, then choose the Spark where it should run.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        modelPicker
+                    }
+                    controls
                 }
+                .padding(2)
             }
             Divider()
-            logView
+            logView.frame(minHeight: 100, maxHeight: 160)
         }
         .padding(16)
         .confirmationDialog("Cancel active YuE renders and stop?", isPresented: $confirmCancelJobs) {
@@ -813,12 +1011,12 @@ struct MainView: View {
         }
         .onAppear {
             if selectedModel == nil {
-                selectedModel = runner.models.first?.id
+                selectedModel = initialSelection
             }
         }
         .onChange(of: runner.models.count) { _ in
             if selectedModel == nil {
-                selectedModel = runner.models.first?.id
+                selectedModel = initialSelection
             }
         }
     }
@@ -829,7 +1027,7 @@ struct MainView: View {
                 Text("spark-serve")
                     .font(.title2.bold())
                 if let s = runner.status {
-                    Text("\(s.head) + \(s.worker)  ·  \(s.url)")
+                    Text("\(s.head) + \(s.worker)  ·  independent model serving")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -865,110 +1063,86 @@ struct MainView: View {
         }
     }
 
-    private var isCurrentModel: String? {
-        if !runner.activeYueWorkers.isEmpty { return "yue" }
-        if runner.preparingModel != nil, runner.status?.ready == true {
-            return runner.status?.served.flatMap { served in
-                runner.models.first(where: { $0.served_name == served || $0.id == served })?.id
-            }
-        }
-        switch runner.bootState {
-        case .ready(let m, _): return m
-        case .booting, .launching, .rebooting, .failed: return nil
-        default:
-            guard runner.status?.ready == true else { return nil }
-            return runner.status?.served.flatMap { served in
-                runner.models.first(where: { $0.served_name == served || $0.id == served })?.id
-            }
-        }
+    private var selectedEntry: ModelEntry? {
+        runner.models.first(where: { $0.id == selectedModel })
+    }
+
+    private var initialSelection: String? {
+        runner.nodes.first(where: { $0.node == runner.status?.active_node && $0.model != nil })?.model
+            ?? runner.nodes.first(where: { $0.ready && $0.model != nil })?.model
+            ?? runner.models.first?.id
     }
 
     private var modelPicker: some View {
-        ScrollView {
-            LazyVGrid(
-                columns: [GridItem(.adaptive(minimum: 190), spacing: 12, alignment: .top)],
-                alignment: .leading,
-                spacing: 12
-            ) {
-                ForEach(runner.models) { m in
-                    Button {
-                        selectedModel = m.id
-                    } label: {
-                        ModelCard(
-                            model: m,
-                            isSelected: selectedModel == m.id,
-                            isCurrent: isCurrentModel == m.id,
-                            showNotes: showNotes
-                        )
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel(m.label)
-                    .accessibilityValue("\(selectedModel == m.id ? "Selected" : "Not selected")\(isCurrentModel == m.id ? ", serving" : "")")
-                    .accessibilityHint("Select this model, then use Start.")
+        LazyVGrid(
+            columns: [GridItem(.adaptive(minimum: 190), spacing: 12, alignment: .top)],
+            alignment: .leading,
+            spacing: 12
+        ) {
+            ForEach(runner.models) { model in
+                Button {
+                    selectedModel = model.id
+                } label: {
+                    ModelCard(
+                        model: model,
+                        isSelected: selectedModel == model.id,
+                        isCurrent: runner.servingModelIDs.contains(model.id),
+                        showNotes: showNotes
+                    )
                 }
+                .buttonStyle(.plain)
+                .accessibilityLabel(model.label)
+                .accessibilityValue("\(selectedModel == model.id ? "Selected" : "Not selected")\(runner.servingModelIDs.contains(model.id) ? ", serving" : "")")
+                .accessibilityHint("Select this model, then choose where to start it.")
             }
-            .padding(2)
-            .background(GeometryReader { geometry in
-                Color.clear
-                    .onAppear { modelPickerHeight = geometry.size.height }
-                    .onChange(of: geometry.size.height) { modelPickerHeight = $0 }
-            })
         }
-        .frame(height: min(360, max(154, modelPickerHeight)))
+        .padding(2)
     }
 
     @ViewBuilder
     private var controls: some View {
-        HStack(spacing: 12) {
-            Button("Start \(selectedModel ?? "")") {
-                if let m = selectedModel {
-                    runner.startUp(model: m)
+        VStack(alignment: .leading, spacing: 10) {
+            if let selectedEntry {
+                if runner.requiresBothSparks(selectedEntry) {
+                    HStack {
+                        Button("Start on both Sparks") {
+                            runner.startUp(model: selectedEntry.id, node: "both")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(runner.isBusy)
+                        Text("This model uses both Sparks and replaces their current models.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                } else {
+                    Text("Selected: \(selectedEntry.label). Use Start on either Spark above.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
             }
-            .buttonStyle(.borderedProminent)
-            .disabled(selectedModel == nil || runner.isBusy)
-
-            Button("Stop") {
-                runner.stop()
-            }
-            .buttonStyle(.bordered)
-            .tint(.red)
-            .disabled(runner.isBusy)
-
-            Button("Restart Sparks") {
-                runner.requestReboot()
-            }
-            .buttonStyle(.bordered)
-            .tint(.orange)
-            .disabled(runner.isBusy)
-
-            if runner.status?.yue_workers?.contains(where: { $0.busy }) == true {
-                Button("Cancel jobs & stop") { confirmCancelJobs = true }
+            HStack(spacing: 12) {
+                Button("Stop both Sparks") { runner.stop(node: "both") }
                     .buttonStyle(.bordered)
+                    .tint(.red)
                     .disabled(runner.isBusy)
-            }
-
-            Button("Refresh") {
-                runner.refresh()
-            }
-            .buttonStyle(.bordered)
-
-            if case .booting(_, let elapsed) = runner.bootState {
-                Text("elapsed \(elapsed)s")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            if case .rebooting(let elapsed) = runner.bootState {
-                Text("reboot \(elapsed)s")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                Button("Restart Sparks") { runner.requestReboot() }
+                    .buttonStyle(.bordered)
+                    .tint(.orange)
+                    .disabled(runner.isBusy)
+                if runner.status?.yue_workers?.contains(where: { $0.busy }) == true {
+                    Button("Cancel jobs & stop both") { confirmCancelJobs = true }
+                        .buttonStyle(.bordered)
+                        .disabled(runner.isBusy)
+                }
+                Button("Refresh") { runner.refresh() }
+                    .buttonStyle(.bordered)
             }
         }
     }
 
     private var logView: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text("Boot log")
+            Text("Activity log")
                 .font(.caption.weight(.medium))
                 .foregroundStyle(.secondary)
             ScrollView {
@@ -986,6 +1160,111 @@ struct MainView: View {
             .background(Color(nsColor: .textBackgroundColor))
             .clipShape(RoundedRectangle(cornerRadius: 6))
         }
+    }
+}
+
+// MARK: - Individual Sparks
+
+struct SparkNodePanel: View {
+    @EnvironmentObject var runner: CLIRunner
+    let node: SparkNodeStatus
+    let selectedModel: ModelEntry?
+
+    private var serving: Bool { runner.isServing(node) }
+    private var color: Color {
+        if serving { return .green }
+        if runner.isChanging(node) { return .orange }
+        if node.error != nil || node.phase == "failed" { return .red }
+        if node.transitionLabel != nil { return .orange }
+        return node.ours_running || node.port_busy ? .orange : .gray
+    }
+    private var stateLabel: String {
+        if serving { return node.sharedModel && !node.canUseInHermes ? "Working together" : "Serving" }
+        if let activity = runner.nodeActivity(node) { return activity }
+        if node.error != nil || node.phase == "failed" { return "Needs attention" }
+        if let transition = node.transitionLabel { return transition }
+        if node.ours_running { return "Not responding" }
+        if node.port_busy { return "Port in use" }
+        return "Idle"
+    }
+    private var startEnabled: Bool {
+        guard let selectedModel else { return false }
+        return !runner.isBusy && !runner.requiresBothSparks(selectedModel) && !node.sharedModel
+    }
+    private var startTitle: String {
+        guard let selectedModel else { return "Choose a model" }
+        return runner.requiresBothSparks(selectedModel)
+            ? "Selected model uses both Sparks" : "Start \(selectedModel.label)"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Circle().fill(color).frame(width: 9, height: 9)
+                Text(node.host).font(.headline)
+                Spacer()
+                if runner.status?.active_node == node.node {
+                    Text("Hermes")
+                        .font(.caption2.weight(.semibold))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 3)
+                        .background(color.opacity(0.12))
+                        .clipShape(Capsule())
+                }
+            }
+            Text(runner.modelLabel(node))
+                .font(.subheadline.weight(.semibold))
+                .lineLimit(2)
+                .help(runner.modelLabel(node))
+            Text(stateLabel)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(color)
+            if serving, let activity = runner.nodeActivity(node) {
+                Text(activity).font(.caption).foregroundStyle(.secondary)
+            }
+            if node.sharedModel {
+                Text("Shared across both Sparks. Stop both before changing one.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            } else {
+                Text(node.url)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+            if let error = node.error, !error.isEmpty {
+                Text(error)
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+                    .lineLimit(2)
+                    .help(error)
+            }
+            Button {
+                if let selectedModel { runner.startUp(model: selectedModel.id, node: node.node) }
+            } label: {
+                Text(startTitle).lineLimit(1)
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(!startEnabled)
+            .accessibilityLabel("Start \(selectedModel?.label ?? "selected model") on \(node.host)")
+            HStack(spacing: 8) {
+                Button(node.sharedModel ? "Stop both Sparks" : "Stop") {
+                    runner.stop(node: node.sharedModel ? "both" : node.node)
+                }
+                .buttonStyle(.bordered)
+                .disabled(runner.isBusy || (!node.ours_running && !node.ready && node.model == nil))
+                .accessibilityLabel(node.sharedModel ? "Stop both Sparks" : "Stop \(node.host)")
+                Button("Use in Hermes") { runner.useInHermes(node: node.node) }
+                    .buttonStyle(.bordered)
+                    .disabled(runner.isBusy || !node.canUseInHermes)
+                    .accessibilityLabel("Use \(node.host) in Hermes")
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, minHeight: 190, alignment: .topLeading)
+        .background(Color(nsColor: .controlBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(color.opacity(0.4), lineWidth: 1))
     }
 }
 

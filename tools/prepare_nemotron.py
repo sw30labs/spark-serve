@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Prepare the pinned single-Spark Qwen runtime without stopping a serving model."""
+"""Prepare the pinned single-Spark Nemotron runtime without stopping a serving model."""
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import shlex
 import subprocess
@@ -11,34 +10,13 @@ import sys
 import tarfile
 import tempfile
 import tomllib
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-RECIPE = ROOT / "recipes" / "qwen38-nvfp4"
 sys.path.insert(0, str(ROOT))
 from spark_serve_nodes import launch_config
 
-
-def validate_overlays(recipe: Path) -> None:
-    """Check every vendored source before uploading or building the runtime."""
-    hashes = json.loads((recipe / "overlays.sha256.json").read_text())
-    patch = recipe / "single-spark-vllm-tp1" / "patch"
-    expected = {"LICENSE", "NOTICE"} | {
-        str(path.relative_to(recipe)) for path in patch.rglob("*")
-        if path.is_file() and "__pycache__" not in path.parts
-    }
-    if set(hashes) != expected:
-        raise ValueError("vendored Qwen sources do not match overlays.sha256.json")
-    for filename, expected_digest in hashes.items():
-        relative = PurePosixPath(filename)
-        path = recipe / relative
-        if (relative.is_absolute() or ".." in relative.parts
-                or not path.resolve().is_relative_to(recipe.resolve())):
-            raise ValueError(f"invalid overlay manifest path: {filename!r}")
-        with path.open("rb") as source:
-            actual = hashlib.file_digest(source, "sha256").hexdigest()
-        if actual != expected_digest:
-            raise ValueError(f"vendored Qwen source checksum mismatch: {filename}")
+RECIPE = ROOT / "recipes" / "nemotron-super-nvfp4"
 
 
 def main() -> None:
@@ -47,20 +25,17 @@ def main() -> None:
     parser.add_argument("--node", choices=("head", "worker"), default="head")
     parser.add_argument("--skip-download", action="store_true", help="require the pinned snapshot already cached")
     args = parser.parse_args()
-    cfg = tomllib.loads(args.catalog.read_text())
-    if args.node == "worker":
-        cfg = launch_config(cfg, "qwen38", args.node)
-    cluster, model = cfg["cluster"], cfg["models"]["qwen38"]
-    if int(model.get("nnodes", 0)) != 1 or model.get("recipe") != "qwen38-nvfp4":
-        parser.error("this preparation recipe requires qwen38 with nnodes=1")
-    validate_overlays(RECIPE)
+    cfg = launch_config(tomllib.loads(args.catalog.read_text()), "nemotron-super", args.node)
+    cluster, model = cfg["cluster"], cfg["models"]["nemotron-super"]
+    if int(model.get("nnodes", 0)) != 1 or model.get("recipe") != "nemotron-super-nvfp4":
+        parser.error("this preparation recipe requires nemotron-super with nnodes=1")
     source = json.loads((RECIPE / "model-source.json").read_text())
     ssh = ["ssh", *cluster.get("ssh_opts", ["-o", "BatchMode=yes"]), cluster["head"]]
     # A new staging directory prevents an interrupted upload from altering a build in progress.
-    proc = subprocess.run([*ssh, "mktemp -d /tmp/spark-serve-qwen38.XXXXXXXX"],
+    proc = subprocess.run([*ssh, "mktemp -d /tmp/spark-serve-nemotron-super.XXXXXXXX"],
                           capture_output=True, text=True, check=True)
     remote = proc.stdout.strip()
-    if not remote.startswith("/tmp/spark-serve-qwen38.") or "\n" in remote:
+    if not remote.startswith("/tmp/spark-serve-nemotron-super.") or "\n" in remote:
         raise RuntimeError("unexpected remote preparation directory")
     with tempfile.TemporaryFile() as archive:
         with tarfile.open(fileobj=archive, mode="w") as tar:
@@ -76,7 +51,7 @@ def main() -> None:
         f"print(snapshot_download({source['model']!r}, revision={source['revision']!r}, cache_dir={str(Path(cache) / 'hub')!r}, token=False, max_workers=2), flush=True)",
     ])
     commands = ["set -euo pipefail", f"cd {shlex.quote(remote)}",
-                'venv="$HOME/.local/share/spark-serve/recipes/qwen38-nvfp4/download-env"']
+                'venv="$HOME/.local/share/spark-serve/recipes/nemotron-super-nvfp4/download-env"']
     if not args.skip_download:
         commands += ['python3 -m venv "$venv"',
                      '"$venv/bin/pip" install --disable-pip-version-check huggingface_hub==1.31.0',
@@ -87,8 +62,8 @@ def main() -> None:
     commands += [verifier,
                  "docker build --tag " + shlex.quote(model["image"]) + " .",
                  "docker image inspect --format '{{.Id}}' " + shlex.quote(model["image"]),
-                 "printf '%s\\n' " + shlex.quote("Prepared Qwen on " + cluster["head"] + ". Start it with ./spark-serve up qwen38 --node " + args.node + ".")]
-    print(f"Preparing NVIDIA Qwen on {cluster['head']}; checkpoint {source['revision']}", flush=True)
+                 "printf '%s\\n' " + shlex.quote("Prepared Nemotron on " + cluster["head"] + ". Start it with ./spark-serve up nemotron-super --node " + args.node + ".")]
+    print(f"Preparing NVIDIA Nemotron on {cluster['head']}; checkpoint {source['revision']}", flush=True)
     subprocess.run([*ssh, "bash -s"], input="\n".join(commands) + "\n", text=True, check=True)
 
 
@@ -96,4 +71,4 @@ if __name__ == "__main__":
     try:
         main()
     except (OSError, ValueError, KeyError, RuntimeError, subprocess.CalledProcessError) as exc:
-        sys.exit(f"Qwen preparation failed: {exc}")
+        sys.exit(f"Nemotron preparation failed: {exc}")

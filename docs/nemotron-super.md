@@ -1,95 +1,138 @@
-# Nemotron-3-Super (NVFP4, solo Spark)
+# Nemotron-3-Super NVFP4 on an independent Spark
 
-Second catalog profile for the two-Spark LAN serve — **not** proven smarter than
-DeepSeek-V4-Flash. Use it when you want NVIDIA's Nemotron-3-Super NVFP4 recipe on
-a single GB10, or to A/B against `ds4` / `ds4-vision`.
-
-## Shape (defaults — do not flip casually)
-
-| Knob | Default | Why |
-|------|---------|-----|
-| `nnodes` | **1** | Solo on **sparkone** (head). sparktwo stays idle. |
-| `tensor_parallel` | **1** | Matches NVIDIA single-Spark recipe. **TP=2 is not the default.** |
-| `max_model_len` | **262144** | Safer KV on 128GB UMA than 1M. NVIDIA shows up to 1M with headroom tradeoffs. |
-| Image | `vllm/vllm-openai:cu130-nightly` | Stock vLLM nightly (not Aiden DS4). |
-| Weights | `nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4` | HF id / cache key. |
-| Served name | `nemotron-3-super` | Hermes `-m` / OpenAI `model`. |
-| Container | `vllm_cluster` (cluster default) | Same stop path as other recipes. |
-
-Optional later: raise `nnodes`/`tensor_parallel` to 2 and rsync weights to
-sparktwo — only as a documented override, never the sketch default.
-
-## Why this profile
-
-- Second recipe next to Flash / vision — same `:8000`, same Hermes provider slot.
-- Official NVIDIA single-Spark NVFP4 path (marlin GEMM, fp4 quant, hermes tool parser).
-- Leaves QSFP / GDR fabric unused: no multi-node NCCL for the default sketch.
-- sparktwo is idle while this is up (power / heat win; also a limitation).
-
-## Flip
+`nemotron-super` runs NVIDIA's 120B/A12B NVFP4 checkpoint on one GB10 with
+262,144-token context. Use the worker while Qwen remains on the head:
 
 ```bash
-./spark-serve up nemotron-super   # stops whatever owns :8000 (ds4 / ds4-vision)
-./spark-serve up ds4              # back to text Flash (TP=2 both Sparks)
-./spark-serve up ds4-vision       # back to FlyCockpit vision
-./spark-serve stop                # leave Atlas neo4j alone
+./spark-serve pull nemotron-super --node worker
+./spark-serve up nemotron-super --node worker
 ```
 
-Only one recipe owns `:8000`. Atlas (`singularity-atlas-neo4j`) stays up
-(`keep_containers`).
+Both models use port 8000 on their own host. Qwen is reached through
+`cluster.lan_url`; Nemotron through `cluster.worker_lan_url`. Add `/v1` for an
+OpenAI-compatible client. Nemotron's request model name is `nemotron-3-super`.
+This placement is TP1 and does not use the inter-node GPU fabric.
 
-## Weights policy (hunt → pull once → optional rsync)
-
-**Do not Hub-pull from the Mac.** On sparkone:
-
-1. **Hunt** local caches first:
-   - `~/.cache/huggingface/hub/models--nvidia--NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4`
-   - any prior `HF_HOME` / shared volume copies
-2. If missing, **pull once on sparkone** (HF CLI or `huggingface-cli download`), then leave `HF_HUB_OFFLINE=1` in the catalog env.
-3. **rsync to sparktwo only if** you later switch the recipe to TP=2 / `nnodes=2`. Solo default never needs the worker cache.
-
-Image: `docker pull vllm/vllm-openai:cu130-nightly` on sparkone when you are ready to boot (not part of this sketch commit).
-
-## Env (catalog)
-
-- `VLLM_NVFP4_GEMM_BACKEND=marlin`
-- `VLLM_ALLOW_LONG_MAX_MODEL_LEN=1`
-- `VLLM_FLASHINFER_ALLREDUCE_BACKEND=trtllm`
-- `VLLM_USE_FLASHINFER_MOE_FP4=0`
-- `HF_HUB_OFFLINE=1` after the one-time pull
-
-## Flags of note
-
-- `--quantization fp4`, `--moe-backend marlin`, `--dtype auto`
-- `--gpu-memory-utilization 0.90`, `--kv-cache-dtype fp8`
-- `--enable-auto-tool-choice` + `--tool-call-parser hermes` (verify on first boot)
-- MTP / speculative decoding: optional; omitted from the sketch args
-- **Reasoning-parser plugin**: optional Phase 2 — do not block first boot on vendoring a `.py` plugin
-
-## Hermes
+Explicit node placement preserves the current Hermes selection. Once Nemotron
+is ready, switch the client without restarting either model:
 
 ```bash
-./spark-serve up nemotron-super
-# catalog sets hermes_provider=spark, hermes_context_length=262144
-# OpenAI base: http://192.168.86.44:8000/v1   model: nemotron-3-super
+./spark-serve use --node worker  # select the worker's already-serving model
+./spark-serve use --node head    # select the head's already-serving model
+./spark-serve stop --node worker
 ```
 
-Retarget Hermes to the spark provider / served name after flip (same pattern as ds4).
+An unscoped `stop` targets both nodes. DeepSeek profiles need both Sparks and
+therefore replace both independent models when explicitly selected.
 
-## Limitations
+## Pinned sources
 
-- No GDR / multi-node NCCL on the default path (solo).
-- sparktwo idle while nemotron-super is up.
-- Context 256k sketch vs NVIDIA's up-to-1M demo — raise `max_model_len` only after you measure KV headroom.
-- Tool parser `hermes`: confirm tool calls on first boot; adjust if the nightly expects another parser.
-- Reasoning-parser plugin is Phase 2 (optional).
-- Not an Aiden / DS4 image — different entrypoint and flag surface.
+The configuration follows the DGX Spark section of the
+[official vLLM Nemotron recipe](https://recipes.vllm.ai/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16),
+pinned to [recipe commit 1fc9fdaae4bde39b8e192ddba9ba694885c98486](https://github.com/vllm-project/recipes/blob/1fc9fdaae4bde39b8e192ddba9ba694885c98486/models/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16.yaml).
+This released-runtime recipe includes native reasoning and tool parsers.
 
-## Dry checks (no live flip)
+| Component | Exact source |
+|---|---|
+| Checkpoint | `nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4` |
+| Checkpoint revision | `ff433f5493e25d631c9f12b5d55c674229923d02` |
+| Upstream image tag | `vllm/vllm-openai:v0.28.0-ubuntu2404` |
+| Linux ARM64 image digest | `sha256:41b54fb42c66a670a8b27e613ebef05898f24b9ab1bdab28bd00c877bd4935f4` |
+| vLLM build commit | `2cf0a6915ce544dc493a0990f2ea38d81601128a` |
+| Local image | `spark-serve-nemotron-super-nvfp4:0.1.0` |
+
+The [NVIDIA model card](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4/tree/ff433f5493e25d631c9f12b5d55c674229923d02)
+provides the checkpoint and its [NVIDIA Nemotron Open Model License](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-nemotron-open-model-license/) terms. The stock
+runtime retains its upstream licenses; the small derived image adds only this
+repository's verifier and public source metadata. No vLLM source is patched,
+model weights are not copied into the image, and no external reasoning plugin
+is installed. See [recipe files](../recipes/nemotron-super-nvfp4/) for all pins
+and the published file digests.
+
+## Serving configuration
+
+| Setting | Value |
+|---|---|
+| Nodes / tensor parallel size | 1 / 1 |
+| Maximum context | 262,144 tokens |
+| GPU memory utilization | 0.80 |
+| Maximum concurrent sequences | 8 |
+| Maximum batched tokens | 16,384 |
+| Weight loader / attention | `fastsafetensors` / `flashinfer` |
+| KV cache | FP8 |
+| Mamba cache / SSM state | `align` / **float32** |
+| FP32 matrix multiplication precision | `high` |
+| Speculation | MTP, 3 tokens |
+| Prefix caching | Enabled |
+| Reasoning / tool parser | `nemotron_v3` / `qwen3_xml` |
+
+The runtime selects the checkpoint's native ModelOpt quantization and the MoE
+backend. FP32 Mamba state follows NVIDIA's numerical-stability guidance in the
+[advanced deployment guide](https://docs.nvidia.com/nemotron/latest/usage-cookbook/Nemotron-3-Super/AdvancedDeploymentGuide/README.html).
+The catalog keeps separate persistent compilation caches for Nemotron and
+Qwen, enables the GB10 architecture target, and uses the socket backend for
+single-node execution. Its 60-minute readiness allowance accommodates first-run
+compilation; it is a timeout ceiling, not a measured startup estimate.
+
+The 262K context limit is the current official Spark recipe's setting. Usable
+concurrency and long-context performance depend on the runtime's measured KV
+allocation. A larger context or batch should be qualified on the actual node.
+
+## Preparation and integrity checks
+
+Preparation runs only on the selected Spark. It downloads the exact public
+checkpoint revision there, authenticates every published file, and builds the
+image from the pinned ARM64 base. It does not start or stop a model. Weights
+remain in that node's configured Hugging Face cache; `worker_hf_cache_host` can
+override `hf_cache_host` when the nodes use different paths.
+
+The initial worker preparation on September 13, 2026 reused a complete existing
+head cache through a rate-limited transfer instead of downloading another copy
+from the Hub. All **36 files / 80,365,684,262 bytes** passed full verification on
+the worker. The prepared image was
+`sha256:2d444d24394afa9c704ef4e598690311dca8f7851129c74c9986bd1ac6cb8987`.
+CPU-only inspection confirmed vLLM 0.28.0, `fastsafetensors`, both native parsers,
+and native Nemotron configuration loading with remote code disabled.
+
+For an already-populated cache, skip checkpoint downloads while still doing
+full verification and the image build:
 
 ```bash
-./spark-serve list
-./spark-serve up nemotron-super --print-cmd   # rank0 only when nnodes=1
+python3 tools/prepare_nemotron.py --catalog models.toml --node worker --skip-download
 ```
 
-Do **not** run `up` against the live vision serve until weights + image are ready and you intend to stop `:8000`.
+A normal preparation may repair one failed cached file at the pinned public
+revision, then reruns full verification. `--skip-download` never repairs files.
+Every startup first uses the prepared image with no network, no GPU, and
+read-only mounts to authenticate serving metadata and check shard lengths.
+Missing or corrupt assets fail before any currently serving model is stopped.
+Full SHA-256 hashing of large weight shards happens during preparation, so it
+does not add an 80GB read to every startup.
+
+## Live qualification — September 13, 2026
+
+The prepared recipe served on sparktwo while the existing Qwen container on
+sparkone continued running. Its first startup took about **7 minutes 30 seconds**
+from container creation to a successful model-list response. Weight loading took
+49.8 seconds; most remaining startup time was kernel tuning, compilation and
+warmup. The runtime allocated 3.67 GiB for KV cache and reported 0.39 GiB of
+captured CUDA graphs.
+
+A worker-only stop and restart also passed, with Qwen's original container and
+generation preserved. The cached restart took about **2 minutes 36 seconds**;
+engine warmup fell from 323.8 to 34.8 seconds and compilation from 23.74 to 1.14
+seconds. That second launch allocated 4.93 GiB of KV cache; allocations vary with
+available memory. Both endpoints answered correctly after the restart.
+
+All **9 functional checks passed** with default thinking and no retries: text,
+strict JSON, automatic tool round trip, summary, coding syntax, numerical
+reasoning, exact retrieval from **8,350 input tokens**, and two concurrent requests.
+These synthetic checks qualify the exercised inputs, not the full 262K context
+or maximum eight-sequence load.
+
+In a separate simultaneous generation check, Qwen and Nemotron produced office
+organization tips with 4.37 seconds of overlapping requests. Nemotron completed
+144 output tokens (including reasoning) in 5.60 seconds, or **25.7 tokens/second
+including prefill**. This is a single smoke measurement, not a sustained benchmark.
+Detailed receipts are retained under
+`diagnostics/2026-09-13-independent-sparks/` (ignored by Git).

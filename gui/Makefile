@@ -4,7 +4,7 @@ BIN     := SparkServeApp
 TARGET  := arm64-apple-macosx13.0
 
 all:
-	@cd "$(dir $(lastword $(MAKEFILE_LIST)))"/.. ; \
+	@set -e; cd "$(dir $(lastword $(MAKEFILE_LIST)))"/.. ; \
 	rm -rf "$(APP)" ; \
 	mkdir -p "$(APP)/Contents/MacOS" "$(APP)/Contents/Resources" ; \
 	cp gui/Info.plist "$(APP)/Contents/Info.plist" ; \

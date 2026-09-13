@@ -3,7 +3,9 @@
 This catalog entry runs NVIDIA's public checkpoint on the head Spark with TP1.
 It exposes text, images and tools at the existing OpenAI-compatible endpoint,
 using the served ID `qwen3.8-flash-next`. The second Spark has no Qwen rank.
-Switching through Spark Serve still drains and reconciles both nodes first.
+Single-node placement reconciles only the selected Spark, preserving an independent
+workload on the peer. Distributed allocations must be switched as a pair.
+See [independent Spark control](independent-sparks.md).
 
 ## Install and run
 
@@ -33,8 +35,8 @@ up to an hour while continuously checking the launched container for failure.
 An exited process still fails promptly and preserves its logs.
 
 The GUI reads this catalog dynamically. Select **Qwen3.8-Flash-Next NVFP4**,
-shown as **1 Spark**, and press Start. Hermes switches to the new served ID
-only after readiness, with its context limit scoped to that model.
+shown as **1 Spark**, then choose the hostname's Start action. Use **Use in Hermes**
+after readiness to select that endpoint, with its context limit scoped to the model.
 
 ## Runtime and provenance
 

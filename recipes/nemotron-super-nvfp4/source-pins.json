@@ -1,0 +1,9 @@
+{
+  "recipe_repository": "https://github.com/vllm-project/recipes",
+  "recipe_commit": "1fc9fdaae4bde39b8e192ddba9ba694885c98486",
+  "recipe_path": "models/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16.yaml",
+  "image_tag": "vllm/vllm-openai:v0.28.0-ubuntu2404",
+  "arm64_manifest": "sha256:41b54fb42c66a670a8b27e613ebef05898f24b9ab1bdab28bd00c877bd4935f4",
+  "image_vllm_commit": "2cf0a6915ce544dc493a0990f2ea38d81601128a",
+  "checkpoint_revision": "ff433f5493e25d631c9f12b5d55c674229923d02"
+}

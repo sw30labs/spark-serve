@@ -8,6 +8,7 @@ Do not retune NCCL here. Never stop names in cluster.keep_containers.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import re
@@ -50,7 +51,9 @@ from spark_serve_controller import (
     guarded_remote_script,
     state_dir,
     yue_catalog_entry,
+    atomic_json,
 )
+from spark_serve_nodes import launch_config, node_url, placement
 
 HERE = Path(__file__).resolve().parent
 CATALOG = HERE / "models.toml"
@@ -143,6 +146,14 @@ def docker_base(cfg: dict, model: dict, name: str, rank: int = 0) -> list[str]:
         "--gpus", "all",
         "--security-opt", "label=disable",
     ]
+    assignment = cfg.get("_spark_serve_placement")
+    if assignment:
+        for key, value in {
+            "ai.spark-serve.model": assignment["model"],
+            "ai.spark-serve.hosts": json.dumps(assignment["hosts"], separators=(",", ":")),
+            "ai.spark-serve.allocation": assignment.get("generation", ""),
+        }.items():
+            cmd.extend(["--label", f"{key}={value}"])
     if not model.get("skip_default_cache_mount"):
         cache = cluster["hf_cache_host"]
         mount = model.get("hf_mount") or "/cache/huggingface"
@@ -588,83 +599,165 @@ def _container_running(state: str) -> bool:
 
 
 def status_host_json(cfg: dict, host: str) -> list:
-    remote = "docker ps -a --format '{{.Names}}|||{{.State}}|||{{.Image}}'"
-    out = ssh_cmd(cfg, host, remote, check=False).stdout.strip()
-    containers = []
-    for line in out.splitlines():
-        if "|||" not in line:
-            continue
-        parts = line.split("|||")
-        if len(parts) != 3:
-            continue
-        name, state, image = (p.strip() for p in parts)
-        owned_names = {container_name(cfg), *(cfg["cluster"].get("stop_names") or [])}
-        owned_names.update(str(m["container"]) for m in (cfg.get("models") or {}).values() if m.get("container"))
-        if name in owned_names or "vllm" in name.lower():
-            containers.append({
-                "name": name,
-                "state": state,
-                "image": image,
-                "running": _container_running(state),
-            })
-    return containers
+    source = """import json, subprocess
+ids = subprocess.check_output(["docker", "ps", "-aq"], text=True).split()
+items = json.loads(subprocess.check_output(["docker", "inspect", *ids], text=True)) if ids else []
+print(json.dumps([{"name": item["Name"].lstrip("/"), "id": item["Id"],
+                  "state": item["State"]["Status"], "image": item["Config"]["Image"],
+                  "running": item["State"]["Running"], "labels": item["Config"].get("Labels") or {}}
+                 for item in items]))
+"""
+    proc = ssh_cmd(cfg, host, shlex.join(["python3", "-c", source]), check=False, timeout=35)
+    if proc.returncode:
+        raise ControllerError(f"{host}: container status unavailable; check SSH")
+    try:
+        values = json.loads(proc.stdout)
+        if not isinstance(values, list):
+            raise ValueError("not a list")
+        names = {container_name(cfg), *(cfg["cluster"].get("stop_names") or [])}
+        names.update(str(m["container"]) for m in (cfg.get("models") or {}).values() if m.get("container"))
+        keep = set(cfg["cluster"].get("keep_containers") or [])
+        return [item for item in values if item["name"] not in keep
+                and (item["name"] in names or "vllm" in item["name"].lower())]
+    except (ValueError, KeyError, TypeError) as exc:
+        raise ControllerError(f"{host}: invalid container status") from exc
+
+
+def endpoint_config(cfg: dict, node: str) -> dict:
+    result = copy.deepcopy(cfg)
+    result["cluster"]["head"] = cfg["cluster"][node]
+    result["cluster"]["lan_url"] = node_url(cfg, node)
+    return result
+
+
+def _active_client_node(cfg: dict) -> str | None:
+    # Read only the selected provider/model. Never expose keys from the config.
+    try:
+        try:
+            from ruamel.yaml import YAML
+            data = YAML(typ="safe").load(HERMES_CONFIG.read_text()) or {}
+        except ImportError:
+            import yaml
+            data = yaml.safe_load(HERMES_CONFIG.read_text()) or {}
+        provider = data.get("model", {}).get("provider")
+        url = data.get("providers", {}).get(provider, {}).get("base_url", "").rstrip("/")
+        return next((node for node in ("head", "worker") if url == node_url(cfg, node) + "/v1"), None)
+    except (OSError, ValueError, TypeError, AttributeError, ImportError):
+        return None
 
 
 def collect_status(cfg: dict) -> dict:
-    c = cfg["cluster"]
-    name = str(c.get("container") or "vllm_cluster")
-    nnodes = int(c.get("nnodes") or 1)
-    head_c = status_host_json(cfg, c["head"])
-    worker_c = status_host_json(cfg, c["worker"])
-    body = probe_v1(cfg)
-    ids = parse_v1_ids(body)
-    served = ids[0] if ids else None
-    catalog = catalog_served_names(cfg)
-    in_catalog = bool(served) and served in catalog
-    matching = [m for m in (cfg.get("models") or {}).values() if m.get("served_name") == served]
-    if len(matching) == 1:
-        nnodes = int(matching[0].get("nnodes") or nnodes)
-        name = container_name(cfg, matching[0])
-
-    def is_ours(x: dict) -> bool:
-        n = x["name"]
-        return bool(x["running"] and n == name)
-
-    head_ours = any(is_ours(x) for x in head_c)
-    worker_ours = any(is_ours(x) for x in worker_c)
-    ours_running = head_ours and (worker_ours if nnodes > 1 else True)
-    vllm_running = any(x["running"] for x in head_c + worker_c)
-    port_busy = bool(ids)
-    # Occupant of :8000 that is not our vLLM set is foreign even if the
-    # served id happens to match a catalog name.
-    if port_busy and not vllm_running:
-        foreign = served or "unknown"
-    elif served and not in_catalog:
-        foreign = served
-    else:
-        foreign = None
-    result = {
-        "head": c["head"],
-        "worker": c["worker"],
-        "url": c["lan_url"],
-        "head_containers": head_c,
-        "worker_containers": worker_c,
-        "ready": bool(ours_running and in_catalog),
-        "served": served,
-        "foreign_served": foreign,
-        "ours_running": ours_running,
-        "vllm_running": vllm_running,
-        "port_busy": port_busy,
-        "v1_models_raw": body,
-    }
+    cluster = cfg["cluster"]
     managed = Controller(cfg, ssh_cmd).status()
-    result.update(managed)
-    if managed["mode"] == "yue":
-        result["ready"] = managed["phase"] == "ready" and managed["ready_workers"] == managed["total_workers"]
+    assignments = {item["host"]: item for item in managed.get("nodes", [])}
+    nodes = []
+
+    def observe(node):
+        host = cluster[node]
+        scoped = endpoint_config(cfg, node)
+        error = None
+        try:
+            containers = status_host_json(cfg, host)
+        except ControllerError as exc:
+            containers, error = [], str(exc)
+        body = probe_v1(scoped) if error is None else ""
+        ids = parse_v1_ids(body)
+        served = ids[0] if ids else None
+        assigned = assignments.get(host, {})
+        expected = assigned.get("model")
+        matches = [(mid, model) for mid, model in cfg.get("models", {}).items()
+                   if model.get("served_name") == served]
+        # Legacy status consumers without node metadata retain observed-model
+        # recognition. New state supplies an explicit per-host expectation.
+        mid, model = matches[0] if len(matches) == 1 else (None, None)
+        if expected:
+            mid, model = expected, cfg.get("models", {}).get(expected)
+        name = container_name(cfg, model)
+        owned = [item for item in containers if item["running"] and item["name"] == name]
+        allocation = assigned.get("allocation_hosts") or (
+            [cluster["head"], cluster["worker"]] if model and int(model.get("nnodes") or cluster.get("nnodes") or 2) > 1
+            else [host]
+        )
+        identity_valid = bool(model and owned and error is None)
+        recorded_ids = {item["id"] for item in assigned.get("containers", []) if item.get("id")}
+        if recorded_ids and {item.get("id") for item in owned} != recorded_ids:
+            identity_valid = False
+        legacy = not assignments or assigned.get("legacy") is True
+        if not legacy and not recorded_ids:
+            identity_valid = False
+        for item in owned:
+            labels = item.get("labels", {})
+            allowed_models = (None, "", mid) if legacy else (mid,)
+            if labels.get("ai.spark-serve.model") not in allowed_models:
+                identity_valid = False
+            generation = assigned.get("allocation_id")
+            allowed_generations = (None, "", generation) if legacy else (generation,)
+            if generation and labels.get("ai.spark-serve.allocation") not in allowed_generations:
+                identity_valid = False
+            if not legacy and not labels.get("ai.spark-serve.hosts"):
+                identity_valid = False
+            if labels.get("ai.spark-serve.hosts"):
+                try:
+                    if set(json.loads(labels["ai.spark-serve.hosts"])) != set(allocation):
+                        identity_valid = False
+                except (ValueError, TypeError):
+                    identity_valid = False
+        valid = bool(identity_valid and served == model.get("served_name"))
+        if assigned.get("phase") in ("draining", "stopping", "failed", "rebooting"):
+            valid = False
+        if assignments and assigned.get("mode") in ("none", "yue", "unknown"):
+            valid = False
+        foreign = served if served and (not model or not owned or served != model.get("served_name")) else None
+        return {"node": node, "host": host, "url": node_url(cfg, node), "ready": valid,
+                "served": served, "model": mid, "backend": assigned.get("mode") or "vllm",
+                "phase": assigned.get("phase") or ("ready" if valid else "unmanaged"),
+                "error": error or assigned.get("error"), "containers": containers,
+                "ours_running": bool(owned), "port_busy": bool(ids), "foreign_served": foreign,
+                "allocation_hosts": allocation, "generation": assigned.get("generation"),
+                "v1_models_raw": body, "can_use": valid, "_model": model,
+                "_identity_valid": identity_valid, "_allocation_id": assigned.get("allocation_id")}
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        nodes = list(pool.map(observe, ("head", "worker")))
+    by_host = {item["host"]: item for item in nodes}
+    group_readiness = {}
+    for item in nodes:
+        if len(item["allocation_hosts"]) <= 1 or not item["_model"]:
+            continue
+        leader = by_host.get(cluster["head"])
+        members = item["allocation_hosts"]
+        group_readiness[item["host"]] = bool(leader and leader["ready"] and all(
+            by_host.get(host, {}).get("_identity_valid")
+            and by_host[host]["model"] == item["model"]
+            and by_host[host]["_allocation_id"] == item["_allocation_id"]
+            and set(by_host[host]["allocation_hosts"]) == set(members)
+            and by_host[host]["phase"] not in ("failed", "stopping", "draining", "rebooting")
+            for host in members))
+    for item in nodes:
+        if len(item["allocation_hosts"]) > 1 and item["_model"]:
+            leader = by_host.get(cluster["head"])
+            group_good = group_readiness[item["host"]]
+            item["ready"] = group_good
+            item["served"] = leader["served"] if group_good else item["served"]
+            item["can_use"] = group_good and item["node"] == "head"
+        if item["backend"] == "yue":
+            worker = next((worker for worker in managed.get("yue_workers", []) if worker["host"] == item["host"]), {})
+            item.update(ready=bool(worker.get("ready")), served="yue" if worker.get("ready") else None, can_use=False)
+        item.pop("_model", None)
+        item.pop("_identity_valid", None)
+        item.pop("_allocation_id", None)
+    head, worker = nodes
+    result = {"head": cluster["head"], "worker": cluster["worker"], "url": cluster["lan_url"],
+              "head_containers": head["containers"], "worker_containers": worker["containers"],
+              "ready": head["ready"], "served": head["served"], "foreign_served": head["foreign_served"],
+              "ours_running": head["ours_running"],
+              "vllm_running": any(c["running"] for n in nodes for c in n["containers"]),
+              "port_busy": head["port_busy"], "v1_models_raw": head["v1_models_raw"], **managed,
+              "nodes": nodes, "active_node": _active_client_node(cfg)}
+    if managed.get("mode") == "yue":
+        result["ready"] = all(item["ready"] for item in nodes)
         result["served"] = "yue" if result["ready"] else None
-        result["url"] = " · ".join(w["url"] for w in managed["yue_workers"])
-    elif managed["phase"] in ("draining", "stopping", "failed"):
-        result["ready"] = False
+        result["url"] = " · ".join(w["url"] for w in managed.get("yue_workers", []) if w.get("ready"))
     return result
 
 
@@ -679,13 +772,19 @@ def foreign_warning(st: dict) -> str | None:
     return f":8000 serving {who} (not a spark-serve container)"
 
 
-def cmd_stop(cfg: dict, cancel_jobs: bool = False) -> None:
-    sink = _Sink(False)
+def cmd_stop(cfg: dict, cancel_jobs: bool = False, node: str = "both", json_mode: bool = False) -> None:
+    sink = _Sink(json_mode)
     try:
-        Controller(cfg, ssh_cmd, sink.event).switch("none", cancel_jobs=cancel_jobs)
+        if node not in ("head", "worker", "both"):
+            raise ControllerError("node must be head, worker, or both")
+        hosts = [cfg["cluster"][role] for role in (("head", "worker") if node == "both" else (node,))]
+        Controller(cfg, ssh_cmd, sink.event).switch("none", cancel_jobs=cancel_jobs, hosts=hosts)
     except ControllerError as exc:
-        die(str(exc))
-    print("stopped; protected containers retained", flush=True)
+        sink.fail(str(exc))
+    if json_mode:
+        sink.event("stopped", node=node, hosts=hosts)
+    else:
+        print(f"stopped {', '.join(hosts)}; protected containers retained", flush=True)
 
 
 def cmd_list(cfg: dict) -> None:
@@ -736,27 +835,18 @@ done
 
 
 def cmd_status(cfg: dict) -> None:
-    c = cfg["cluster"]
     st = collect_status(cfg)
-    print(f"head   {c['head']}  worker {c['worker']}  url {c['lan_url']}")
-    print(f"-- {c['head']} --")
-    print(status_host(cfg, c["head"]) or "(ssh failed)")
-    print(f"-- {c['worker']} --")
-    print(status_host(cfg, c["worker"]) or "(ssh failed)")
-    print(f"mode: {st['mode']} · {st['phase']}")
+    for node in st["nodes"]:
+        serving = f"serving {node['served']}" if node["ready"] else node["phase"]
+        selected = " · selected in Hermes" if st["active_node"] == node["node"] else ""
+        print(f"{node['host']}: {serving}{selected} · {node['url']}")
+        if node.get("error"):
+            print(f"  {node['error']}")
     for worker in st["yue_workers"]:
-        print(f"  YuE {worker['host']}: ready={worker['ready']} accepting={worker['accepting']} busy={worker['busy']}" + (f" ({worker['error']})" if worker.get("error") else ""))
+        if worker.get("ready") or worker.get("busy"):
+            print(f"  YuE {worker['host']}: ready={worker['ready']} accepting={worker['accepting']} busy={worker['busy']}")
     if st.get("transition_error"):
         print(f"transition: {st['transition_error']}")
-    print("-- /v1/models --")
-    print(st["v1_models_raw"] or "DOWN")
-    if st["ready"]:
-        print(f"ready: {st['served']}")
-    else:
-        print("ready: no")
-    warn = foreign_warning(st)
-    if warn:
-        print(f"warning: {warn}")
 
 
 def pick_log_container(cfg: dict, host: str) -> str:
@@ -952,12 +1042,12 @@ def wait_ready(
     return False, None, body
 
 
-def cmd_wait(cfg: dict) -> None:
+def cmd_wait(cfg: dict, node: str = "head") -> None:
     st = collect_status(cfg)
     warn = foreign_warning(st)
     if warn:
         print(f"note: {warn}; waiting for a catalog model")
-    ok, served, body = wait_models(cfg)
+    ok, served, body = wait_models(endpoint_config(cfg, node))
     if not ok:
         die("timed out waiting for /v1/models")
     print(body)
@@ -975,6 +1065,7 @@ def _hermes_patch(cfg: dict, mid: str, model: dict, skip: bool) -> tuple[str, bo
     provider = model.get("hermes_provider") or "spark"
     ctx = int(model.get("hermes_context_length") or model.get("max_model_len") or 0)
     url = cfg["cluster"]["lan_url"].rstrip("/") + "/v1"
+    node = cfg.get("_spark_serve_placement", {}).get("node", "head")
     py = None
     for cand in (
         Path.home() / ".hermes/hermes-agent/venv/bin/python",
@@ -1025,7 +1116,7 @@ block['base_url'] = {url!r}
 block['default_model'] = {served!r}
 models = block.setdefault('models', {{}})
 models[{served!r}] = {{'context_length': {ctx} or 8192}}
-if 'spark-ds4' in providers and {provider!r} != 'spark-ds4':
+if 'spark-ds4' in providers and {provider!r} != 'spark-ds4' and {node != 'worker'!r}:
     providers['spark-ds4']['base_url'] = {url!r}
 if engine == 'ruamel':
     with p.open('w') as f:
@@ -1051,19 +1142,26 @@ def maybe_hermes_json(cfg: dict, mid: str, model: dict, skip: bool) -> str:
     return msg
 
 
-def cmd_pull(cfg: dict, name: str) -> None:
+def cmd_pull(cfg: dict, name: str, node: str | None = None) -> None:
     mid, model = resolve_model(cfg, name)
+    selected, hosts = placement(cfg, model, node)
     recipe = model.get("recipe")
     if recipe:
-        if recipe != "qwen38-nvfp4":
+        scripts = {"qwen38-nvfp4": "prepare_qwen38.py", "nemotron-super-nvfp4": "prepare_nemotron.py"}
+        if recipe not in scripts:
             die(f"unknown preparation recipe {recipe!r} for {mid}")
-        proc = subprocess.run([
-            sys.executable, str(HERE / "tools" / "prepare_qwen38.py"),
+        command = [
+            sys.executable, str(HERE / "tools" / scripts[recipe]),
             "--catalog", str(CATALOG),
-        ], check=False)
+        ]
+        if node is not None:
+            command += ["--node", selected]
+        proc = subprocess.run(command, check=False)
         if proc.returncode:
             die(f"preparation failed for {mid} (exit {proc.returncode})")
         return
+    cfg = launch_config(cfg, mid, selected)
+    model = cfg["models"][mid]
     image = model["image"]
     repos = [model["hf_id"], *[str(x) for x in (model.get("pull_repos") or [])]]
     print(f"pull {mid}: image {image}")
@@ -1093,7 +1191,7 @@ fi
 {hf_lines}
 echo DONE
 """
-    for host in (cfg["cluster"]["worker"], cfg["cluster"]["head"]):
+    for host in hosts:
         print(f"-- {host} --")
         proc = ssh_cmd(cfg, host, remote, check=False)
         sys.stdout.write(proc.stdout or "")
@@ -1199,9 +1297,11 @@ def _bring_up(
     sink: _Sink,
     print_cmd: bool = False,
     generation: str | None = None,
-) -> None:
+) -> dict | None:
     mid, model = resolve_model(cfg, name)
     c = cfg["cluster"]
+    if cfg.get("_spark_serve_placement"):
+        cfg["_spark_serve_placement"]["generation"] = generation or ""
     nnodes = int(model.get("nnodes") or c["nnodes"])
     if print_cmd:
         ranks = [(0, False, "head/rank0")]
@@ -1221,7 +1321,7 @@ def _bring_up(
         url=c["lan_url"] + "/v1",
         nnodes=nnodes,
     )
-    # The cross-backend controller already drained and verified both GPUs.
+    # The controller drained and verified only this allocation's GPUs.
     ids = parse_v1_ids(probe_v1(cfg))
     if ids:
         who = ids[0]
@@ -1262,7 +1362,7 @@ def _bring_up(
     if no_wait:
         sink.event("hermes", detail="skipped (--no-wait)")
         sink.event("launched")
-        return
+        return {"containers": copy.deepcopy(monitor.containers), "served": None}
     hint = f"provider {model.get('hermes_provider', 'spark')}, -m {model['served_name']}"
     ready_path = model.get("ready_path") or "/v1/models"
     sink.event("waiting", hermes_hint=hint, ready_path=ready_path)
@@ -1279,7 +1379,7 @@ def _bring_up(
         hermes = maybe_hermes_json(cfg, mid, model, skip=no_hermes)
         sink.event("hermes", detail=hermes)
         sink.event("ready", served=served, elapsed=int(time.time() - t0), body=body)
-        return
+        return {"containers": copy.deepcopy(monitor.containers), "served": served}
     sink.event("hermes", detail="skipped (wait failed)")
     monitor.fail(f"containers started but {ready_path} did not become ready before the startup timeout")
 
@@ -1336,9 +1436,11 @@ def model_preflight(cfg: dict, mid: str, model: dict, sink: _Sink) -> None:
         proc = ssh_cmd(cfg, host, remote, check=False, timeout=145)
         if proc.returncode:
             output = ((proc.stderr or "") + (proc.stdout or "")).strip()[-8192:]
+            selected_node = cfg.get("_spark_serve_placement", {}).get("node")
+            node_hint = f" --node {selected_node}" if selected_node else ""
             raise ControllerError(
                 f"{mid}: preflight failed on {host}; current workload was not changed. "
-                f"Run spark-serve pull {mid} to prepare it. "
+                f"Run spark-serve pull {mid}{node_hint} to prepare it. "
                 + (output or f"exit {proc.returncode}")
             )
         sink.event("preflight", model=mid, host=host, detail="passed", output=(proc.stdout or "").strip()[-8192:])
@@ -1352,28 +1454,64 @@ def cmd_up(
     json_mode: bool,
     print_cmd: bool = False,
     cancel_jobs: bool = False,
+    node: str | None = None,
 ) -> None:
     sink = _Sink(json_mode)
     yue = name.strip().lower() in ("yue", "yue-icl")
+    try:
+        if yue:
+            selected, hosts = placement(cfg, None, node)
+            scoped, mid = cfg, "yue"
+        else:
+            mid, model = resolve_model(cfg, name)
+            selected, hosts = placement(cfg, model, node)
+            scoped = launch_config(cfg, mid, selected)
+        # Explicit placement is independent of client selection. Legacy `up`
+        # without --node retains its existing retarget-after-readiness behavior.
+        no_hermes = no_hermes or node is not None
+    except ControllerError as exc:
+        sink.fail(str(exc))
     if print_cmd:
         if yue:
             print("YuE uses managed systemd workers; no distributed vLLM command is generated.")
         else:
-            _bring_up(cfg, name, no_hermes, no_wait, sink, print_cmd=True)
+            _bring_up(scoped, mid, no_hermes, no_wait, sink, print_cmd=True)
         return
     if yue and no_wait:
         sink.fail("YuE requires admission verification before publishing workers; omit --no-wait")
     try:
         if not yue:
-            mid, model = resolve_model(cfg, name)
+            model = scoped["models"][mid]
             # Fail before Controller.switch can drain or stop a live model.
             model_ready_timeout(model)
-            model_preflight(cfg, mid, model, sink)
+            model_preflight(scoped, mid, model, sink)
         Controller(cfg, ssh_cmd, sink.event).switch(
-            "yue" if yue else name,
-            lambda generation: _bring_up(cfg, name, no_hermes, no_wait, sink, generation=generation),
-            cancel_jobs=cancel_jobs, no_wait=no_wait,
+            mid,
+            lambda generation: _bring_up(scoped, mid, no_hermes, no_wait, sink, generation=generation),
+            cancel_jobs=cancel_jobs, no_wait=no_wait, hosts=hosts,
         )
+    except ControllerError as exc:
+        sink.fail(str(exc))
+
+
+def cmd_use(cfg: dict, node: str, json_mode: bool = False) -> None:
+    sink = _Sink(json_mode)
+    controller = Controller(cfg, ssh_cmd)
+    try:
+        with controller.lock():
+            status = collect_status(cfg)
+            current = next(item for item in status["nodes"] if item["node"] == node)
+            if not current["can_use"] or not current.get("model"):
+                raise ControllerError(f"{current['host']}: no verified model endpoint is ready to select")
+            mid = current["model"]
+            model = cfg["models"][mid]
+            selected = "both" if int(model.get("nnodes") or cfg["cluster"].get("nnodes") or 2) > 1 else node
+            scoped = launch_config(cfg, mid, selected)
+            message, ok = _hermes_patch(scoped, mid, scoped["models"][mid], False)
+            if not ok:
+                raise ControllerError(message)
+            sink.event("hermes", detail=message)
+            sink.event("selected", node=node, host=current["host"], served=current["served"], url=current["url"])
     except ControllerError as exc:
         sink.fail(str(exc))
 
@@ -1391,20 +1529,29 @@ def build_parser() -> argparse.ArgumentParser:
     st = sub.add_parser("status", help="containers + /v1/models")
     st.add_argument("--json", action="store_true", help="emit status as JSON")
 
-    stop = sub.add_parser("stop", help="drain and stop all managed workloads, retain protected containers")
+    stop = sub.add_parser("stop", help="drain and stop managed workloads on the selected Sparks")
     stop.add_argument("--cancel-jobs", action="store_true", help="explicitly cancel active YuE jobs before stopping")
-    sub.add_parser("wait", help="block until a catalog model answers /v1/models")
+    stop.add_argument("--node", choices=["head", "worker", "both"], default="both")
+    stop.add_argument("--json", action="store_true", help="emit JSON-line progress")
+    wait = sub.add_parser("wait", help="block until a catalog model answers /v1/models")
+    wait.add_argument("--node", choices=["head", "worker"], default="head")
 
     up = sub.add_parser("up", help="stop current serve, start a catalog model")
     up.add_argument("model")
+    up.add_argument("--node", choices=["head", "worker", "both"], help="physical placement; explicit placement preserves Hermes selection")
     up.add_argument("--cancel-jobs", action="store_true", help="explicitly cancel active YuE jobs before switching modes")
     up.add_argument("--no-hermes", action="store_true", help="do not retarget ~/.hermes/config.yaml")
     up.add_argument("--no-wait", action="store_true", help="do not block on the ready probe")
     up.add_argument("--json", action="store_true", help="emit JSON-line progress events")
     up.add_argument("--print-cmd", action="store_true", help=argparse.SUPPRESS)
 
-    pull = sub.add_parser("pull", help="docker pull + hf download on both Sparks")
+    pull = sub.add_parser("pull", help="prepare the model on its selected Spark(s)")
     pull.add_argument("model")
+    pull.add_argument("--node", choices=["head", "worker", "both"])
+
+    use = sub.add_parser("use", help="select an already-serving Spark in Hermes without restarting anything")
+    use.add_argument("--node", choices=["head", "worker"], required=True)
+    use.add_argument("--json", action="store_true", help="emit JSON-line progress")
 
     logs = sub.add_parser("logs", help="docker logs on head (or worker)")
     logs.add_argument("-f", "--follow", action="store_true")
@@ -1444,9 +1591,10 @@ def main(argv: list[str] | None = None) -> None:
         else:
             cmd_status(cfg)
     elif args.cmd == "stop":
-        cmd_stop(cfg, cancel_jobs=args.cancel_jobs)
+        _JSON_MODE = bool(args.json)
+        cmd_stop(cfg, cancel_jobs=args.cancel_jobs, node=args.node, json_mode=args.json)
     elif args.cmd == "wait":
-        cmd_wait(cfg)
+        cmd_wait(cfg, node=args.node)
     elif args.cmd == "up":
         _JSON_MODE = bool(args.json)
         cmd_up(
@@ -1457,9 +1605,16 @@ def main(argv: list[str] | None = None) -> None:
             json_mode=_JSON_MODE,
             print_cmd=bool(args.print_cmd),
             cancel_jobs=args.cancel_jobs,
+            node=args.node,
         )
     elif args.cmd == "pull":
-        cmd_pull(cfg, args.model)
+        try:
+            cmd_pull(cfg, args.model, node=args.node)
+        except ControllerError as exc:
+            die(str(exc))
+    elif args.cmd == "use":
+        _JSON_MODE = bool(args.json)
+        cmd_use(cfg, args.node, json_mode=args.json)
     elif args.cmd == "logs":
         cmd_logs(cfg, args.follow, args.which)
     elif args.cmd == "reboot":

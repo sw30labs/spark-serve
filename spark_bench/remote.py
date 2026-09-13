@@ -60,8 +60,9 @@ def remote_run(args):
                'started_at': time.time(), 'status': 'preparing', 'network_changed': False}
     write_json(output / 'remote-run.json', receipt)
     with controller.lock():
-        if controller.state.get('mode') != 'yue' or controller.state.get('phase') != 'ready':
-            raise RuntimeError('Spark Serve must already be in admitted YuE mode')
+        assignment = controller.node_states().get(args.ssh_host, {})
+        if assignment.get('mode') != 'yue' or assignment.get('phase') != 'ready':
+            raise RuntimeError('The selected Spark must already have an admitted YuE worker')
         # Deployment contains our own regular files only; validate on receive too.
         deploy = '''import io,pathlib,sys,tarfile
 root=pathlib.Path.home()/sys.argv[1]

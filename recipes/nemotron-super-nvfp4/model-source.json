@@ -1,0 +1,244 @@
+{
+  "model": "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
+  "revision": "ff433f5493e25d631c9f12b5d55c674229923d02",
+  "architectures": [
+    "NemotronHForCausalLM"
+  ],
+  "files": [
+    {
+      "path": ".gitattributes",
+      "size": 1635,
+      "lfs": null,
+      "git_blob_sha1": "aa7aacd0134a92c3c1943fdecc75cd8b7420cce6"
+    },
+    {
+      "path": "README.md",
+      "size": 81626,
+      "lfs": null,
+      "git_blob_sha1": "9439260819d84611797ff779da798ba1fea09125"
+    },
+    {
+      "path": "__init__.py",
+      "size": 0,
+      "lfs": null,
+      "git_blob_sha1": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
+    },
+    {
+      "path": "accuracy_chart.png",
+      "size": 79162,
+      "lfs": null,
+      "git_blob_sha1": "b02796fcc95a5b948f843088cc3bf8da96b39601"
+    },
+    {
+      "path": "bias.md",
+      "size": 2626,
+      "lfs": null,
+      "git_blob_sha1": "6406714ae56570a4a00d16678ae7579117a97f08"
+    },
+    {
+      "path": "chat_template.jinja",
+      "size": 10771,
+      "lfs": null,
+      "git_blob_sha1": "71935c3a25edcdde07a0b7c4bec26f68bbce73a4"
+    },
+    {
+      "path": "config.json",
+      "size": 7411248,
+      "lfs": null,
+      "git_blob_sha1": "25fdfa00f468ad953fc5516aeab78a128332da1a"
+    },
+    {
+      "path": "configuration_nemotron_h.py",
+      "size": 19822,
+      "lfs": null,
+      "git_blob_sha1": "b0577e12c52dac6d40529081c2c316b08b3b7ecf"
+    },
+    {
+      "path": "explainability.md",
+      "size": 3155,
+      "lfs": null,
+      "git_blob_sha1": "24936994e396a15aa18c75dd1cd43d41d36275fd"
+    },
+    {
+      "path": "generation_config.json",
+      "size": 210,
+      "lfs": null,
+      "git_blob_sha1": "9f6546e3b99dd85a2899453a2487850007815ead"
+    },
+    {
+      "path": "hf_quant_config.json",
+      "size": 6146797,
+      "lfs": null,
+      "git_blob_sha1": "756004b69ae1a798e8cff5ffeaf0a53e46e6ddc2"
+    },
+    {
+      "path": "model-00001-of-00017.safetensors",
+      "size": 5000122600,
+      "lfs": {
+        "sha256": "3d31c241fb777f44342ac3c298147bb82ddcaa64214c555494d8fab397218d0e"
+      }
+    },
+    {
+      "path": "model-00002-of-00017.safetensors",
+      "size": 4977660672,
+      "lfs": {
+        "sha256": "78d4a5ad26841e04ea92ae3d6b6b29ab9069b4ea27155b93213a5bfbeef85081"
+      }
+    },
+    {
+      "path": "model-00003-of-00017.safetensors",
+      "size": 5001219144,
+      "lfs": {
+        "sha256": "ecb72debb5d274b4beb74fb993a44e4f8ac27d640ecadaf656ed7de178942429"
+      }
+    },
+    {
+      "path": "model-00004-of-00017.safetensors",
+      "size": 5000841128,
+      "lfs": {
+        "sha256": "a7d1c68e827296ee4bfc0ca4fe2c6a545c48b7a7f5148d9ebf4872c6fb123106"
+      }
+    },
+    {
+      "path": "model-00005-of-00017.safetensors",
+      "size": 5000389560,
+      "lfs": {
+        "sha256": "1d432c9c783453c6efa69d01228023b407be77e7bfea2909b2023c03df07df6a"
+      }
+    },
+    {
+      "path": "model-00006-of-00017.safetensors",
+      "size": 4995800552,
+      "lfs": {
+        "sha256": "037ea60b87cb2b8ce12beb7164c5382f4d97723c24cdbacc9fc188ae5a28f47b"
+      }
+    },
+    {
+      "path": "model-00007-of-00017.safetensors",
+      "size": 5000688960,
+      "lfs": {
+        "sha256": "3c0527dac96fd91874427f04e92c1df43585503608a487a4c8ffcf9d5f925bd4"
+      }
+    },
+    {
+      "path": "model-00008-of-00017.safetensors",
+      "size": 5000478392,
+      "lfs": {
+        "sha256": "ef6e73f64c3d7242a50230a288811eaa56aa2d9c6da9040b90361e6b9245bc26"
+      }
+    },
+    {
+      "path": "model-00009-of-00017.safetensors",
+      "size": 5000199288,
+      "lfs": {
+        "sha256": "b4f598068350b93d42c486e537239dabc4661545ea2d39c8f0bb7ca23223c4f5"
+      }
+    },
+    {
+      "path": "model-00010-of-00017.safetensors",
+      "size": 4997005048,
+      "lfs": {
+        "sha256": "bf8bf1f4e2e01591c3d91f4b51f4f00252e14715132278177cab6ecc76511884"
+      }
+    },
+    {
+      "path": "model-00011-of-00017.safetensors",
+      "size": 5000780360,
+      "lfs": {
+        "sha256": "ac436f2e1af8185dc3b093e1527f3297b93fd639ab84ad208376bd82d5e94e94"
+      }
+    },
+    {
+      "path": "model-00012-of-00017.safetensors",
+      "size": 5000527232,
+      "lfs": {
+        "sha256": "7814c9ae0dc394beb4709ebf0c7e976214e2770b322fa2422bc467446dd97023"
+      }
+    },
+    {
+      "path": "model-00013-of-00017.safetensors",
+      "size": 5001126000,
+      "lfs": {
+        "sha256": "b13aa79c0879539c4a514489497bccd21e23ec597d8112ba91808767fcbd4d92"
+      }
+    },
+    {
+      "path": "model-00014-of-00017.safetensors",
+      "size": 5000330504,
+      "lfs": {
+        "sha256": "1d8781b2643ca6566e7bdae77c275b62785de3502c5337b8cb53558df2477eed"
+      }
+    },
+    {
+      "path": "model-00015-of-00017.safetensors",
+      "size": 4996320352,
+      "lfs": {
+        "sha256": "5f6c3c0f842055418b0420dbeeba6b737d892d9d849725d956603a714f44745e"
+      }
+    },
+    {
+      "path": "model-00016-of-00017.safetensors",
+      "size": 4998674800,
+      "lfs": {
+        "sha256": "a5f795056a1ac69546ce8f5bccdcab3b6cb7142426024a81f23c15d3d45aa51e"
+      }
+    },
+    {
+      "path": "model-00017-of-00017.safetensors",
+      "size": 345784264,
+      "lfs": {
+        "sha256": "218355cf69f1f9d3efa1b5c8b5f531e28e1aa50a3d869ee768ba9835d936e182"
+      }
+    },
+    {
+      "path": "model.safetensors.index.json",
+      "size": 16634043,
+      "lfs": {
+        "sha256": "e0ca77ceed3a9511db61dc0ae6dbed2f71e6f6ee9f345fe3352f5cfe50cd094f"
+      }
+    },
+    {
+      "path": "modeling_nemotron_h.py",
+      "size": 82338,
+      "lfs": null,
+      "git_blob_sha1": "de290021078450c4d5042f66dd74b8eecf1d3eb3"
+    },
+    {
+      "path": "privacy.md",
+      "size": 2688,
+      "lfs": null,
+      "git_blob_sha1": "ad6fad984525fd246ec6ba62ca2b1e34f8524d94"
+    },
+    {
+      "path": "safety.md",
+      "size": 2120,
+      "lfs": null,
+      "git_blob_sha1": "8d4a9212d934db3437e1b7e9816f679a69740b61"
+    },
+    {
+      "path": "special_tokens_map.json",
+      "size": 563,
+      "lfs": null,
+      "git_blob_sha1": "0451f37912edb7f8a4bf04d77eef13f6130f0515"
+    },
+    {
+      "path": "super_v3_reasoning_parser.py",
+      "size": 1909,
+      "lfs": null,
+      "git_blob_sha1": "e3ac376058bf821fce8d7482ab1c2523d6e9c801"
+    },
+    {
+      "path": "tokenizer.json",
+      "size": 17077484,
+      "lfs": {
+        "sha256": "623c34567aebb18582765289fbe23d901c62704d6518d71866e0e58db892b5b7"
+      }
+    },
+    {
+      "path": "tokenizer_config.json",
+      "size": 177209,
+      "lfs": null,
+      "git_blob_sha1": "c96e5ad00986bfa0b666d4bc425666f1c51d6d1b"
+    }
+  ]
+}
