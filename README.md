@@ -26,6 +26,7 @@ cp models.example.toml models.toml   # then edit [cluster]
 ./spark-serve status
 ./spark-serve up ds4
 ./spark-serve stop
+./spark-serve reboot
 ./spark-serve logs -f
 ```
 
@@ -81,6 +82,11 @@ check appears only after readiness; controls stay busy through cleanup.
 
 See [DeepSeek startup recovery](docs/ds4-startup-recovery.md) for the verified
 QSFP Socket transport workaround and validation results.
+
+`reboot` drains like `stop`, then reboots both hosts with
+`/usr/bin/systemctl reboot --no-block`. It uses passwordless sudo when that
+binary is already NOPASSWD, otherwise `--sudo-password-stdin`. It does not add
+or weaken sudoers rules. The cluster stays idle until the next `up`.
 
 Only exact catalog-owned Docker IDs are stopped. `keep_containers` are retained,
 including when accidentally listed in `stop_names`. Unreachable hosts, untracked
@@ -171,9 +177,14 @@ NCCL / UCX in the example catalog are pinned to the right-port QSFP rails
 ## GUI
 
 Menu-bar + window app. It shells out to this CLI (`list` / `status` / `up` /
-`stop`); it does not speak SSH itself. The YuE card and per-worker status show
+`stop` / `reboot`); it does not speak SSH itself. The YuE card and per-worker status show
 readiness, draining, and active work. The regular Stop preserves active renders;
-“Cancel jobs & stop” is a separate confirmed action. It never kills a running CLI
+“Cancel jobs & stop” is a separate confirmed action. **Restart Sparks** drains,
+then reboots both hosts (`systemctl reboot --no-block`) and waits for SSH.
+Passwordless `/usr/bin/systemctl` is used when sudoers already allows it; otherwise
+the confirmation sheet’s sudo password is passed on stdin for that reboot only
+and is not stored. This tool does not add or weaken sudoers rules. After reboot,
+press Start if you want a catalog model again. It never kills a running CLI
 transition merely to launch another one.
 
 ```

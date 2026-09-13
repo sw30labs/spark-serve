@@ -8,6 +8,7 @@ all:
 	rm -rf "$(APP)" ; \
 	mkdir -p "$(APP)/Contents/MacOS" "$(APP)/Contents/Resources" ; \
 	cp gui/Info.plist "$(APP)/Contents/Info.plist" ; \
+	cp gui/Resources/AppIcon.icns "$(APP)/Contents/Resources/AppIcon.icns" ; \
 	echo "==> compiling (swiftc, $(TARGET))" ; \
 	xcrun -sdk macosx swiftc -O \
 	  -target "$(TARGET)" \

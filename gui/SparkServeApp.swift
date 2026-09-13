@@ -61,6 +61,7 @@ enum BootState {
     case idle
     case launching(model: String)
     case booting(model: String, elapsed: Int)
+    case rebooting(elapsed: Int)
     case ready(model: String, served: String?)
     case failed(message: String)
 }
@@ -110,6 +111,7 @@ final class CLIRunner: ObservableObject {
     @Published var models: [ModelEntry] = []
     @Published var bootState: BootState = .idle
     @Published var logLines: [String] = []
+    @Published var rebootDialog = false
     @Published private var isStopping = false
     @Published private(set) var preparingModel: String?
 
@@ -123,7 +125,7 @@ final class CLIRunner: ObservableObject {
     var isBusy: Bool {
         if isStopping || upProcess != nil { return true }
         switch bootState {
-        case .launching, .booting: return true
+        case .launching, .booting, .rebooting: return true
         default: return false
         }
     }
@@ -166,7 +168,7 @@ final class CLIRunner: ObservableObject {
         if serverNotResponding { return .orange }
         switch bootState {
         case .ready: return .green
-        case .booting, .launching: return .orange
+        case .booting, .launching, .rebooting: return .orange
         case .failed: return .red
         case .idle:
             if status?.ready == true { return .green }
@@ -180,6 +182,7 @@ final class CLIRunner: ObservableObject {
         switch bootState {
         case .failed(let message): return message
         case .booting(_, let elapsed): return "booting (\(elapsed)s)"
+        case .rebooting(let elapsed): return "rebooting Sparks (\(elapsed)s)"
         case .launching(let model): return preparingModel == nil ? "starting \(model)…" : "checking \(model)…"
         default: break
         }
@@ -201,6 +204,7 @@ final class CLIRunner: ObservableObject {
         switch bootState {
         case .ready(_, let served): return "serving \(served ?? "")"
         case .booting(_, let elapsed): return "booting (\(elapsed)s)"
+        case .rebooting(let elapsed): return "rebooting Sparks (\(elapsed)s)"
         case .launching(let model): return "starting \(model)…"
         case .failed(let message): return message
         case .idle:
@@ -247,7 +251,9 @@ final class CLIRunner: ObservableObject {
     func startPolling(interval: TimeInterval = 15) {
         stopPolling()
         pollTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
-            self?.refresh()
+            guard let self else { return }
+            if case .rebooting = self.bootState { return }
+            self.refresh()
         }
         refresh()
     }
@@ -311,6 +317,52 @@ final class CLIRunner: ObservableObject {
         }
     }
 
+    func requestReboot() {
+        openMainWindow()
+        rebootDialog = true
+    }
+
+    func reboot(cancelJobs: Bool, sudoPassword: String) {
+        guard !isBusy else { return }
+        preparingModel = nil
+        bootState = .rebooting(elapsed: 0)
+        logLines = []
+        lineBuf = Data()
+        lastDecodeError = nil
+        appendLog("$ spark-serve reboot --json")
+
+        var args: [String] = ["reboot", "--json", "--sudo-password-stdin"]
+        if cancelJobs { args.append("--cancel-jobs") }
+
+        let process = makeProcess(args)
+        let outPipe = Pipe()
+        let inPipe = Pipe()
+        process.standardOutput = outPipe
+        process.standardError = outPipe
+        process.standardInput = inPipe
+        upProcess = process
+
+        do {
+            try process.run()
+        } catch {
+            bootState = .failed(message: "Failed to reboot: \(error.localizedDescription)")
+            upProcess = nil
+            return
+        }
+
+        let payload = (sudoPassword + "\n").data(using: .utf8) ?? Data([0x0a])
+        inPipe.fileHandleForWriting.write(payload)
+        try? inPipe.fileHandleForWriting.close()
+
+        observeProcess(process, pipe: outPipe, model: "reboot") { runner, statusCode in
+            if case .rebooting = runner.bootState {
+                runner.bootState = statusCode == 0
+                    ? .idle
+                    : .failed(message: "reboot exited \(statusCode)")
+            }
+        }
+    }
+
     func openMainWindow() {
         NSApp.activate(ignoringOtherApps: true)
         if let window = NSApplication.shared.windows.first(where: { $0.title == "spark-serve" }) {
@@ -321,7 +373,7 @@ final class CLIRunner: ObservableObject {
     private func syncBootState(with status: ClusterStatus?) {
         guard let status else { return }
         switch bootState {
-        case .launching, .booting:
+        case .launching, .booting, .rebooting:
             // The owned CLI reports readiness and failures. A concurrent status
             // request can still describe an earlier attempt at the same model.
             return
@@ -341,7 +393,7 @@ final class CLIRunner: ObservableObject {
 
     private func finishUp(statusCode: Int32) {
         switch bootState {
-        case .ready, .failed:
+        case .ready, .failed, .rebooting:
             return
         case .launching, .booting:
             if statusCode != 0 {
@@ -430,12 +482,31 @@ final class CLIRunner: ObservableObject {
         case "start":
             preparingModel = nil
             let label = obj["label"] as? String ?? model
-            appendLog("── Starting \(label) (\(model)) ──")
+            if model == "reboot" || obj["model"] as? String == "reboot" {
+                appendLog("── Reboot both Sparks ──")
+            } else {
+                appendLog("── Starting \(label) (\(model)) ──")
+            }
         case "stop":
             preparingModel = nil
             if let host = obj["host"] as? String {
                 appendLog("  stop \(host)")
             }
+        case "reboot":
+            if let host = obj["host"] as? String {
+                appendLog("  reboot \(host): \(obj["output"] as? String ?? "issued")")
+            }
+        case "host_down":
+            if let host = obj["host"] as? String {
+                appendLog("  \(host) going down")
+            }
+        case "host_up":
+            if let host = obj["host"] as? String {
+                appendLog("  \(host) is up")
+            }
+        case "rebooted":
+            bootState = .idle
+            appendLog("  both Sparks are back")
         case "drop_caches":
             if let host = obj["host"] as? String {
                 appendLog("  drop_caches \(host): \(obj["output"] as? String ?? "")")
@@ -465,18 +536,30 @@ final class CLIRunner: ObservableObject {
                 appendLog("  hermes: \(detail)")
             }
         case "waiting":
-            bootState = .booting(model: model, elapsed: 0)
-            appendLog("  waiting for \(obj["ready_path"] as? String ?? "runtime readiness") …")
+            if case .rebooting = bootState {
+                appendLog("  waiting for SSH …")
+            } else {
+                bootState = .booting(model: model, elapsed: 0)
+                appendLog("  waiting for \(obj["ready_path"] as? String ?? "runtime readiness") …")
+            }
         case "poll":
             if let elapsed = jsonInt(obj, "elapsed") {
-                bootState = .booting(model: model, elapsed: elapsed)
+                if case .rebooting = bootState {
+                    bootState = .rebooting(elapsed: elapsed)
+                } else {
+                    bootState = .booting(model: model, elapsed: elapsed)
+                }
             }
         case "ready":
             let served = obj["served"] as? String ?? model
             bootState = .ready(model: model, served: served)
             appendLog("  ready — serving \(served)")
         case "timeout":
-            bootState = .failed(message: "Timed out waiting for runtime readiness")
+            if case .rebooting = bootState {
+                bootState = .failed(message: "Timed out waiting for Sparks to return")
+            } else {
+                bootState = .failed(message: "Timed out waiting for runtime readiness")
+            }
             appendLog("  timeout")
         case "error":
             let detail = obj["detail"] as? String ?? "error"
@@ -653,6 +736,13 @@ struct MenuBarView: View {
             .padding(.horizontal, 8)
             .disabled(runner.isBusy)
 
+            Button("Restart Sparks…") {
+                runner.requestReboot()
+            }
+            .buttonStyle(.plain)
+            .padding(.horizontal, 8)
+            .disabled(runner.isBusy)
+
             Divider()
 
             Button("Open spark-serve window") {
@@ -717,6 +807,10 @@ struct MainView: View {
         } message: {
             Text("Active renders will end. Completed results are retained.")
         }
+        .sheet(isPresented: $runner.rebootDialog) {
+            RebootSheet()
+                .environmentObject(runner)
+        }
         .onAppear {
             if selectedModel == nil {
                 selectedModel = runner.models.first?.id
@@ -780,7 +874,7 @@ struct MainView: View {
         }
         switch runner.bootState {
         case .ready(let m, _): return m
-        case .booting, .launching, .failed: return nil
+        case .booting, .launching, .rebooting, .failed: return nil
         default:
             guard runner.status?.ready == true else { return nil }
             return runner.status?.served.flatMap { served in
@@ -841,6 +935,13 @@ struct MainView: View {
             .tint(.red)
             .disabled(runner.isBusy)
 
+            Button("Restart Sparks") {
+                runner.requestReboot()
+            }
+            .buttonStyle(.bordered)
+            .tint(.orange)
+            .disabled(runner.isBusy)
+
             if runner.status?.yue_workers?.contains(where: { $0.busy }) == true {
                 Button("Cancel jobs & stop") { confirmCancelJobs = true }
                     .buttonStyle(.bordered)
@@ -854,6 +955,11 @@ struct MainView: View {
 
             if case .booting(_, let elapsed) = runner.bootState {
                 Text("elapsed \(elapsed)s")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            if case .rebooting(let elapsed) = runner.bootState {
+                Text("reboot \(elapsed)s")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -880,6 +986,58 @@ struct MainView: View {
             .background(Color(nsColor: .textBackgroundColor))
             .clipShape(RoundedRectangle(cornerRadius: 6))
         }
+    }
+}
+
+// MARK: - Reboot confirmation
+
+struct RebootSheet: View {
+    @EnvironmentObject var runner: CLIRunner
+    @State private var sudoPassword = ""
+
+    private var yueBusy: Bool {
+        runner.status?.yue_workers?.contains(where: { $0.busy }) == true
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Restart Sparks?")
+                .font(.title3.bold())
+            Text("Drains managed workloads, then reboots both hosts. They will be unreachable for several minutes. Serving does not come back by itself — press Start after they return.")
+                .font(.callout)
+                .fixedSize(horizontal: false, vertical: true)
+            if yueBusy {
+                Text("Active YuE renders will be cancelled.")
+                    .font(.callout)
+                    .foregroundStyle(.orange)
+            }
+            Text("A sudo password is required on any Spark without passwordless systemctl. It is written to the CLI stdin for this reboot only and is not stored.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            SecureField("sudo password", text: $sudoPassword)
+                .textFieldStyle(.roundedBorder)
+            HStack {
+                Spacer()
+                Button("Cancel") {
+                    sudoPassword = ""
+                    runner.rebootDialog = false
+                }
+                .keyboardShortcut(.cancelAction)
+                Button(yueBusy ? "Cancel renders and reboot" : "Reboot") {
+                    let password = sudoPassword
+                    sudoPassword = ""
+                    runner.rebootDialog = false
+                    runner.reboot(cancelJobs: yueBusy, sudoPassword: password)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.orange)
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 420)
+        .onDisappear { sudoPassword = "" }
     }
 }
 

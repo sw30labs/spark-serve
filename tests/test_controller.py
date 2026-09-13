@@ -331,6 +331,27 @@ class ControllerTests(unittest.TestCase):
         status = self.c.status()
         self.assertEqual(1, status["ready_workers"])
 
+    def test_after_idle_runs_under_lock_after_workloads_stop(self):
+        ran = []
+
+        def after_idle():
+            ran.append(read_state(self.directory)["mode"])
+            with self.assertRaisesRegex(ControllerError, "another Spark Serve"):
+                FakeController(self.directory).switch("yue")
+
+        self.c.switch("none", after_idle=after_idle)
+        self.assertEqual(["none"], ran)
+        self.assertEqual("stopped", read_state(self.directory)["phase"])
+
+    def test_after_idle_failure_marks_transition_failed(self):
+        def boom():
+            raise ControllerError("reboot failed")
+
+        with self.assertRaisesRegex(ControllerError, "reboot failed"):
+            self.c.switch("none", after_idle=boom)
+        self.assertEqual("failed", read_state(self.directory)["phase"])
+        self.assertEqual("reboot failed", read_state(self.directory)["error"])
+
     def test_configuration_rejects_typos_and_credential_urls(self):
         for override in (
             {"typo": 1},

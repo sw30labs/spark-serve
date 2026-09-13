@@ -274,6 +274,279 @@ def drop_caches(cfg: dict, host: str) -> str:
     return (proc.stdout or "").strip() or "skip"
 
 
+# Probe/reboot must use this exact path: sparkone's sudoers grants NOPASSWD on
+# /usr/bin/systemctl, not a generic `reboot` or `shutdown` binary. Do not add
+# sudoers rules from this tool.
+SYSTEMCTL = "/usr/bin/systemctl"
+
+# Remote helper: read the sudo password from stdin, feed it to a PTY so Ubuntu's
+# `Defaults use_pty` still authenticates, then exec sudo argv. Never put the
+# password on a command line.
+_PTY_SUDO = r"""
+import os, pty, select, sys, time
+argv = sys.argv[1:]
+password = sys.stdin.readline()
+if not password.endswith("\n"):
+    password += "\n"
+pid, fd = pty.fork()
+if pid == 0:
+    os.execvp("sudo", ["sudo", "-p", "SUDO_PASS", *argv])
+deadline = time.monotonic() + 25
+buf = b""
+sent = False
+while True:
+    leftover = deadline - time.monotonic()
+    if leftover <= 0:
+        sys.stderr.write("sudo timed out waiting for a prompt or exit")
+        raise SystemExit(1)
+    ready, _, _ = select.select([fd], [], [], min(0.5, leftover))
+    if fd in ready:
+        try:
+            chunk = os.read(fd, 4096)
+        except OSError:
+            chunk = b""
+        if not chunk:
+            break
+        buf += chunk
+        if not sent and b"SUDO_PASS" in buf:
+            os.write(fd, password.encode())
+            sent = True
+    waited = os.waitpid(pid, os.WNOHANG)
+    if waited[0] == pid:
+        break
+w = os.waitpid(pid, 0)
+code = os.waitstatus_to_exitcode(w[1])
+sys.stdout.write(buf.decode("utf-8", "replace").replace("SUDO_PASS", ""))
+raise SystemExit(code)
+"""
+
+
+def cluster_hosts(cfg: dict) -> list[str]:
+    c = cfg["cluster"]
+    hosts: list[str] = []
+    for host in (c["worker"], c["head"]):
+        if host not in hosts:
+            hosts.append(host)
+    return hosts
+
+
+def _redact(text: str, password: str | None) -> str:
+    if not text:
+        return ""
+    if password:
+        text = text.replace(password, "********")
+    return text.replace("SUDO_PASS", "")
+
+
+def systemctl_nopasswd(cfg: dict, host: str) -> bool:
+    proc = ssh_cmd(
+        cfg,
+        host,
+        f"sudo -n {SYSTEMCTL} --version >/dev/null && echo ok",
+        check=False,
+        timeout=20,
+    )
+    return proc.returncode == 0 and "ok" in (proc.stdout or "")
+
+
+def ssh_sudo(
+    cfg: dict,
+    host: str,
+    sudo_argv: list[str],
+    password: str,
+    timeout: int = 30,
+) -> subprocess.CompletedProcess:
+    opts = list(cfg["cluster"].get("ssh_opts") or ["-o", "BatchMode=yes"])
+    remote = "python3 -c " + shlex.quote(_PTY_SUDO) + " " + " ".join(
+        shlex.quote(a) for a in sudo_argv
+    )
+    try:
+        proc = subprocess.run(
+            ["ssh", *opts, "-o", "ConnectTimeout=8", host, "bash", "-c", remote],
+            input=password + "\n",
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        proc = subprocess.CompletedProcess(
+            [], 124, "", "SSH sudo timed out; remote ownership requires reconciliation"
+        )
+    if password:
+        proc.stdout = _redact(proc.stdout or "", password)
+        proc.stderr = _redact(proc.stderr or "", password)
+    return proc
+
+
+def sudo_password_ok(cfg: dict, host: str, password: str) -> bool:
+    proc = ssh_sudo(cfg, host, [SYSTEMCTL, "--version"], password, timeout=30)
+    return proc.returncode == 0
+
+
+def reboot_auth_plan(cfg: dict, password: str | None) -> list[tuple[str, str]]:
+    """Decide nopasswd vs password per host before draining anything."""
+    plan: list[tuple[str, str]] = []
+    missing: list[str] = []
+    for host in cluster_hosts(cfg):
+        if systemctl_nopasswd(cfg, host):
+            plan.append((host, "nopasswd"))
+            continue
+        if not password:
+            missing.append(host)
+            continue
+        if not sudo_password_ok(cfg, host, password):
+            die(
+                f"{host}: sudo password was rejected for {SYSTEMCTL}. "
+                "No sudoers changes were made."
+            )
+        plan.append((host, "password"))
+    if missing:
+        die(
+            "passwordless "
+            + SYSTEMCTL
+            + " is unavailable on "
+            + ", ".join(missing)
+            + "; pass the sudo password on stdin (--sudo-password-stdin). "
+            "The password is not stored. No sudoers changes were made."
+        )
+    return plan
+
+
+def _reboot_output_ok(proc: subprocess.CompletedProcess) -> bool:
+    text = ((proc.stdout or "") + "\n" + (proc.stderr or "")).lower()
+    if "password is required" in text or "a terminal is required" in text:
+        return False
+    if proc.returncode == 0 and "issued" in (proc.stdout or ""):
+        return True
+    # Host already dropped mid-command after accepting reboot.
+    if proc.returncode in (255, 1) and "issued" in (proc.stdout or ""):
+        return True
+    return False
+
+
+def issue_host_reboot(cfg: dict, host: str, method: str, password: str | None) -> None:
+    if method == "nopasswd":
+        proc = ssh_cmd(
+            cfg,
+            host,
+            f"sudo -n {SYSTEMCTL} reboot --no-block && echo issued",
+            check=False,
+            timeout=30,
+        )
+        if not _reboot_output_ok(proc):
+            err = _redact(
+                (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip(),
+                password,
+            )
+            die(f"{host}: reboot via passwordless {SYSTEMCTL} failed: {err}")
+        return
+    if method != "password" or not password:
+        die(f"{host}: internal reboot auth method {method!r} is invalid")
+    proc = ssh_sudo(
+        cfg, host, [SYSTEMCTL, "reboot", "--no-block"], password, timeout=30
+    )
+    text = ((proc.stdout or "") + "\n" + (proc.stderr or "")).lower()
+    if proc.returncode not in (0, 255) or "password is required" in text:
+        err = _redact(
+            (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip(),
+            password,
+        )
+        die(f"{host}: reboot via sudo {SYSTEMCTL} failed: {err}")
+
+
+def wait_for_hosts(
+    cfg: dict,
+    hosts: list[str],
+    sink: _Sink,
+    *,
+    reachable=None,
+    sleep=time.sleep,
+    clock=time.monotonic,
+    down_timeout: float = 90,
+    up_timeout: float = 600,
+    interval: float = 3,
+) -> None:
+    def _reachable(host: str) -> bool:
+        if reachable is not None:
+            return reachable(host)
+        proc = ssh_cmd(cfg, host, "true", check=False, timeout=15)
+        return proc.returncode == 0
+
+    t0 = clock()
+    pending_down = set(hosts)
+    while pending_down and clock() - t0 < down_timeout:
+        sink.event("poll", elapsed=int(clock() - t0), detail="waiting for reboot to start")
+        for host in list(pending_down):
+            if not _reachable(host):
+                pending_down.discard(host)
+                sink.event("host_down", host=host)
+        if pending_down:
+            sleep(interval)
+    if pending_down:
+        sink.fail(
+            "reboot did not take effect on "
+            + ", ".join(sorted(pending_down))
+            + " (SSH still up). No sudoers changes were made."
+        )
+
+    pending_up = set(hosts)
+    up_deadline = clock() + up_timeout
+    while pending_up and clock() < up_deadline:
+        sink.event("poll", elapsed=int(clock() - t0), detail="waiting for SSH")
+        for host in list(pending_up):
+            if _reachable(host):
+                pending_up.discard(host)
+                sink.event("host_up", host=host)
+        if pending_up:
+            sleep(interval)
+    if pending_up:
+        sink.fail(
+            "reboot issued but still unreachable: " + ", ".join(sorted(pending_up))
+        )
+
+
+def read_sudo_password_stdin() -> str | None:
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    password = line[:-1] if line.endswith("\n") else line
+    return password or None
+
+
+def cmd_reboot(
+    cfg: dict,
+    *,
+    cancel_jobs: bool = False,
+    json_mode: bool = False,
+    no_wait: bool = False,
+    password: str | None = None,
+) -> None:
+    sink = _Sink(json_mode)
+    plan = reboot_auth_plan(cfg, password)
+    sink.event("start", model="reboot", label="reboot both Sparks")
+    controller = Controller(cfg, ssh_cmd, sink.event)
+
+    def after_idle() -> None:
+        controller.save(phase="rebooting")
+        for host, method in plan:
+            issue_host_reboot(cfg, host, method, password)
+            sink.event("reboot", host=host, output="issued")
+        if no_wait:
+            sink.event("launched")
+            controller.save(mode="none", phase="stopped")
+            return
+        sink.event("waiting", ready_path="ssh")
+        wait_for_hosts(cfg, [host for host, _ in plan], sink)
+        controller.save(mode="none", phase="stopped")
+        sink.event("rebooted")
+
+    try:
+        controller.switch("none", cancel_jobs=cancel_jobs, after_idle=after_idle)
+    except ControllerError as exc:
+        sink.fail(str(exc))
+
+
 def catalog_served_names(cfg: dict) -> set[str]:
     names: set[str] = set()
     for m in (cfg.get("models") or {}).values():
@@ -600,7 +873,6 @@ class _StartupMonitor:
         raise ControllerError(reason)
 
 
-
 def wait_models(
     cfg: dict,
     timeout: int = 1500,
@@ -845,12 +1117,23 @@ class _Sink:
             _emit(name, **fields)
             return
         if name == "start":
+            if fields.get("model") == "reboot":
+                print("reboot both Sparks")
+                return
             print(f"up {fields.get('model')} ({fields.get('label')})")
             print(f"  image  {fields.get('image')}")
             print(f"  served {fields.get('served')}  ctx {fields.get('ctx')}")
             print(f"  url    {fields.get('url')}")
         elif name == "stop":
             print(f"  stop {fields.get('host')}: {fields.get('output')}")
+        elif name == "reboot":
+            print(f"  reboot {fields.get('host')}: {fields.get('output')}")
+        elif name == "host_down":
+            print(f"  {fields.get('host')} going down")
+        elif name == "host_up":
+            print(f"  {fields.get('host')} is up")
+        elif name == "rebooted":
+            print("both Sparks are back; start a catalog model if you want serving again")
         elif name == "drop_caches":
             print(f"  drop_caches {fields.get('host')}: {fields.get('output')}")
         elif name == "preflight":
@@ -870,15 +1153,19 @@ class _Sink:
         elif name == "hermes":
             print(f"hermes: {fields.get('detail')}")
         elif name == "waiting":
+            path = fields.get("ready_path") or "/v1/models"
+            if path == "ssh":
+                print("waiting for both Sparks to reboot and accept SSH …")
+                return
             print("boot takes ~10–25 min (Triton JIT on Qwen is the long one).")
             print("  spark-serve status")
             print("  spark-serve logs -f")
             if fields.get("hermes_hint"):
                 print(f"  hermes  ({fields['hermes_hint']})")
-            path = fields.get("ready_path") or "/v1/models"
             print(f"waiting for {path} …")
         elif name == "poll":
-            print(f"  waiting for serve ({fields.get('elapsed', 0)}s)…")
+            what = fields.get("detail") or "waiting for serve"
+            print(f"  {what} ({fields.get('elapsed', 0)}s)…")
         elif name == "startup_diagnostics":
             print(f"-- startup log {fields.get('host')} rank {fields.get('rank')} --", flush=True)
             print(fields.get("output") or "(no logs available)", flush=True)
@@ -1122,6 +1409,23 @@ def build_parser() -> argparse.ArgumentParser:
     logs = sub.add_parser("logs", help="docker logs on head (or worker)")
     logs.add_argument("-f", "--follow", action="store_true")
     logs.add_argument("which", nargs="?", default="head", choices=["head", "worker"])
+
+    reboot = sub.add_parser(
+        "reboot",
+        help="drain managed workloads and reboot both Spark hosts",
+    )
+    reboot.add_argument(
+        "--cancel-jobs",
+        action="store_true",
+        help="explicitly cancel active YuE jobs before rebooting",
+    )
+    reboot.add_argument("--no-wait", action="store_true", help="do not wait for SSH to return")
+    reboot.add_argument("--json", action="store_true", help="emit JSON-line progress events")
+    reboot.add_argument(
+        "--sudo-password-stdin",
+        action="store_true",
+        help="read the sudo password from stdin; not stored. Used only on hosts without passwordless systemctl",
+    )
     return p
 
 
@@ -1158,6 +1462,16 @@ def main(argv: list[str] | None = None) -> None:
         cmd_pull(cfg, args.model)
     elif args.cmd == "logs":
         cmd_logs(cfg, args.follow, args.which)
+    elif args.cmd == "reboot":
+        _JSON_MODE = bool(args.json)
+        password = read_sudo_password_stdin() if args.sudo_password_stdin else None
+        cmd_reboot(
+            cfg,
+            cancel_jobs=args.cancel_jobs,
+            json_mode=_JSON_MODE,
+            no_wait=args.no_wait,
+            password=password,
+        )
     else:
         die(f"unhandled {args.cmd}")
 

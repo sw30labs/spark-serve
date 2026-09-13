@@ -651,7 +651,7 @@ print(json.dumps({"listening_ports": listening, "containers": [{"id": c["Id"], "
         )
         self.emit("ready", served="yue", ready_workers=len(ready), workers=ready)
 
-    def switch(self, target: str, start_vllm=None, *, cancel_jobs=False, no_wait=False):
+    def switch(self, target: str, start_vllm=None, *, cancel_jobs=False, no_wait=False, after_idle=None):
         with self.lock():
             generation = str(uuid.uuid4())
             self.save(
@@ -676,6 +676,8 @@ print(json.dumps({"listening_ports": listening, "containers": [{"id": c["Id"], "
                 self.stop_vllm()
                 self.verify_idle()
                 self.save(mode="none", phase="stopped")
+                if after_idle is not None:
+                    after_idle()
                 if target == "none":
                     return
                 self.save(phase="starting")
