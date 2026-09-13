@@ -115,12 +115,12 @@ final class CLIRunner: ObservableObject {
     private let home: URL?
     private let cliPath: String
     private var pollTimer: Timer?
-    private var upProcess: Process?
+    @Published private var upProcess: Process?
     private var lineBuf = Data()
     private var lastDecodeError: String?
 
     var isBusy: Bool {
-        if isStopping { return true }
+        if isStopping || upProcess != nil { return true }
         switch bootState {
         case .launching, .booting: return true
         default: return false
@@ -149,6 +149,7 @@ final class CLIRunner: ObservableObject {
     }
 
     var badgeColor: Color {
+        if case .failed = bootState { return .red }
         if isBusy || yueIsDraining { return .orange }
         if transitionIsBlocked { return .red }
         switch bootState {
@@ -165,6 +166,7 @@ final class CLIRunner: ObservableObject {
     var badgeText: String {
         if isStopping { return "draining / stopping" }
         switch bootState {
+        case .failed(let message): return message
         case .booting(_, let elapsed): return "booting (\(elapsed)s)"
         case .launching(let model): return "starting \(model)…"
         default: break
@@ -266,21 +268,8 @@ final class CLIRunner: ObservableObject {
             return
         }
 
-        pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let data = handle.availableData
-            DispatchQueue.main.async {
-                self?.consumeStdout(data, model: model)
-            }
-        }
-
-        process.terminationHandler = { [weak self] proc in
-            pipe.fileHandleForReading.readabilityHandler = nil
-            DispatchQueue.main.async {
-                self?.flushStdout(model: model)
-                self?.upProcess = nil
-                self?.finishUp(statusCode: proc.terminationStatus)
-                self?.refresh()
-            }
+        observeProcess(process, pipe: pipe, model: model) { runner, statusCode in
+            runner.finishUp(statusCode: statusCode)
         }
     }
 
@@ -318,6 +307,8 @@ final class CLIRunner: ObservableObject {
         guard let status else { return }
         switch bootState {
         case .launching, .booting:
+            // The owned CLI reports readiness and failures. A concurrent status
+            // request can still describe an earlier attempt at the same model.
             return
         case .ready:
             if !status.ready {
@@ -346,6 +337,33 @@ final class CLIRunner: ObservableObject {
         case .idle:
             if statusCode != 0 {
                 bootState = .failed(message: "up exited \(statusCode)")
+            }
+        }
+    }
+
+    private func observeProcess(
+        _ process: Process, pipe: Pipe, model: String,
+        didExit: @escaping (CLIRunner, Int32) -> Void
+    ) {
+        // Drain stdout through EOF before finishing. A termination handler can
+        // otherwise detach the reader before its final error event is consumed.
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            while true {
+                let data = pipe.fileHandleForReading.availableData
+                if data.isEmpty { break }
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.upProcess === process else { return }
+                    self.consumeStdout(data, model: model)
+                }
+            }
+            process.waitUntilExit()
+            let statusCode = process.terminationStatus
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.upProcess === process else { return }
+                self.flushStdout(model: model)
+                self.upProcess = nil
+                didExit(self, statusCode)
+                self.refresh()
             }
         }
     }
@@ -402,6 +420,14 @@ final class CLIRunner: ObservableObject {
             appendLog("  YuE worker ready: \(obj["host"] as? String ?? "") (\(jsonInt(obj, "ready_workers") ?? 0)/\(jsonInt(obj, "total_workers") ?? 2))")
         case "head_start":
             appendLog("  head started")
+        case "startup_diagnostics":
+            let host = obj["host"] as? String ?? "runtime"
+            appendLog("── Startup diagnostics: \(host) ──")
+            if let output = obj["output"] as? String {
+                for line in output.split(separator: "\n", omittingEmptySubsequences: false) {
+                    appendLog(String(line))
+                }
+            }
         case "hermes":
             if let detail = obj["detail"] as? String {
                 appendLog("  hermes: \(detail)")
@@ -593,6 +619,7 @@ struct MenuBarView: View {
             }
             .buttonStyle(.plain)
             .padding(.horizontal, 8)
+            .disabled(runner.isBusy)
 
             Divider()
 
@@ -710,9 +737,9 @@ struct MainView: View {
         if !runner.activeYueWorkers.isEmpty { return "yue" }
         switch runner.bootState {
         case .ready(let m, _): return m
-        case .booting(let m, _): return m
-        case .launching(let m): return m
+        case .booting, .launching, .failed: return nil
         default:
+            guard runner.status?.ready == true else { return nil }
             return runner.status?.served.flatMap { served in
                 runner.models.first(where: { $0.served_name == served || $0.id == served })?.id
             }

@@ -10,11 +10,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 
@@ -45,6 +48,7 @@ from spark_serve_controller import (
     Controller,
     ControllerError,
     guarded_remote_script,
+    state_dir,
     yue_catalog_entry,
 )
 
@@ -86,12 +90,18 @@ def resolve_model(cfg: dict, name: str) -> tuple[str, dict]:
     die(f"unknown model {name!r}. catalog: {known}")
 
 
-def ssh_cmd(cfg: dict, host: str, remote: str, check: bool = True) -> subprocess.CompletedProcess:
+def ssh_cmd(
+    cfg: dict,
+    host: str,
+    remote: str,
+    check: bool = True,
+    timeout: int = 660,
+) -> subprocess.CompletedProcess:
     opts = list(cfg["cluster"].get("ssh_opts") or ["-o", "BatchMode=yes"])
     try:
         proc = subprocess.run(
             ["ssh", *opts, "-o", "ConnectTimeout=8", host, "bash", "-s"],
-            input=remote, text=True, capture_output=True, timeout=660, check=False,
+            input=remote, text=True, capture_output=True, timeout=timeout, check=False,
         )
     except subprocess.TimeoutExpired:
         proc = subprocess.CompletedProcess([], 124, "", "SSH operation timed out; remote ownership requires reconciliation")
@@ -248,6 +258,7 @@ raise SystemExit(result.returncode)
     return (
         "set -euo pipefail\n"
         + "container_id=$(" + shlex.join(full) + ")\n"
+        + f'echo created $(hostname) rank={rank} id="$container_id"\n'
         + shlex.join(["python3", "-c", start]) + ' "$container_id"\n'
         + f'echo started $(hostname) rank={rank} id="$container_id"\n'
     )
@@ -294,6 +305,7 @@ def probe_v1(cfg: dict, timeout: int = 5) -> str:
         cfg["cluster"]["head"],
         f"curl -sf --max-time {int(timeout)} {shlex.quote(url)} || true",
         check=False,
+        timeout=timeout + 10,
     ).stdout.strip()
 
 
@@ -497,26 +509,125 @@ def cmd_logs(cfg: dict, follow: bool, which: str) -> None:
     os.execvp("ssh", ["ssh", *opts, host, f"docker logs {flag} {shlex.quote(name)}"])
 
 
+class _StartupMonitor:
+    """Observe only IDs created by this launch; retain evidence before cleanup."""
+
+    def __init__(self, cfg: dict, sink: _Sink):
+        self.cfg, self.sink = cfg, sink
+        self.containers: list[dict] = []
+
+    def remember(self, host: str, rank: int, output: str) -> bool:
+        ids = set(re.findall(
+            rf"^(?:created|started) \S+ rank={rank} id=([0-9a-f]{{64}})$",
+            output or "", re.MULTILINE,
+        ))
+        if len(ids) != 1:
+            return False
+        self.containers.append({"host": host, "rank": rank, "id": ids.pop()})
+        return True
+
+    def _inspect(self, container: dict) -> str | None:
+        host, cid = container["host"], container["id"]
+        proc = ssh_cmd(
+            self.cfg, host,
+            shlex.join(["docker", "inspect", "--type", "container", "--format", "{{json .State}}", cid]),
+            check=False, timeout=15,
+        )
+        prefix = f"{host} rank {container['rank']} ({cid[:12]})"
+        if proc.returncode:
+            error = (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()[-1200:]
+            if proc.returncode in (124, 255):
+                return f"{prefix}: SSH unavailable; container state is unknown: {error}"
+            if re.search(r"no such (?:object|container)", error, re.IGNORECASE):
+                return f"{prefix}: launched container is missing"
+            return f"{prefix}: cannot inspect container; state is unknown: {error}"
+        try:
+            state = json.loads(proc.stdout)
+            if not isinstance(state, dict) or not isinstance(state.get("Running"), bool):
+                raise ValueError("invalid Docker state")
+        except (ValueError, TypeError):
+            return f"{prefix}: invalid Docker state response; container state is unknown"
+        container["state"] = state
+        status = state.get("Status", "unknown")
+        if (not state["Running"] or status != "running"
+                or state.get("OOMKilled") or state.get("Restarting") or state.get("Paused")):
+            error = str(state.get("Error") or "").strip()[:1200]
+            return (
+                f"{prefix}: startup failed (state={status}, exit={state.get('ExitCode', '?')}, "
+                f"OOMKilled={bool(state.get('OOMKilled'))})" + (f": {error}" if error else "")
+            )
+        return None
+
+    def check(self) -> None:
+        with ThreadPoolExecutor(max_workers=max(1, len(self.containers))) as pool:
+            failures = list(pool.map(self._inspect, self.containers))
+        if any(failures):
+            self.fail("; ".join(reason for reason in failures if reason))
+
+    def _logs(self, container: dict) -> dict:
+        # Bound remote output as well as local storage. IDs cannot follow a
+        # replacement that reuses the same catalog container name.
+        remote = "set -o pipefail\n" + shlex.join([
+            "docker", "logs", "--timestamps", "--tail", "160", container["id"],
+        ]) + " 2>&1 | tail -c 32768"
+        proc = ssh_cmd(self.cfg, container["host"], remote, check=False, timeout=15)
+        output = ((proc.stdout or "") + (proc.stderr or ""))[-32768:]
+        return dict(container, log=output, log_exit_code=proc.returncode)
+
+    def fail(self, reason: str) -> None:
+        with ThreadPoolExecutor(max_workers=max(1, len(self.containers))) as pool:
+            evidence = list(pool.map(self._logs, self.containers))
+        report_path = None
+        try:
+            directory = state_dir() / "diagnostics"
+            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            report_path = Path(tempfile.mkdtemp(prefix="startup-", dir=directory)) / "failure.json"
+            report_path.write_text(json.dumps({
+                "error": reason, "captured_at": time.time(), "containers": evidence,
+            }, indent=2) + "\n")
+        except OSError as exc:
+            reason += f"; could not save startup diagnostics: {exc}"
+        for item in evidence:
+            self.sink.event(
+                "startup_diagnostics", host=item["host"], rank=item["rank"],
+                container_id=item["id"], output=item["log"],
+                path=str(report_path) if report_path else None,
+            )
+        if report_path:
+            reason += f"; startup diagnostics saved to {report_path}"
+        # Controller.switch preserves this message and then performs its
+        # existing generation-guarded cleanup of the partial launch.
+        raise ControllerError(reason)
+
+
+
 def wait_models(
     cfg: dict,
     timeout: int = 1500,
     expect_served: str | None = None,
     on_poll=None,
+    check_started=None,
 ) -> tuple[bool, str | None, str]:
     catalog = catalog_served_names(cfg)
-    t0 = time.time()
+    t0 = time.monotonic()
     body = ""
-    while time.time() - t0 < timeout:
+    while time.monotonic() - t0 < timeout:
+        if check_started:
+            check_started()
         body = probe_v1(cfg, timeout=4)
         ids = parse_v1_ids(body)
         if expect_served:
             if expect_served in ids:
+                if check_started:
+                    check_started()
                 return True, expect_served, body
         else:
             hit = next((i for i in ids if i in catalog), None)
             if hit:
+                if check_started:
+                    check_started()
                 return True, hit, body
-        elapsed = int(time.time() - t0)
+        elapsed = int(time.monotonic() - t0)
         if on_poll:
             on_poll(elapsed)
         else:
@@ -531,29 +642,36 @@ def wait_ready(
     expect_served: str | None = None,
     ready_path: str = "/v1/models",
     on_poll=None,
+    check_started=None,
 ) -> tuple[bool, str | None, str]:
     path = ready_path or "/v1/models"
     if path.rstrip("/") == "/v1/models":
         return wait_models(
-            cfg, timeout=timeout, expect_served=expect_served, on_poll=on_poll
+            cfg, timeout=timeout, expect_served=expect_served, on_poll=on_poll,
+            check_started=check_started,
         )
     url = cfg["cluster"]["lan_url"].rstrip("/") + path
-    t0 = time.time()
+    t0 = time.monotonic()
     body = ""
-    while time.time() - t0 < timeout:
+    while time.monotonic() - t0 < timeout:
+        if check_started:
+            check_started()
         proc = ssh_cmd(
             cfg,
             cfg["cluster"]["head"],
             f"curl -sf --max-time 4 {shlex.quote(url)}",
             check=False,
+            timeout=14,
         )
         if proc.returncode == 0:
             body = probe_v1(cfg, timeout=4)
             ids = parse_v1_ids(body)
             served = expect_served if expect_served in ids else next((mid for mid in ids if mid in catalog_served_names(cfg)), None)
             if served and (not expect_served or served == expect_served):
+                if check_started:
+                    check_started()
                 return True, served, body
-        elapsed = int(time.time() - t0)
+        elapsed = int(time.monotonic() - t0)
         if on_poll:
             on_poll(elapsed)
         else:
@@ -745,6 +863,11 @@ class _Sink:
             print(f"waiting for {path} …")
         elif name == "poll":
             print(f"  waiting for serve ({fields.get('elapsed', 0)}s)…")
+        elif name == "startup_diagnostics":
+            print(f"-- startup log {fields.get('host')} rank {fields.get('rank')} --", flush=True)
+            print(fields.get("output") or "(no logs available)", flush=True)
+            if fields.get("path"):
+                print(f"diagnostics: {fields['path']}", flush=True)
         elif name == "ready":
             if fields.get("body"):
                 print(fields["body"])
@@ -807,13 +930,17 @@ def _bring_up(
         hosts = (c["head"],) if nnodes == 1 else (c["worker"], c["head"])
         for host in hosts:
             sink.event("drop_caches", host=host, output=drop_caches(cfg, host))
+    monitor = _StartupMonitor(cfg, sink)
     if nnodes > 1:
         worker_script = docker_run_script(cfg, model, 1, True)
         if generation:
             worker_script = guarded_remote_script(generation, worker_script)
         w = ssh_cmd(cfg, c["worker"], worker_script, check=False)
+        worker_id_known = monitor.remember(c["worker"], 1, w.stdout)
         if w.returncode != 0:
-            sink.fail(f"{c['worker']}: {(w.stderr or w.stdout or '').strip() or f'exit {w.returncode}'}")
+            monitor.fail(f"{c['worker']}: worker launch failed: {(w.stderr or w.stdout or '').strip()[-1200:] or f'exit {w.returncode}'}")
+        if not worker_id_known:
+            monitor.fail(f"{c['worker']}: worker launch returned no unambiguous immutable container ID")
         sink.event("worker_start", host=c["worker"], output=(w.stdout or "").strip())
         # Give the worker a moment to bind the torch.distributed master port.
         time.sleep(8)
@@ -823,8 +950,11 @@ def _bring_up(
     if generation:
         head_script = guarded_remote_script(generation, head_script)
     h = ssh_cmd(cfg, c["head"], head_script, check=False)
+    head_id_known = monitor.remember(c["head"], 0, h.stdout)
     if h.returncode != 0:
-        sink.fail(f"{c['head']}: {(h.stderr or h.stdout or '').strip() or f'exit {h.returncode}'}")
+        monitor.fail(f"{c['head']}: head launch failed: {(h.stderr or h.stdout or '').strip()[-1200:] or f'exit {h.returncode}'}")
+    if not head_id_known:
+        monitor.fail(f"{c['head']}: head launch returned no unambiguous immutable container ID")
     sink.event("head_start", host=c["head"], output=(h.stdout or "").strip())
     if no_wait:
         sink.event("hermes", detail="skipped (--no-wait)")
@@ -839,21 +969,15 @@ def _bring_up(
         expect_served=model["served_name"],
         ready_path=ready_path,
         on_poll=lambda elapsed: sink.event("poll", elapsed=elapsed),
+        check_started=monitor.check,
     )
     if ok:
-        expected_name = container_name(cfg, model)
-        hosts = (c["head"],) if nnodes == 1 else (c["head"], c["worker"])
-        for host in hosts:
-            if not any(item["name"] == expected_name and item["running"] for item in status_host_json(cfg, host)):
-                sink.fail(f"{host}: model endpoint answered, but expected container {expected_name} is absent")
         hermes = maybe_hermes_json(cfg, mid, model, skip=no_hermes)
         sink.event("hermes", detail=hermes)
         sink.event("ready", served=served, elapsed=int(time.time() - t0), body=body)
         return
     sink.event("hermes", detail="skipped (wait failed)")
-    sink.event("timeout", ready_path=ready_path)
-    if sink.json_mode:
-        raise SystemExit(1)
+    monitor.fail(f"containers started but {ready_path} did not become ready before the startup timeout")
 
 
 def cmd_up(

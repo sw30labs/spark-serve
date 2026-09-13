@@ -8,3 +8,6 @@ models.toml
 GUI_RESEARCH.md
 benchmark-results/
 tests/workloads/local/
+
+# Local startup logs and host-specific investigation evidence.
+diagnostics/

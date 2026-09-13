@@ -50,6 +50,8 @@ NCCL_CUMEM_ENABLE = "0"
 # Model A — DeepSeek-V4-Flash (Aiden GB10 image, native 1M YaRN)
 # ---------------------------------------------------------------------------
 [models.ds4]
+# Explicit pinned-memory allowance; see docs/ds4-startup-recovery.md.
+docker_extra = ["--ulimit", "memlock=-1:-1"]
 aliases = ["deepseek", "deepseek-v4-flash", "ds"]
 label = "DeepSeek-V4-Flash"
 image = "aidendle94/sparkrun-vllm-ds4-gb10:production-ready"
@@ -66,6 +68,18 @@ hermes_context_length = 1048576
 notes = "KV fp8 OK. MTP 2. Do not cap at 32k."
 
 [models.ds4.env]
+# Verified recovery for GB10 RDMA long-term page migration failures.
+# Socket transport still uses the fast right-port QSFP interfaces.
+# Remove these model overrides only after validating a native RDMA remedy.
+NCCL_NET = "Socket"
+NCCL_IB_DISABLE = "1"
+NCCL_SOCKET_IFNAME = "=enp1s0f1np1,enP2p1s0f1np1"
+NCCL_SOCKET_NTHREADS = "2"
+NCCL_NSOCKS_PERTHREAD = "4"
+NCCL_BUFFSIZE = "1048576"
+NCCL_MAX_NCHANNELS = "8"
+NCCL_DEBUG = "INFO"
+NCCL_NVLS_ENABLE = "0"
 HF_HOME = "/cache/huggingface"
 HF_HUB_OFFLINE = "1"
 VLLM_CACHE_ROOT = "/cache/huggingface/vllm-cache"

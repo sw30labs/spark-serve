@@ -65,6 +65,17 @@ commands for an older transition cannot admit a worker or launch a model after a
 new transition starts. Commands hold that lock through their side effects,
 including when a parent process is interrupted.
 
+While a vLLM model starts, the CLI checks the exact containers it launched on
+every required node. An exited container or an unverifiable node ends the wait
+with its host and failure reason instead of leaving the app booting until the
+readiness timeout. Before cleanup, bounded logs and container states are saved
+under `~/.local/state/spark-serve/diagnostics/startup-*/failure.json` (or the
+configured state directory) and shown in the app's boot log. The green model
+check appears only after readiness; controls stay busy through cleanup.
+
+See [DeepSeek startup recovery](docs/ds4-startup-recovery.md) for the verified
+QSFP Socket transport workaround and validation results.
+
 Only exact catalog-owned Docker IDs are stopped. `keep_containers` are retained,
 including when accidentally listed in `stop_names`. Unreachable hosts, untracked
 GPU containers, or remaining host compute processes block a mode switch. Stop
