@@ -48,7 +48,13 @@ cp models.example.toml models.toml   # then edit [cluster]
 `up ds4` / `up ds4-vision` drain YuE jobs, stop the previous workload, verify
 both GPUs are free, start the worker (rank 1, `--headless`) and head (rank 0),
 then retarget Hermes after readiness. Single-node recipes such as
-`nemotron-super` preserve their `nnodes=1` and TP=1 settings.
+`nemotron-super` and `qwen38` preserve their `nnodes=1` and TP=1 settings.
+
+Qwen3.8-Flash-Next uses NVIDIA NVFP4 weights, native 262K context, images and
+tools on one Spark. Run `./spark-serve pull qwen38` to prepare its pinned
+runtime and checkpoint, then `./spark-serve up qwen38`. It checks its assets
+before stopping the current model. See the [Qwen recipe](docs/qwen38-nvfp4.md)
+for setup, provenance and qualification details.
 
 `up yue` starts two **independent** workers. Each can render a different song or
 take. This uses the existing SSH hosts and Mac app, while YuE keeps its own

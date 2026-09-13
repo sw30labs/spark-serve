@@ -1,0 +1,14 @@
+{
+  "LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+  "NOTICE": "da2dd571381b23a5243b2a691b8f0bfd7bbf370627f01da91cc53b23986c316c",
+  "single-spark-vllm-tp1/patch/upstream-overlays/PROVENANCE.md": "69dc4f15a3ea5c6a665e9c6d4523babf6a708a4bbffe4e811f73c47647c68961",
+  "single-spark-vllm-tp1/patch/ple_layer.py": "74526607e4239ad95b5bc8e94acfcb8a250ba75f8705acce3cbe752e0cc1f4a9",
+  "single-spark-vllm-tp1/patch/ple_mmap.py": "aa03eb1dff0b8739744259cf426bcb7674b1c6a7cc06233c181cac323bb86a00",
+  "single-spark-vllm-tp1/patch/model_state.py": "ce9fc0c589d60703899659a6100594c788d0b1636a33585e301636531a4d85ce",
+  "single-spark-vllm-tp1/patch/mtp_draft_vocab.py": "1d6b90d3dea98b4c7fa0de86b1ef222e88d5772969fd8fb9b20a705e4c4c5981",
+  "single-spark-vllm-tp1/patch/upstream-overlays/ops_ple.py": "cc8994b653dd4b59d6ba35b6ec10af34017e9944482ec67cad6a32a02c5dd00a",
+  "single-spark-vllm-tp1/patch/upstream-overlays/ops_qsa.py": "1e928e2994233496e9ef447768e8b63acbedc22e242d4b2fc9f4ed861a1616c3",
+  "single-spark-vllm-tp1/patch/upstream-overlays/qsa.py": "f2fc3fb43f6c6e84e892a995697fb59a85ee8df2ef2959943c96cf0233078da7",
+  "single-spark-vllm-tp1/patch/upstream-overlays/platforms_interface.py": "443b556b984b306c0274c58af8658ef853c664b8beae6deefda41908f789d26d",
+  "single-spark-vllm-tp1/patch/upstream-overlays/modelopt.py": "472b41a26267fe6bc78ea3d872863b518154d92b6672eb4050cd92e63e25c69b"
+}

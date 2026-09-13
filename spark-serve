@@ -742,7 +742,8 @@ model = data.setdefault('model', {{}})
 model['default'] = {served!r}
 model['provider'] = {provider!r}
 if {ctx}:
-    model['context_length'] = {ctx}
+    # Keep the server limit scoped to this provider/model when Hermes switches.
+    model.pop('context_length', None)
 providers = data.setdefault('providers', {{}})
 block = providers.setdefault({provider!r}, {{}})
 block['name'] = 'Spark cluster'
@@ -780,6 +781,17 @@ def maybe_hermes_json(cfg: dict, mid: str, model: dict, skip: bool) -> str:
 
 def cmd_pull(cfg: dict, name: str) -> None:
     mid, model = resolve_model(cfg, name)
+    recipe = model.get("recipe")
+    if recipe:
+        if recipe != "qwen38-nvfp4":
+            die(f"unknown preparation recipe {recipe!r} for {mid}")
+        proc = subprocess.run([
+            sys.executable, str(HERE / "tools" / "prepare_qwen38.py"),
+            "--catalog", str(CATALOG),
+        ], check=False)
+        if proc.returncode:
+            die(f"preparation failed for {mid} (exit {proc.returncode})")
+        return
     image = model["image"]
     repos = [model["hf_id"], *[str(x) for x in (model.get("pull_repos") or [])]]
     print(f"pull {mid}: image {image}")
@@ -841,6 +853,10 @@ class _Sink:
             print(f"  stop {fields.get('host')}: {fields.get('output')}")
         elif name == "drop_caches":
             print(f"  drop_caches {fields.get('host')}: {fields.get('output')}")
+        elif name == "preflight":
+            print(f"  preflight {fields.get('model')} on {fields.get('host')}: {fields.get('detail')}", flush=True)
+            if fields.get("output"):
+                print(fields["output"], flush=True)
         elif name == "worker_ready":
             print(f"YuE ready {fields.get('host')}: {fields.get('ready_workers')}/{fields.get('total_workers')}")
         elif name == "worker_start":
@@ -966,6 +982,7 @@ def _bring_up(
     t0 = time.time()
     ok, served, body = wait_ready(
         cfg,
+        timeout=model_ready_timeout(model),
         expect_served=model["served_name"],
         ready_path=ready_path,
         on_poll=lambda elapsed: sink.event("poll", elapsed=elapsed),
@@ -978,6 +995,66 @@ def _bring_up(
         return
     sink.event("hermes", detail="skipped (wait failed)")
     monitor.fail(f"containers started but {ready_path} did not become ready before the startup timeout")
+
+
+def model_ready_timeout(model: dict) -> int:
+    value = model.get("ready_timeout", 1500)
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ControllerError("model ready_timeout must be a positive integer number of seconds")
+    return value
+
+
+def model_preflight(cfg: dict, mid: str, model: dict, sink: _Sink) -> None:
+    """Verify prepared assets without GPUs or changes to the current workload."""
+    arguments = model.get("preflight_args")
+    if arguments is None:
+        return
+    if (not isinstance(arguments, list) or not arguments
+            or any(not isinstance(arg, str) or not arg for arg in arguments)):
+        raise ControllerError(f"{mid}: preflight_args must be a nonempty list of strings")
+    c = cfg["cluster"]
+    nnodes = int(model.get("nnodes") or c["nnodes"])
+    if nnodes not in (1, 2):
+        raise ControllerError(f"{mid}: preflight supports one or two Spark hosts")
+    hosts = [(0, c["head"])]
+    if nnodes > 1:
+        hosts.append((1, c["worker"]))
+    for rank, host in hosts:
+        # Do not inherit docker_base(): it grants GPUs, RDMA devices, host
+        # networking, writable caches, and model-specific privileged options.
+        command = [
+            "docker", "run", "--rm", "--pull", "never", "--network", "none",
+            "--entrypoint", "python3",
+            "-e", "NVIDIA_VISIBLE_DEVICES=void", "-e", "CUDA_VISIBLE_DEVICES=",
+        ]
+        if not model.get("skip_default_cache_mount"):
+            command.extend(["-v", f"{c['hf_cache_host']}:{model.get('hf_mount') or '/cache/huggingface'}:ro"])
+        for mount in model.get("mounts") or []:
+            if not isinstance(mount, dict):
+                continue
+            source = mount.get("head" if rank == 0 else "worker")
+            target = mount.get("container")
+            if source and target:
+                command.extend(["-v", f"{source}:{target}:ro"])
+        # Resolve the tag locally, then run its immutable ID. --pull never and
+        # --network none keep preparation/downloads out of a model switch.
+        inspect = shlex.join(["docker", "image", "inspect", "--format", "{{.Id}}", model["image"]])
+        remote = (
+            "set -euo pipefail\n"
+            f"image_id=$({inspect})\n"
+            "timeout --signal=TERM --kill-after=10s 120s "
+            + shlex.join(command) + ' "$image_id" ' + shlex.join(arguments) + "\n"
+        )
+        sink.event("preflight", model=mid, host=host, detail="checking local image and prepared weights")
+        proc = ssh_cmd(cfg, host, remote, check=False, timeout=145)
+        if proc.returncode:
+            output = ((proc.stderr or "") + (proc.stdout or "")).strip()[-8192:]
+            raise ControllerError(
+                f"{mid}: preflight failed on {host}; current workload was not changed. "
+                f"Run spark-serve pull {mid} to prepare it. "
+                + (output or f"exit {proc.returncode}")
+            )
+        sink.event("preflight", model=mid, host=host, detail="passed", output=(proc.stdout or "").strip()[-8192:])
 
 
 def cmd_up(
@@ -999,9 +1076,12 @@ def cmd_up(
         return
     if yue and no_wait:
         sink.fail("YuE requires admission verification before publishing workers; omit --no-wait")
-    if not yue:
-        resolve_model(cfg, name)  # Reject invalid names before touching live workloads.
     try:
+        if not yue:
+            mid, model = resolve_model(cfg, name)
+            # Fail before Controller.switch can drain or stop a live model.
+            model_ready_timeout(model)
+            model_preflight(cfg, mid, model, sink)
         Controller(cfg, ssh_cmd, sink.event).switch(
             "yue" if yue else name,
             lambda generation: _bring_up(cfg, name, no_hermes, no_wait, sink, generation=generation),

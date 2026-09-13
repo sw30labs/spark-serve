@@ -111,6 +111,7 @@ final class CLIRunner: ObservableObject {
     @Published var bootState: BootState = .idle
     @Published var logLines: [String] = []
     @Published private var isStopping = false
+    @Published private(set) var preparingModel: String?
 
     private let home: URL?
     private let cliPath: String
@@ -148,10 +149,21 @@ final class CLIRunner: ObservableObject {
         return status?.transition_error ?? "The \(target) needs attention."
     }
 
+    var retainedServingNote: String? {
+        guard preparingModel != nil, status?.ready == true, let served = status?.served else { return nil }
+        return "Still serving \(served)"
+    }
+
+    private var serverNotResponding: Bool {
+        !isBusy && status?.ready == false
+            && (status?.vllm_running == true || status?.ours_running == true)
+    }
+
     var badgeColor: Color {
         if case .failed = bootState { return .red }
         if isBusy || yueIsDraining { return .orange }
         if transitionIsBlocked { return .red }
+        if serverNotResponding { return .orange }
         switch bootState {
         case .ready: return .green
         case .booting, .launching: return .orange
@@ -168,7 +180,7 @@ final class CLIRunner: ObservableObject {
         switch bootState {
         case .failed(let message): return message
         case .booting(_, let elapsed): return "booting (\(elapsed)s)"
-        case .launching(let model): return "starting \(model)…"
+        case .launching(let model): return preparingModel == nil ? "starting \(model)…" : "checking \(model)…"
         default: break
         }
         if yueIsDraining {
@@ -177,6 +189,7 @@ final class CLIRunner: ObservableObject {
         if transitionIsBlocked {
             return activeYueWorkers.isEmpty ? "Switch blocked" : "YuE rendering · switch blocked"
         }
+        if serverNotResponding { return "server not responding" }
         if status?.mode == "yue", status?.phase == "ready" {
             let ready = status?.ready_workers ?? 0
             let total = status?.total_workers ?? 2
@@ -246,6 +259,7 @@ final class CLIRunner: ObservableObject {
 
     func startUp(model: String, noHermes: Bool = false) {
         guard !isBusy else { return }
+        preparingModel = nil
         bootState = .launching(model: model)
         logLines = []
         lineBuf = Data()
@@ -278,6 +292,7 @@ final class CLIRunner: ObservableObject {
             appendLog("A mode transition is already running. Wait for it to finish before stopping.")
             return
         }
+        preparingModel = nil
         let args = cancelJobs ? ["stop", "--cancel-jobs"] : ["stop"]
         appendLog("$ spark-serve \(args.joined(separator: " "))")
         isStopping = true
@@ -403,10 +418,21 @@ final class CLIRunner: ObservableObject {
             return
         }
         switch event {
+        case "preflight":
+            preparingModel = obj["model"] as? String ?? model
+            let host = obj["host"] as? String ?? "Spark"
+            let detail = obj["detail"] as? String ?? "checking prepared model"
+            if detail == "passed" {
+                appendLog("  preparation checks passed on \(host)")
+            } else {
+                appendLog("  preparing \(preparingModel ?? model) on \(host): \(detail)")
+            }
         case "start":
+            preparingModel = nil
             let label = obj["label"] as? String ?? model
             appendLog("── Starting \(label) (\(model)) ──")
         case "stop":
+            preparingModel = nil
             if let host = obj["host"] as? String {
                 appendLog("  stop \(host)")
             }
@@ -415,7 +441,13 @@ final class CLIRunner: ObservableObject {
                 appendLog("  drop_caches \(host): \(obj["output"] as? String ?? "")")
             }
         case "worker_start":
-            appendLog("  worker started: \(obj["host"] as? String ?? "")")
+            let host = obj["host"] as? String ?? ""
+            let output = (obj["output"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            if output.hasPrefix("skipped") {
+                appendLog("  worker \(output): \(host)")
+            } else {
+                appendLog("  worker started: \(host)")
+            }
         case "worker_ready":
             appendLog("  YuE worker ready: \(obj["host"] as? String ?? "") (\(jsonInt(obj, "ready_workers") ?? 0)/\(jsonInt(obj, "total_workers") ?? 2))")
         case "head_start":
@@ -524,10 +556,10 @@ struct SparkServeApp: App {
         Window("spark-serve", id: "main") {
             MainView()
                 .environmentObject(runner)
-                .frame(minWidth: 520, minHeight: 380)
+                .frame(minWidth: 640, minHeight: 600)
         }
         .windowStyle(.titleBar)
-        .defaultSize(width: 560, height: 420)
+        .defaultSize(width: 820, height: 660)
 
         MenuBarExtra {
             MenuBarView()
@@ -654,6 +686,7 @@ struct MainView: View {
     @State private var selectedModel: String?
     @State private var showNotes = true
     @State private var confirmCancelJobs = false
+    @State private var modelPickerHeight: CGFloat = 324
 
     var body: some View {
         VStack(spacing: 12) {
@@ -712,6 +745,11 @@ struct MainView: View {
                         .foregroundStyle(.orange)
                         .lineLimit(2)
                 }
+                if let note = runner.retainedServingNote {
+                    Text(note)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
                 if let foreign = runner.status?.foreign_served, runner.status?.ready != true {
                     Text("foreign on :8000: \(foreign)")
                         .font(.caption)
@@ -735,6 +773,11 @@ struct MainView: View {
 
     private var isCurrentModel: String? {
         if !runner.activeYueWorkers.isEmpty { return "yue" }
+        if runner.preparingModel != nil, runner.status?.ready == true {
+            return runner.status?.served.flatMap { served in
+                runner.models.first(where: { $0.served_name == served || $0.id == served })?.id
+            }
+        }
         switch runner.bootState {
         case .ready(let m, _): return m
         case .booting, .launching, .failed: return nil
@@ -747,18 +790,37 @@ struct MainView: View {
     }
 
     private var modelPicker: some View {
-        HStack(spacing: 12) {
-            ForEach(runner.models) { m in
-                ModelCard(
-                    model: m,
-                    isSelected: selectedModel == m.id,
-                    isCurrent: isCurrentModel == m.id,
-                    showNotes: showNotes
-                )
-                .onTapGesture { selectedModel = m.id }
+        ScrollView {
+            LazyVGrid(
+                columns: [GridItem(.adaptive(minimum: 190), spacing: 12, alignment: .top)],
+                alignment: .leading,
+                spacing: 12
+            ) {
+                ForEach(runner.models) { m in
+                    Button {
+                        selectedModel = m.id
+                    } label: {
+                        ModelCard(
+                            model: m,
+                            isSelected: selectedModel == m.id,
+                            isCurrent: isCurrentModel == m.id,
+                            showNotes: showNotes
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(m.label)
+                    .accessibilityValue("\(selectedModel == m.id ? "Selected" : "Not selected")\(isCurrentModel == m.id ? ", serving" : "")")
+                    .accessibilityHint("Select this model, then use Start.")
+                }
             }
-            Spacer()
+            .padding(2)
+            .background(GeometryReader { geometry in
+                Color.clear
+                    .onAppear { modelPickerHeight = geometry.size.height }
+                    .onChange(of: geometry.size.height) { modelPickerHeight = $0 }
+            })
         }
+        .frame(height: min(360, max(154, modelPickerHeight)))
     }
 
     @ViewBuilder
@@ -834,6 +896,8 @@ struct ModelCard: View {
             HStack {
                 Text(model.label)
                     .font(.headline)
+                    .lineLimit(2)
+                    .help(model.label)
                 if isCurrent {
                     Image(systemName: "checkmark.circle.fill")
                         .foregroundStyle(.green)
@@ -843,6 +907,7 @@ struct ModelCard: View {
             Text(model.backend == "yue" ? "Artist Twin song / take queue" : "served: \(model.served_name)")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+                .lineLimit(2)
             HStack(spacing: 8) {
                 Label(ctxLabel, systemImage: "text.line.inherit")
                     .font(.caption2)
@@ -851,15 +916,21 @@ struct ModelCard: View {
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
+            if model.backend != "yue", let topology = model.topology {
+                Label(topology == "single" ? "1 Spark" : "2 Sparks", systemImage: "desktopcomputer")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
             if showNotes && !model.notes.isEmpty {
                 Text(model.notes)
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
                     .lineLimit(2)
+                    .help(model.notes)
             }
         }
         .padding(10)
-        .frame(width: 180)
+        .frame(maxWidth: .infinity, minHeight: 150, alignment: .topLeading)
         .background(
             RoundedRectangle(cornerRadius: 8)
                 .fill(isSelected ? Color.accentColor.opacity(0.12) : Color(nsColor: .controlBackgroundColor))

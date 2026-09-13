@@ -249,3 +249,95 @@ args = [
   "--enable-auto-tool-choice",
   "--tool-call-parser", "hermes",
 ]
+
+# ---------------------------------------------------------------------------
+# Qwen3.8-Flash-Next — pinned NVIDIA NVFP4, staged PLE on local NVMe.
+# Prepare: ./spark-serve pull qwen38    Start: ./spark-serve up qwen38
+# Playbook: docs/qwen38-nvfp4.md. Native 262K; one Spark, TP1.
+# ---------------------------------------------------------------------------
+[models.qwen38]
+aliases = ["qwen", "qwen3.8", "qwen38-flash-next"]
+label = "Qwen3.8-Flash-Next NVFP4"
+image = "spark-serve-qwen38-nvfp4:0.1.0"
+recipe = "qwen38-nvfp4"
+hf_id = "nvidia/Qwen3.8-Flash-Next-NVFP4"
+serve_path = "/cache/huggingface/hub/models--nvidia--Qwen3.8-Flash-Next-NVFP4/snapshots/fc694b54fb0174e0913e6adf86691ef85a4ead47"
+served_name = "qwen3.8-flash-next"
+wrapper = "vllm"
+nnodes = 1
+tensor_parallel = 1
+hf_mount = "/cache/huggingface"
+drop_caches = true
+shm_size = "32g"
+docker_extra = ["--ulimit", "memlock=-1:-1"]
+ready_timeout = 3600
+max_model_len = 262144
+max_num_seqs = 6
+gpu_memory_utilization = 0.80
+hermes_provider = "spark"
+hermes_context_length = 262144
+preflight_args = ["/opt/spark-serve/qwen38/verify.py", "/cache/huggingface/hub/models--nvidia--Qwen3.8-Flash-Next-NVFP4/snapshots/fc694b54fb0174e0913e6adf86691ef85a4ead47"]
+notes = "NVIDIA NVFP4. Native 262K, vision + tools, thinking on. MTP 3. Cold start about 13 min."
+
+[models.qwen38.env]
+HF_HOME = "/cache/huggingface"
+VLLM_CACHE_ROOT = "/cache/huggingface/qwen38-vllm-cache"
+XDG_CACHE_HOME = "/cache/huggingface/qwen38-runtime-cache"
+FLASHINFER_WORKSPACE_BASE = "/cache/huggingface/qwen38-runtime-cache"
+TRITON_CACHE_DIR = "/cache/huggingface/qwen38-runtime-cache/triton"
+TORCH_EXTENSIONS_DIR = "/cache/huggingface/qwen38-runtime-cache/torch_extensions"
+CUDA_CACHE_PATH = "/cache/huggingface/qwen38-runtime-cache/cuda"
+NCCL_NET = "Socket"
+NCCL_IB_DISABLE = "1"
+HF_HUB_OFFLINE = "1"
+TRANSFORMERS_OFFLINE = "1"
+VLLM_ENGINE_READY_TIMEOUT_S = "3600"
+PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True"
+CUTE_DSL_ARCH = "sm_121a"
+TORCH_CUDA_ARCH_LIST = "12.1a"
+FLASHINFER_CUDA_ARCH_LIST = "12.1a"
+FLASHINFER_DISABLE_VERSION_CHECK = "1"
+VLLM_USE_DEEP_GEMM = "0"
+VLLM_USE_V2_MODEL_RUNNER = "1"
+QWEN4EXP_PLE_MMAP = "1"
+QWEN4EXP_PLE_STAGED = "1"
+QWEN4EXP_PLE_MMAP_THREADS = "64"
+QWEN4EXP_DRAFT_VOCAB = "65536"
+
+[models.qwen38.vllm]
+args = [
+  "--served-model-name",
+  "qwen3.8-flash-next",
+  "--host",
+  "0.0.0.0",
+  "--port",
+  "8000",
+  "--trust-remote-code",
+  "--quantization",
+  "modelopt",
+  "--tensor-parallel-size",
+  "1",
+  "--max-model-len",
+  "262144",
+  "--max-num-seqs",
+  "6",
+  "--gpu-memory-utilization",
+  "0.80",
+  "--max-num-batched-tokens",
+  "4096",
+  "--no-enable-flashinfer-autotune",
+  "--no-enable-prefix-caching",
+  "--reasoning-parser",
+  "qwen3",
+  "--enable-auto-tool-choice",
+  "--tool-call-parser",
+  "qwen3_xml",
+  "--default-chat-template-kwargs",
+  "{\"enable_thinking\":true}",
+  "--speculative-config",
+  "{\"method\":\"mtp\",\"num_speculative_tokens\":3}",
+  "--compilation-config",
+  "{\"mode\":0,\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"cudagraph_capture_sizes\":[4,8,12,16,20,24]}",
+  "--kv-cache-dtype",
+  "fp8_e4m3",
+]
