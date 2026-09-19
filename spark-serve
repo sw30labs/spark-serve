@@ -814,7 +814,6 @@ def cmd_list_json(cfg: dict) -> None:
             "wrapper": m.get("wrapper", "vllm"),
             "hermes_provider": m.get("hermes_provider", "spark"),
         })
-    out.append(yue_catalog_entry())
     print(json.dumps(out, indent=2))
 
 

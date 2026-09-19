@@ -51,7 +51,7 @@ cp models.example.toml models.toml   # then edit [cluster]
 
 ## Behaviour
 
-`up ds4` / `up ds4-vision` drain YuE jobs, stop the previous workload, verify
+`up ds4` drain YuE jobs, stop the previous workload, verify
 both GPUs are free, start the worker (rank 1, `--headless`) and head (rank 0),
 then retarget Hermes after readiness. Single-node recipes such as
 `nemotron-super` and `qwen38` preserve their `nnodes=1` and TP=1 settings.
