@@ -102,3 +102,38 @@ real failed starts exercised diagnostics and cleanup before the successful run.
 - [NVIDIA R535 issue 4429264](https://docs.nvidia.com/datacenter/tesla/tesla-release-notes-535-183-01/index.html)
   describes a previous CUDA/CMA/RDMA interaction. It is precedent, not proof
   that this captured failure is the identical defect.
+
+## Resolution (2026-09-19): kho=off restores RDMA
+
+NVIDIA's forum mitigation for the kernel 7.0.0-1019 regression is disabling KHO:
+`/etc/default/grub.d/kho-off.cfg` containing
+`GRUB_CMDLINE_LINUX="$GRUB_CMDLINE_LINUX kho=off"`, then `sudo update-grub` and a
+reboot on both Sparks. After that `NCCL_NET = "IB"` (no Socket overrides)
+starts DS4 with no `ibv_reg_mr` failure. Same image and flags; 17-token prompt
+with 400 output tokens, and a 15k-token prefill:
+
+| Transport | decode c=1 | decode c=2 (aggregate) | 15k prefill |
+|---|---|---|---|
+| Socket | 21-23 tok/s | 38 tok/s | request failed (engine step timeout) |
+| RDMA (IB) | 43-44 tok/s | 69 tok/s | 7.5 s (~2000 tok/s) |
+
+### RDMA prefill and long-context results (2026-09-19)
+
+Single request, random-word prompts (no prefix-cache hits), `max_tokens=4`,
+`max_model_len` 1,048,576, KV cache 3,523,778 tokens (3.36x a full-context
+request). Reproduce with `tools/ds4_prefill_bench.py`.
+
+| Prompt tokens | Time | Prefill speed |
+|---|---|---|
+| 10,812 | 5.2 s | 2,063 tok/s |
+| 21,635 | 10.4 s | 2,081 tok/s |
+| 43,295 | 20.9 s | 2,068 tok/s |
+| 86,676 | 43.3 s | 2,000 tok/s |
+| 172,689 | 95.3 s | 1,811 tok/s |
+| 346,261 | 222.1 s | 1,559 tok/s |
+| 986,474 | 977.3 s (16.3 min) | 1,009 tok/s |
+
+The 986k-token request completed with no engine timeout, NCCL error or
+container restart; peak KV usage was 36.1%. Prefill speed holds near 2,000
+tok/s to ~87k tokens and falls as attention cost grows. Not tested: concurrent
+long requests, sustained soak, or long generation after a 1M prompt.

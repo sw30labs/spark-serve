@@ -69,16 +69,10 @@ hermes_context_length = 1048576
 notes = "KV fp8 OK. MTP 2. Do not cap at 32k."
 
 [models.ds4.env]
-# Verified recovery for GB10 RDMA long-term page migration failures.
-# Socket transport still uses the fast right-port QSFP interfaces.
-# Remove these model overrides only after validating a native RDMA remedy.
-NCCL_NET = "Socket"
-NCCL_IB_DISABLE = "1"
-NCCL_SOCKET_IFNAME = "=enp1s0f1np1,enP2p1s0f1np1"
-NCCL_SOCKET_NTHREADS = "2"
-NCCL_NSOCKS_PERTHREAD = "4"
-NCCL_BUFFSIZE = "1048576"
-NCCL_MAX_NCHANNELS = "8"
+# RDMA via [cluster.nccl]. On kernel 7.0.0-1019 this needs kho=off on both
+# Sparks (docs/ds4-startup-recovery.md); without it fall back to NCCL_NET = "Socket".
+NCCL_NET = "IB"
+NCCL_IB_DISABLE = "0"
 NCCL_DEBUG = "INFO"
 NCCL_NVLS_ENABLE = "0"
 HF_HOME = "/cache/huggingface"
