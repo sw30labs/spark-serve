@@ -49,6 +49,18 @@ cp models.example.toml models.toml   # then edit [cluster]
 
 `models.toml` is gitignored on purpose. Do not commit LAN IPs or SSH hostnames.
 
+## Model catalog
+
+| Model | Sparks | Catalog context | Recipe |
+|---|---:|---:|---|
+| DeepSeek-V4-Flash | 2 | 1M | [Startup and recovery](docs/ds4-startup-recovery.md) |
+| Nemotron-3-Super-120B NVFP4 | 1 | 262K | [Independent Spark setup](docs/nemotron-super.md) |
+| Qwen3.8-Flash-Next NVFP4 | 1 | 262K | [Text, images and tools](docs/qwen38-nvfp4.md) |
+| MiMo-V2.6-Flash-RL | 2 | 300K | [TP2, DFlash, official MXFP4 checkpoint](docs/mimo-v26-flash.md) |
+
+Context values are catalog limits. Each recipe records the extent of its local
+qualification; they are not guarantees for every workload at that size.
+
 ## Behaviour
 
 `up ds4` drain YuE jobs, stop the previous workload, verify
@@ -66,6 +78,11 @@ tools on one Spark. Run `./spark-serve pull qwen38` to prepare its pinned
 runtime and checkpoint, then `./spark-serve up qwen38`. It checks its assets
 before stopping the current model. See the [Qwen recipe](docs/qwen38-nvfp4.md)
 for setup, provenance and qualification details.
+
+MiMo-V2.6-Flash-RL serves the official MXFP4 checkpoint on both Sparks with a
+300K context. Run `./spark-serve pull mimo26`, then `./spark-serve up mimo26`.
+Preparation downloads the weights on the head and copies that tree to the worker.
+See the [MiMo recipe](docs/mimo-v26-flash.md).
 
 `up yue` starts two **independent** workers. Each can render a different song or
 take. This uses the existing SSH hosts and Mac app, while YuE keeps its own

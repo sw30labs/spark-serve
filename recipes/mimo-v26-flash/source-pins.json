@@ -1,0 +1,13 @@
+{
+  "model": "XiaomiMiMo/MiMo-V2.6-Flash-RL",
+  "revision": "5711b268169967567844e1e560e8a3966da959b1",
+  "base_image": "ghcr.io/tonyd2wild/vllm-glm53-flash@sha256:4def0ef644cb2e9814136dcffd5e385e21bc594f48f3b292234051904abe85a6",
+  "base_image_id": "sha256:35c6f70ffcba62fd67d7b9d4b4e8300ad177201792ce9cdb1ea18fd449bc23b6",
+  "local_image": "spark-serve-mimo-v26-flash:0.1.0",
+  "patch_upstream": "tonyd2wild/MiMo-V2.6-Flash-DGX-Spark-Recipe@13621bb3cc6fd30a94d53609320599d1f1134686",
+  "patch_sha256": {
+    "mimo_v2.py": "c70c5efd8bdac49679d8fe31763c861124780c931243fa2d701f25c970081ba4",
+    "mimo_v2_omni.py": "ccbf31bcfa6b18b77c8c58c31b2516b6f319250ab780e0b135c33740ce353ecd",
+    "triton_attn_diffkv.py": "23c030f76a928fdef44109abf8a84e055e6705d08fbb0439707063b8e5b45c8c"
+  }
+}

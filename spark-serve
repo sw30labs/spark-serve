@@ -1146,7 +1146,8 @@ def cmd_pull(cfg: dict, name: str, node: str | None = None) -> None:
     selected, hosts = placement(cfg, model, node)
     recipe = model.get("recipe")
     if recipe:
-        scripts = {"qwen38-nvfp4": "prepare_qwen38.py", "nemotron-super-nvfp4": "prepare_nemotron.py"}
+        scripts = {"qwen38-nvfp4": "prepare_qwen38.py", "nemotron-super-nvfp4": "prepare_nemotron.py",
+                   "mimo-v26-flash": "prepare_mimo26.py"}
         if recipe not in scripts:
             die(f"unknown preparation recipe {recipe!r} for {mid}")
         command = [

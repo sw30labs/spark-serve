@@ -19,7 +19,7 @@ container = "vllm_cluster"
 executor = "mp"
 ssh_opts = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=8"]
 keep_containers = []
-stop_names = ["vllm_cluster"]
+stop_names = ["vllm_cluster", "vllm_mimo"]
 
 # Independent YuE song/take workers (requires Artist Twin protocol-v2 factory).
 # Host names here must resolve from the Mac; SSH aliases need not resolve in HTTP.
@@ -273,4 +273,78 @@ args = [
   "{\"mode\":0,\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"cudagraph_capture_sizes\":[4,8,12,16,20,24]}",
   "--kv-cache-dtype",
   "fp8_e4m3",
+]
+
+
+# MiMo-V2.6-Flash-RL — official MXFP4/FP8 checkpoint, two Sparks, TP2.
+# Prepare: ./spark-serve pull mimo26
+# Weights download on the head, then one QSFP copy to the worker.
+# Playbook: docs/mimo-v26-flash.md. Catalog context is 300K, not the 1M architecture limit.
+# host_ip_* are the QSFP addresses. On a stock NVIDIA pair that is .10 and .11.
+[models.mimo26]
+aliases = ["mimo", "mimo-v2.6", "mimo-v2.6-flash", "mimo-flash"]
+label = "MiMo-V2.6-Flash-RL"
+image = "spark-serve-mimo-v26-flash:0.1.0"
+recipe = "mimo-v26-flash"
+hf_id = "XiaomiMiMo/MiMo-V2.6-Flash-RL"
+serve_path = "/cache/huggingface/spark-serve/mimo-v26-flash/XiaomiMiMo-MiMo-V2.6-Flash-RL"
+served_name = "mimo-v2.6-flash"
+wrapper = "vllm"
+container = "vllm_mimo"
+nnodes = 2
+tensor_parallel = 2
+hf_mount = "/cache/huggingface"
+drop_caches = true
+shm_size = "32g"
+docker_extra = ["--ulimit", "memlock=-1:-1", "--memory", "112g", "--memory-swap", "112g", "--cap-add", "IPC_LOCK"]
+ready_timeout = 3600
+max_model_len = 300000
+max_num_seqs = 8
+gpu_memory_utilization = 0.85
+hermes_provider = "spark"
+hermes_context_length = 300000
+hermes_supports_vision = true
+host_ip_head = "192.168.100.10"
+host_ip_worker = "192.168.100.11"
+preflight_args = ["/opt/spark-serve/mimo-v26-flash/verify.py", "/cache/huggingface/spark-serve/mimo-v26-flash/XiaomiMiMo-MiMo-V2.6-Flash-RL"]
+notes = "Two Sparks. Text, image, video, audio. Thinking off. 300K fp8 KV, DFlash 7, Marlin MoE, DeepGEMM off."
+
+[models.mimo26.env]
+HF_HOME = "/cache/huggingface"
+HF_HUB_OFFLINE = "1"
+TRANSFORMERS_OFFLINE = "1"
+VLLM_CACHE_ROOT = "/cache/huggingface/spark-serve/mimo-v26-flash/runtime-cache/vllm"
+XDG_CACHE_HOME = "/cache/huggingface/spark-serve/mimo-v26-flash/runtime-cache"
+TRITON_CACHE_DIR = "/cache/huggingface/spark-serve/mimo-v26-flash/runtime-cache/triton"
+VLLM_ENGINE_READY_TIMEOUT_S = "3600"
+VLLM_USE_DEEP_GEMM = "0"
+VLLM_ALLOW_LONG_MAX_MODEL_LEN = "1"
+TORCH_CUDA_ARCH_LIST = "12.1a"
+PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True"
+NCCL_IB_ROCE_VERSION_NUM = "2"
+NCCL_IB_ADDR_FAMILY = "AF_INET"
+NCCL_IB_ADDR_RANGE = "192.168.100.0/24"
+TORCH_NCCL_ASYNC_ERROR_HANDLING = "1"
+
+[models.mimo26.vllm]
+args = [
+  "--served-model-name", "mimo-v2.6-flash",
+  "--host", "0.0.0.0",
+  "--port", "8000",
+  "--trust-remote-code",
+  "--tensor-parallel-size", "2",
+  "--moe-backend", "marlin",
+  "--linear-backend", "auto",
+  "--max-model-len", "300000",
+  "--max-num-seqs", "8",
+  "--gpu-memory-utilization", "0.85",
+  "--kv-cache-dtype", "fp8",
+  "--no-async-scheduling",
+  "--speculative-config", "{\"method\":\"dflash\",\"model\":\"/cache/huggingface/spark-serve/mimo-v26-flash/XiaomiMiMo-MiMo-V2.6-Flash-RL/dflash\",\"num_speculative_tokens\":7}",
+  "--generation-config", "vllm",
+  "--override-generation-config", "{\"temperature\":1.0,\"top_p\":0.95,\"repetition_penalty\":1.05}",
+  "--reasoning-parser", "mimo",
+  "--tool-call-parser", "mimo",
+  "--enable-auto-tool-choice",
+  "--default-chat-template-kwargs", "{\"enable_thinking\":false}",
 ]

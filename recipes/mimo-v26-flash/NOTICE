@@ -1,0 +1,13 @@
+The files in patches/ are the MIT-licensed drop-in replacements from
+https://github.com/tonyd2wild/MiMo-V2.6-Flash-DGX-Spark-Recipe
+commit 13621bb3cc6fd30a94d53609320599d1f1134686
+Copyright (c) 2026 Tech2wild
+
+They replace three modules inside ghcr.io/tonyd2wild/vllm-glm53-flash:sm121-v11-dflash2
+so MiMo-V2.6-Flash-RL tensor-parallel 2 loads on GB10:
+
+- mimo_v2.py — fused FP8 QKV sharding at the checkpoint's TP, and FP8 KV cache_config
+- mimo_v2_omni.py — SupportsEagle3 so the bundled DFlash drafter can attach
+- triton_attn_diffkv.py — DiffKV attention accepts FP8 KV
+
+The upstream DFlash value-scale patch is not included. Their bench measured no change.
