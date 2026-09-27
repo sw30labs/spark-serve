@@ -1543,6 +1543,7 @@ def build_parser() -> argparse.ArgumentParser:
     bench_commands = bench.add_subparsers(dest="bench_cmd", required=True)
     bench_run = bench_commands.add_parser("run", help="run a bounded decode or prefill benchmark")
     bench_run.add_argument("--node", choices=["head", "worker"], required=True)
+    bench_run.add_argument("--allocation-id", help="reject admission if the selected allocation has changed")
     bench_run.add_argument("--kind", choices=["decode", "prefill"], default="decode")
     bench_run.add_argument("--concurrency", type=int, default=1)
     bench_run.add_argument("--requests", type=int, default=3, help="measured requests; warmup is recorded separately")
@@ -1645,6 +1646,7 @@ def main(argv: list[str] | None = None) -> None:
                         concurrency=args.concurrency, requests=args.requests,
                         max_tokens=args.max_tokens, prompt_tokens=args.prompt_tokens,
                         thinking=args.thinking, ssh_run=ssh_cmd,
+                        expected_allocation_id=args.allocation_id,
                     )
                 finally:
                     status_source.stop()

@@ -11,9 +11,11 @@ import fcntl
 import http.client
 import json
 import os
+import select
 from pathlib import Path
 import socket
 import statistics
+import sys
 import threading
 import time
 from urllib.parse import urlsplit, urlunsplit
@@ -25,10 +27,55 @@ DEADLINE_SECONDS = 300
 REQUEST_SECONDS = 120
 POLL_SECONDS = 0.2
 IDENTITY_SECONDS = 5
+EVENT_SECONDS = 2
 
 
 class BenchmarkCancelled(RuntimeError):
     pass
+
+
+class _EventWriter:
+    """Bound output backpressure without a queue or a second writer thread."""
+
+    def __init__(self):
+        self.failed = False
+
+    def __call__(self, event):
+        if self.failed:
+            return
+        data = json.dumps(event) + "\n"
+        try:
+            try:
+                fd = sys.stdout.fileno()
+            except (AttributeError, OSError):
+                # StringIO and other in-memory test streams have no descriptor.
+                sys.stdout.write(data)
+                sys.stdout.flush()
+                return
+            blocking = os.get_blocking(fd)
+            try:
+                os.set_blocking(fd, False)
+                remaining = memoryview(data.encode("utf-8"))
+                deadline = time.monotonic() + EVENT_SECONDS
+                while remaining:
+                    wait = deadline - time.monotonic()
+                    if wait <= 0 or not select.select([], [fd], [], wait)[1]:
+                        raise TimeoutError("Benchmark event consumer is not reading")
+                    try:
+                        written = os.write(fd, remaining)
+                    except BlockingIOError:
+                        continue
+                    if not written:
+                        raise BrokenPipeError("Benchmark event consumer closed")
+                    remaining = remaining[written:]
+            finally:
+                try:
+                    os.set_blocking(fd, blocking)
+                except OSError:
+                    pass
+        except BaseException:
+            self.failed = True
+            raise
 
 
 def _now():
@@ -211,11 +258,19 @@ def _stream_request(url, payload, timeout, check):
         check()
         conn.connect()
         transport = conn.sock
+        if interrupted:
+            raise interrupted[0]
+        if time.monotonic() - started >= timeout:
+            raise TimeoutError("Connection exhausted the request deadline")
         transport.settimeout(max(0.1, timeout - (time.monotonic() - started)))
         check()
         headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
         if os.environ.get("SPARK_API_KEY"):
             headers["Authorization"] = "Bearer " + os.environ["SPARK_API_KEY"]
+        if interrupted:
+            raise interrupted[0]
+        if time.monotonic() - started >= timeout:
+            raise TimeoutError("Request deadline exceeded before submission")
         conn.request("POST", urlunsplit(("", "", endpoint.path, "", "")),
                      body=json.dumps(payload).encode(), headers=headers)
         response = conn.getresponse()
@@ -286,7 +341,8 @@ def _prompt(size, nonce):
 
 
 def run_benchmark(cfg, status_fn, *, node, kind="decode", concurrency=1, requests=3,
-                  max_tokens=128, prompt_tokens=512, thinking=None, ssh_run=None, emit=None) -> int:
+                  max_tokens=128, prompt_tokens=512, thinking=None, ssh_run=None, emit=None,
+                  expected_allocation_id=None) -> int:
     """Run one bounded suite; status_fn() returns fresh collect_status(cfg)."""
     from spark_serve_controller import ControllerError
     if kind not in ("decode", "prefill"):
@@ -301,7 +357,7 @@ def run_benchmark(cfg, status_fn, *, node, kind="decode", concurrency=1, request
         raise ControllerError("prefill sweeps run one request at a time")
     if thinking is not None and not isinstance(thinking, bool):
         raise ControllerError("thinking must be true, false, or server default")
-    emit = emit or (lambda event: print(json.dumps(event), flush=True))
+    emit = emit or _EventWriter()
     controller = _controller(cfg, ssh_run)
     root = controller.directory
     run_id = uuid.uuid4().hex
@@ -311,6 +367,8 @@ def run_benchmark(cfg, status_fn, *, node, kind="decode", concurrency=1, request
                [max(32, round(prompt_tokens * (i + 1) / requests)) for i in range(requests)])
     with controller.lock():
         identity = _identity(cfg, status_fn(), controller.node_states(), node)
+        if expected_allocation_id is not None and identity["allocation"]["id"] != expected_allocation_id:
+            raise ControllerError("Selected allocation changed before benchmark admission; select it again")
         model = cfg["models"][identity["model"]]
         if concurrency > int(model.get("max_num_seqs") or 4):
             raise ControllerError("benchmark concurrency exceeds the model scheduler limit")
@@ -353,6 +411,8 @@ def run_benchmark(cfg, status_fn, *, node, kind="decode", concurrency=1, request
     deadline = started + DEADLINE_SECONDS
     ended = threading.Event()
     invalid = []
+    completion_times = []
+    output_failed = False
 
     def check():
         if invalid:
@@ -405,6 +465,8 @@ def run_benchmark(cfg, status_fn, *, node, kind="decode", concurrency=1, request
         except Exception as exc:
             record.update(passed=False, cancelled=isinstance(exc, BenchmarkCancelled),
                           error=f"{type(exc).__name__}: {exc}")
+        if not warmup:
+            completion_times.append(time.monotonic())
         return record
 
     measurement_started = None
@@ -436,7 +498,8 @@ def run_benchmark(cfg, status_fn, *, node, kind="decode", concurrency=1, request
         run["finished_at"] = _now()
         run["elapsed_seconds"] = round(time.monotonic() - started, 4)
         run["results"].sort(key=lambda r: r["index"])
-        run["summary"] = _summary(run["results"], time.monotonic() - measurement_started if measurement_started else 0)
+        measured_wall = max(completion_times) - measurement_started if completion_times and measurement_started is not None else 0
+        run["summary"] = _summary(run["results"], measured_wall)
         try:
             _save(root / "benchmarks" / (run_id + ".json"), run)
         finally:
@@ -446,5 +509,10 @@ def run_benchmark(cfg, status_fn, *, node, kind="decode", concurrency=1, request
             lease_lock.close()
             lease_path.unlink(missing_ok=True)
             lease_path.with_suffix(".lock").unlink(missing_ok=True)
-        emit({"event": "result", "run": run})
-    return 0 if run["status"] == "completed" else 1
+        try:
+            emit({"event": "result", "run": run})
+        except (OSError, KeyboardInterrupt):
+            # History and lease cleanup already completed. Never bounce a broken
+            # output channel into the CLI error path, which writes to stdout too.
+            output_failed = True
+    return 0 if run["status"] == "completed" and not output_failed else 1

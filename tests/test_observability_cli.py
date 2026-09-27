@@ -44,12 +44,14 @@ def test_benchmark_forwards_explicit_target_and_server_default_thinking(cfg, mon
 
     run = Mock(return_value=0)
     monkeypatch.setattr(spark_serve_benchmarks, "run_benchmark", run)
-    cli.main(["bench", "run", "--node", "worker", "--kind", "prefill", "--concurrency", "2", *flag])
+    cli.main(["bench", "run", "--node", "worker", "--kind", "prefill", "--concurrency", "2",
+              "--allocation-id", "selected-allocation", *flag])
     assert run.call_args.args[0] is cfg
     assert run.call_args.kwargs["node"] == "worker"
     assert run.call_args.kwargs["thinking"] is thinking
     assert run.call_args.kwargs["concurrency"] == 2
     assert run.call_args.kwargs["kind"] == "prefill"
+    assert run.call_args.kwargs["expected_allocation_id"] == "selected-allocation"
 
 
 def test_benchmark_exit_status_is_preserved(cfg, monkeypatch):

@@ -101,6 +101,15 @@ def test_changed_container_identity_rejects_admission(setup, monkeypatch):
         bench.run_benchmark(cfg, lambda: status, node="head")
 
 
+def test_selected_allocation_replaced_before_admission_never_sends_request(setup, monkeypatch):
+    cfg, status, _, _ = setup
+    request = Mock()
+    monkeypatch.setattr(bench, "_stream_request", request)
+    with pytest.raises(ControllerError, match="Selected allocation changed"):
+        bench.run_benchmark(cfg, lambda: status, node="head", expected_allocation_id="previous-allocation")
+    request.assert_not_called()
+
+
 def test_shared_allocation_benchmarks_head_once_and_leases_both_hosts(setup, monkeypatch):
     cfg, status, owners, root = setup
     for owner in owners.values():
@@ -250,3 +259,92 @@ def test_failed_history_write_still_releases_client_lease(setup, monkeypatch):
     with pytest.raises(OSError, match="disk full"):
         bench.run_benchmark(cfg, lambda: status, node="head", emit=lambda e: None)
     assert not list((root / "benchmarks" / "leases").glob("*.json"))
+
+
+def test_progress_output_delay_is_not_charged_to_measurement(setup, monkeypatch):
+    cfg, status, _, _ = setup
+    clock = [0.0]
+    monkeypatch.setattr(bench.time, "monotonic", lambda: clock[0])
+    def request(*args):
+        clock[0] += 1
+        return response()
+    def emit(event):
+        if event["event"] == "progress":
+            clock[0] += 100  # Simulate a slow GUI/event consumer after completion.
+    monkeypatch.setattr(bench, "_stream_request", request)
+    assert bench.run_benchmark(cfg, lambda: status, node="head", requests=1, emit=emit) == 0
+    report = bench.list_benchmarks(cfg)[0]
+    assert report["summary"]["wall_seconds"] == 1
+    assert report["summary"]["aggregate_completion_tokens_per_second_end_to_end"] == 100
+    assert report["elapsed_seconds"] == 102
+
+
+def test_final_output_failure_is_not_rethrown_after_history_and_cleanup(setup, monkeypatch):
+    cfg, status, _, root = setup
+    monkeypatch.setattr(bench, "_stream_request", lambda *a: response())
+    def emit(event):
+        if event["event"] == "result":
+            raise BrokenPipeError("closed consumer")
+    assert bench.run_benchmark(cfg, lambda: status, node="head", requests=1, emit=emit) == 1
+    assert bench.list_benchmarks(cfg)[0]["status"] == "completed"
+    assert not list((root / "benchmarks" / "leases").glob("*.json"))
+
+
+@pytest.mark.parametrize("terminate", [False, True])
+def test_unread_stdout_does_not_hold_lease_or_block_exit(setup, terminate):
+    import os
+    import subprocess
+    import sys
+    cfg, status, _, root = setup
+    code = '''import json, signal, sys
+import spark_serve_benchmarks as bench
+cfg, status = json.loads(sys.argv[1])
+cfg["models"]["m"]["image"] = "x" * 1000000
+bench.EVENT_SECONDS = 0.1 if sys.argv[2] == "false" else 2
+
+def interrupt(*args): raise KeyboardInterrupt()
+signal.signal(signal.SIGTERM, interrupt)
+def unexpected(*args): raise AssertionError("No inference should run with blocked initial output")
+bench._stream_request = unexpected
+raise SystemExit(bench.run_benchmark(cfg, lambda: status, node="head"))
+'''
+    process = subprocess.Popen([sys.executable, "-c", code, json.dumps([cfg, status]), str(terminate).lower()],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+    try:
+        if terminate:
+            deadline = time.time() + 2
+            while not list((root / "benchmarks" / "leases").glob("*.json")) and time.time() < deadline:
+                time.sleep(.01)
+            time.sleep(.05)
+            process.terminate()
+        assert process.wait(timeout=3) == 1
+        assert not list((root / "benchmarks" / "leases").glob("*.json"))
+        report = bench.list_benchmarks(cfg)[0]
+        assert report["status"] == ("cancelled" if terminate else "failed")
+        assert report["warmup"] is None
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=1)
+        process.stdout.close()
+        process.stderr.close()
+
+
+def test_late_connection_never_posts_after_request_deadline(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(bench.time, "monotonic", lambda: clock[0])
+    connection = FakeConnection(stream_body())
+    connection.connect = lambda: clock.__setitem__(0, 2.0)
+    connection.request = Mock()
+    monkeypatch.setattr(bench.http.client, "HTTPConnection", lambda *a, **k: connection)
+    with pytest.raises(TimeoutError, match="Connection exhausted"):
+        bench._stream_request("http://spark-a:8000/v1", {}, 1, lambda: None)
+    connection.request.assert_not_called()
+
+
+def test_default_event_writer_supports_in_memory_stream(monkeypatch):
+    output = io.StringIO()
+    monkeypatch.setattr(bench.sys, "stdout", output)
+    bench._EventWriter()({"event": "test"})
+    assert json.loads(output.getvalue()) == {"event": "test"}
