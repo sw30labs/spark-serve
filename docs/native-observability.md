@@ -6,6 +6,11 @@ allocations. **Models** retains placement, start/stop, and Hermes selection.
 **Benchmarks** exercises an already-serving allocation and stores its results
 locally. Selecting Hermes does not select or move the monitored workload.
 
+Rationale: [native app boundary](adr/0001-native-app-cli.md),
+[telemetry](adr/0006-ephemeral-telemetry.md),
+[benchmark method](adr/0007-inference-benchmark-method.md), and
+[benchmark leases](adr/0008-benchmark-leases.md).
+
 Build and open the native app on an Apple Silicon Mac running **macOS 13 or
 newer**, with Command Line Tools installed. Quit any running copy before
 rebuilding, then run these commands from the repository root:
@@ -15,9 +20,9 @@ make -f gui/Makefile
 open gui/SparkServeApp.app
 ```
 
-Monitoring starts automatically in Overview. Use Models to manage workloads,
-then choose a ready allocation in Benchmarks to run a decode test or prefill
-sweep. The app uses `watch` and `bench` from the same Python CLI described below.
+Monitoring starts with the app and stays active across tabs. Use Models to
+manage workloads, then choose a ready allocation in Benchmarks to run a decode
+test or prefill sweep. The app uses the same CLI `watch` and `bench` commands.
 The [README screenshots](../README.md#screenshots) show the current interface
 with synthetic demo data captured September 26, 2026, not hardware performance
 measurements.
@@ -52,10 +57,10 @@ cards. Independent models have independent endpoints and metric streams.
 Resource metrics still exist when a node is idle or running YuE.
 
 Inference metrics are fetched from the allocation endpoint's `/metrics`
-(NIM uses `/v1/metrics`, with a fallback when that path is absent):
+(NIM uses `/v1/metrics`, falling back to `/metrics` only after HTTP 404):
 
 - Running and waiting requests, and KV-cache utilization are current gauges.
-- Prompt tokens/s, generated tokens/s, and completed requests/s are counter
+- Prompt tokens/s, generated tokens/s, and successful requests/s are counter
   deltas over the adjacent scrape interval.
 - TTFT and time per output token are histogram **means over that interval**,
   not lifetime averages or percentiles.
@@ -69,6 +74,10 @@ OpenAI compatibility alone does not establish metric support. Resource
 monitoring still works when inference metrics are unavailable.
 
 ## Benchmarks
+
+These are HTTP inference tests. [YuE capacity experiments](worker-concurrency-benchmark.md)
+launch isolated containers and hold lifecycle locks throughout; they use a
+different execution contract.
 
 Benchmarks send synthetic requests to an already-ready managed allocation.
 They do not change model placement, launch a model, or retarget Hermes.
@@ -86,6 +95,10 @@ explicitly selected. Use the same setting when comparing runs. Prompt sizes
 are synthetic targets; saved **server-reported token usage** is authoritative.
 Streaming chunks are never counted as tokens. A server that omits usage cannot
 produce a successful throughput result.
+
+Benchmark TTFT is client-observed first visible content. First model output is
+recorded separately and includes reasoning. These differ from the server
+histogram latencies shown in live monitoring.
 
 Warmup is recorded separately from measured requests. End-to-end throughput
 includes prefill and client/network overhead. A post-first-output estimate,

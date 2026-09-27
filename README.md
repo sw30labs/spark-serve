@@ -23,6 +23,8 @@ allocation cards, and saved decode/prefill benchmarks. See
 [native monitoring and benchmarks](docs/native-observability.md) for metric
 definitions, cancellation behavior, and CLI usage.
 
+Design rationale: [architecture decisions](docs/adr/README.md).
+
 <p align="center">
   <a href="docs/screenshots/native-overview.jpg">
     <img src="docs/screenshots/native-overview.jpg" alt="Spark Serve Overview with physical Spark resource charts and logical model allocations, using synthetic demo data" width="900">
@@ -43,8 +45,8 @@ cp models.example.toml models.toml   # then edit [cluster]
 ## Setup
 
 1. Two Sparks with SSH aliases for head and worker (`BatchMode=yes`).
-2. Python 3.11+ on the Mac (`tomllib`), plus `python3` on each Spark for live
-   resource monitoring. The CLI re-execs `~/miniconda3/bin/python3` if
+2. Python 3.11+ on the Mac (`tomllib`) and each Spark for live resource
+   monitoring. The CLI re-execs `~/miniconda3/bin/python3` if
    `/usr/bin/python3` is too old.
 3. Copy `models.example.toml` → `models.toml` and set:
 
@@ -115,8 +117,8 @@ under `~/.local/state/spark-serve/diagnostics/startup-*/failure.json` (or the
 configured state directory) and shown in the app's boot log. The green model
 check appears only after readiness; controls stay busy through cleanup.
 
-See [DeepSeek startup recovery](docs/ds4-startup-recovery.md) for the verified
-QSFP Socket transport workaround and validation results.
+See [DeepSeek startup recovery](docs/ds4-startup-recovery.md) for RDMA recovery,
+the QSFP Socket fallback and validation results.
 
 `reboot` drains like `stop`, then reboots both hosts with
 `/usr/bin/systemctl reboot --no-block`. It uses passwordless sudo when that
@@ -227,8 +229,8 @@ The window has three tabs:
   power, and network/disk rates for each physical Spark, plus inference metrics
   for each logical model allocation. A model shared across both Sparks has one
   inference endpoint.
-- **Models** controls placement, preparation, start/stop, and Hermes selection.
-  Startup progress and failures remain visible in the activity log.
+- **Models** controls placement, start/stop, and Hermes selection. Prepare
+  models with CLI `pull`; startup progress and failures appear in the activity log.
 - **Benchmarks** runs bounded decode tests and prefill sweeps against a ready
   managed allocation, with reasoning settings, cancellation, saved history, and
   comparison of two runs. Warmup is separate; token counts come from the server.

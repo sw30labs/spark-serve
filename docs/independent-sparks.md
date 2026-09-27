@@ -1,5 +1,8 @@
 # Independent workloads on two Sparks
 
+Rationale: [node allocations](adr/0002-node-allocations.md) and
+[fenced lifecycle transitions](adr/0003-fenced-lifecycle.md).
+
 Each Spark can serve its own single-node model. The initial pairing is
 Qwen3.8-Flash-Next NVFP4 on the configured head and Nemotron-3-Super NVFP4 on the
 configured worker. Both use port 8000 on their respective machines. They have

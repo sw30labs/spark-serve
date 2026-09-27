@@ -1,5 +1,9 @@
 # YuE worker concurrency experiment
 
+Rationale: [isolated capacity experiments](adr/0009-yue-capacity-experiments.md).
+This workflow holds lifecycle locks throughout. Native [decode/prefill benchmarks](native-observability.md#benchmarks)
+exercise an existing HTTP server using revocable leases instead.
+
 ## Architecture reconnaissance
 
 Spark Serve is a Mac CLI/SwiftUI workload controller, not the YuE inference
@@ -41,11 +45,11 @@ admission rejections rather than GPU capacity.
 
 ## Experimental boundary
 
-The experiment will use a separate dispatcher with isolated job directories and
-benchmark-specific container identities. It will reuse the deployed runtime,
+The experiment uses a separate dispatcher with isolated job directories and
+benchmark-specific container identities. It reuses the deployed runtime,
 image digest, model settings, and integrity validation. The production factory
-will be drained, active jobs allowed to finish, and node ownership held for the
-experiment. No production capacity or network configuration will change.
+is drained, active jobs finish, and node ownership is held for the experiment.
+Production capacity and network configuration remain unchanged.
 
 Here concurrency means simultaneously running independent inference containers
 on one physical Spark. This is the process topology that a future multi-job
