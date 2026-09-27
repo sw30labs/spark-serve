@@ -17,6 +17,11 @@ port 8000. Distributed models expose their endpoint on the head.
 YuE uses one HTTP worker per Spark on port 8011. All SSH / Docker / NCCL work lives in the Python CLI. The GUI is a thin
 `Process` wrapper around that CLI.
 
+The same native app includes live resource and inference metrics, topology-aware
+allocation cards, and saved decode/prefill benchmarks. See
+[native monitoring and benchmarks](docs/native-observability.md) for metric
+definitions, cancellation behavior, and CLI usage.
+
 <p align="center">
   <a href="docs/screenshots/qwen-nemotron-serving.png">
     <img src="docs/screenshots/qwen-nemotron-serving.png" alt="Spark Serve showing Qwen on sparkone and Nemotron on sparktwo, both serving, with Hermes using Qwen" width="720">

@@ -136,6 +136,24 @@ def test_two_model_endpoints_are_independently_ready(monkeypatch, tmp_path):
     assert result["nodes"][1]["url"] == "http://second.lan:8000"
 
 
+def test_status_exposes_allocation_and_container_identity_separate_from_runtime(monkeypatch, tmp_path):
+    cfg, _ = setup_status(monkeypatch, tmp_path)
+    cfg["models"]["nemotron"]["wrapper"] = "nim"
+    head, worker = cli.collect_status(cfg)["nodes"]
+    assert head["runtime"] == "vllm"
+    assert worker["runtime"] == "nim"
+    assert worker["backend"] == "vllm"  # Lifecycle mode is distinct from engine.
+    assert worker["allocation_id"] == "second"
+    assert worker["container_ids"] == ["second-immutable"]
+
+
+def test_distributed_status_exposes_shared_allocation_with_distinct_container_ids(monkeypatch, tmp_path):
+    cfg, _ = setup_status(monkeypatch, tmp_path, distributed=True, second_id=None)
+    head, worker = cli.collect_status(cfg)["nodes"]
+    assert head["allocation_id"] == worker["allocation_id"] == "group"
+    assert head["container_ids"] != worker["container_ids"]
+
+
 @pytest.mark.parametrize("phase,served", [("failed", "nemotron"), ("ready", "wrong-model")])
 def test_worker_failure_or_wrong_identity_does_not_hide_healthy_head(monkeypatch, tmp_path, phase, served):
     cfg, _ = setup_status(monkeypatch, tmp_path, second_phase=phase, second_id=served)
