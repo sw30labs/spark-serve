@@ -824,6 +824,10 @@ print(json.dumps({"listening_ports": listening, "containers": [{"id": c["Id"], "
         launch_hosts = selected[:1] if model is not None and nnodes == 1 else selected
         with self.lock():
             self._check_scope(selected)
+            # Admission and revocation share this lock. A benchmark never holds
+            # it while generating, so lifecycle operations can always cancel it.
+            from spark_serve_benchmarks import revoke_benchmarks
+            revoke_benchmarks(self.directory, selected)
             self.operation_hosts = selected
             generation = str(uuid.uuid4())
             self.operation_generation = generation
