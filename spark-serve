@@ -708,8 +708,13 @@ def collect_status(cfg: dict) -> dict:
         if assignments and assigned.get("mode") in ("none", "yue", "unknown"):
             valid = False
         foreign = served if served and (not model or not owned or served != model.get("served_name")) else None
+        wrapper = (model or {}).get("wrapper", "vllm")
+        runtime = ("yue" if assigned.get("mode") == "yue" else
+                   ("vllm" if wrapper in ("vllm", "dsv4") else wrapper) if model else None)
         return {"node": node, "host": host, "url": node_url(cfg, node), "ready": valid,
                 "served": served, "model": mid, "backend": assigned.get("mode") or "vllm",
+                "runtime": runtime, "allocation_id": assigned.get("allocation_id"),
+                "container_ids": sorted(item["id"] for item in owned if item.get("id")),
                 "phase": assigned.get("phase") or ("ready" if valid else "unmanaged"),
                 "error": error or assigned.get("error"), "containers": containers,
                 "ours_running": bool(owned), "port_busy": bool(ids), "foreign_served": foreign,
