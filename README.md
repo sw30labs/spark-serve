@@ -14,8 +14,9 @@ serving backend.
 
 Each single-node model exposes an OpenAI-compatible endpoint on its Spark's LAN
 port 8000. Distributed models expose their endpoint on the head.
-YuE uses one HTTP worker per Spark on port 8011. All SSH / Docker / NCCL work lives in the Python CLI. The GUI is a thin
-`Process` wrapper around that CLI.
+YuE uses one HTTP worker per Spark on port 8011. The SwiftUI app uses the Python
+CLI for workload control, live monitoring, and benchmarks. SSH, Docker, and NCCL
+operations stay in that CLI.
 
 The same native app includes live resource and inference metrics, topology-aware
 allocation cards, and saved decode/prefill benchmarks. See
@@ -23,10 +24,10 @@ allocation cards, and saved decode/prefill benchmarks. See
 definitions, cancellation behavior, and CLI usage.
 
 <p align="center">
-  <a href="docs/screenshots/qwen-nemotron-serving.png">
-    <img src="docs/screenshots/qwen-nemotron-serving.png" alt="Spark Serve showing Qwen on sparkone and Nemotron on sparktwo, both serving, with Hermes using Qwen" width="720">
+  <a href="docs/screenshots/native-overview.jpg">
+    <img src="docs/screenshots/native-overview.jpg" alt="Spark Serve Overview with physical Spark resource charts and logical model allocations, using synthetic demo data" width="900">
   </a><br>
-  <em>Qwen and Nemotron serving independently on two Sparks, with Hermes connected to Qwen.</em>
+  <em>Native Overview, captured September 26, 2026. Synthetic demo data illustrates the interface; these values are not hardware performance measurements.</em>
 </p>
 
 ```
@@ -42,8 +43,9 @@ cp models.example.toml models.toml   # then edit [cluster]
 ## Setup
 
 1. Two Sparks with SSH aliases for head and worker (`BatchMode=yes`).
-2. Python 3.11+ on the Mac (`tomllib`). The CLI re-execs `~/miniconda3/bin/python3`
-   if `/usr/bin/python3` is too old.
+2. Python 3.11+ on the Mac (`tomllib`), plus `python3` on each Spark for live
+   resource monitoring. The CLI re-execs `~/miniconda3/bin/python3` if
+   `/usr/bin/python3` is too old.
 3. Copy `models.example.toml` → `models.toml` and set:
 
    - `head` / `worker` — SSH hostnames
@@ -209,75 +211,122 @@ NCCL / UCX in the example catalog are pinned to the right-port QSFP rails
 
 ## GUI
 
-Menu-bar + window app. It shells out to this CLI (`list` / `status` / `up` /
-`stop` / `reboot`); it does not speak SSH itself. The YuE card and per-worker status show
-readiness, draining, and active work. The regular Stop preserves active renders;
-“Cancel jobs & stop” is a separate confirmed action. **Restart Sparks** drains,
-then reboots both hosts (`systemctl reboot --no-block`) and waits for SSH.
-Passwordless `/usr/bin/systemctl` is used when sudoers already allows it; otherwise
-the confirmation sheet’s sudo password is passed on stdin for that reboot only
-and is not stored. This tool does not add or weaken sudoers rules. After reboot,
-press Start if you want a catalog model again. It never kills a running CLI
-transition merely to launch another one.
+The native SwiftUI menu-bar and window app requires **macOS 13 or newer** on an
+Apple Silicon Mac and Command Line Tools (`swiftc`); full Xcode is not needed.
+Quit any running copy of Spark Serve, then build and open it from the repository
+root:
 
-```
-make -C gui
+```sh
+make -f gui/Makefile
 open gui/SparkServeApp.app
 ```
 
-CLI path is resolved from the app bundle (`repo/gui/SparkServeApp.app` → repo)
-or `SPARK_SERVE_HOME`. The app's `PATH` includes `~/miniconda3/bin` so the
-`python3` shebang works under a GUI environment.
+The window has three tabs:
 
-Requires Command Line Tools (`swiftc`); full Xcode is not needed.
+- **Overview** shows CPU and GPU utilization charts, memory use, temperature,
+  power, and network/disk rates for each physical Spark, plus inference metrics
+  for each logical model allocation. A model shared across both Sparks has one
+  inference endpoint.
+- **Models** controls placement, preparation, start/stop, and Hermes selection.
+  Startup progress and failures remain visible in the activity log.
+- **Benchmarks** runs bounded decode tests and prefill sweeps against a ready
+  managed allocation, with reasoning settings, cancellation, saved history, and
+  comparison of two runs. Warmup is separate; token counts come from the server.
+
+The app invokes this CLI (`list`, `status`, `watch`, `bench`, `up`, `stop`, and
+`reboot`) and does not speak SSH itself. Live monitoring starts with the app and
+stops when it quits. Benchmarks start only when requested. The same interfaces
+are available directly:
+
+```sh
+./spark-serve watch --json   # Ctrl-C to stop monitoring
+./spark-serve bench run --node head --kind decode --requests 3 --json
+./spark-serve bench list --json
+```
+
+See [native monitoring and benchmarks](docs/native-observability.md) for metric
+semantics, limits, saved results, and cancellation behavior.
+
+The YuE card and per-worker status show readiness, draining, and active work.
+Regular Stop preserves active renders; “Cancel jobs & stop” is a separate
+confirmed action. **Restart Sparks** drains, reboots both hosts
+(`systemctl reboot --no-block`), and waits for SSH. Passwordless
+`/usr/bin/systemctl` is used when sudoers already allows it; otherwise the
+confirmation sheet’s sudo password is passed on stdin for that reboot only
+and is not stored. This tool does not add or weaken sudoers rules. After reboot,
+press Start to launch a catalog model again. A running CLI transition completes
+before another one can begin.
+
+The CLI path is resolved from the app bundle (`repo/gui/SparkServeApp.app` →
+repo) or `SPARK_SERVE_HOME`. The app's `PATH` includes `~/miniconda3/bin` so the
+`python3` shebang works under a GUI environment.
 
 ### Screenshots
 
-Captured September 13, 2026. Screenshots display at reduced widths; click any
-image, including the overview above, to open the original at full resolution.
+The Overview above and Benchmarks below were captured from the native app on
+**September 26, 2026**, using **synthetic demo data**. They illustrate the
+interface and do not report hardware performance measurements. Click an image
+to open it at full resolution.
 
 <p align="center">
-  <a href="docs/screenshots/nemotron-starting.png">
-    <img src="docs/screenshots/nemotron-starting.png" alt="Qwen remains serving on sparkone while Nemotron starts on sparktwo, with startup progress in the activity log" width="420">
+  <a href="docs/screenshots/native-benchmarks.jpg">
+    <img src="docs/screenshots/native-benchmarks.jpg" alt="Spark Serve Benchmarks tab with decode and prefill controls, saved runs, and a decode result using synthetic demo data" width="900">
   </a><br>
-  <em>Starting Nemotron on sparktwo while Qwen continues serving on sparkone.</em>
+  <em>Native Benchmarks: configure a test, select a saved run, and inspect latency and token rates. Synthetic demo data, September 26, 2026.</em>
 </p>
 
 <p align="center">
-  <a href="docs/screenshots/hermes-qwen-session.png">
-    <img src="docs/screenshots/hermes-qwen-session.png" alt="Hermes terminal session using Qwen3.8-Flash-Next, showing tool-call progress and context usage" width="720">
+  <a href="docs/screenshots/native-prefill.jpg">
+    <img src="docs/screenshots/native-prefill.jpg" alt="Saved prefill result with a context sweep chart of prompt tokens against first model output latency, using synthetic demo data" width="900">
   </a><br>
-  <em>A Hermes session using Qwen3.8-Flash-Next, with tool-call progress and context usage visible.</em>
+  <em>Prefill context sweep and saved request statistics. Synthetic demo data, September 26, 2026.</em>
+</p>
+
+#### Earlier model-control screenshots — September 13, 2026
+
+These earlier captures show independent model control and Hermes sessions.
+They predate the Overview and Benchmarks tabs.
+
+<p align="center">
+  <a href="docs/screenshots/qwen-nemotron-serving.png">
+    <img src="docs/screenshots/qwen-nemotron-serving.png" alt="Earlier Spark Serve model controls showing Qwen and Nemotron serving independently, with Hermes using Qwen" width="720">
+  </a><br>
+  <em>Qwen and Nemotron serving independently on two Sparks, with Hermes connected to Qwen.</em>
+</p>
+
+<p align="center">
+  <a href="docs/screenshots/nemotron-starting.png">
+    <img src="docs/screenshots/nemotron-starting.png" alt="Earlier Spark Serve model controls showing Qwen remaining available while Nemotron starts on the second Spark" width="420">
+  </a><br>
+  <em>Starting Nemotron on the second Spark while Qwen continues serving on the first.</em>
 </p>
 
 <p align="center">
   <a href="docs/screenshots/hermes-qwen-nemotron-sessions.png">
-    <img src="docs/screenshots/hermes-qwen-nemotron-sessions.png" alt="Two Hermes terminals: Qwen3.8-Flash-Next working on a coding task above, and Nemotron-3-Super answering a story prompt below" width="720">
+    <img src="docs/screenshots/hermes-qwen-nemotron-sessions.png" alt="Two Hermes terminals using Qwen for a coding task and Nemotron for a story prompt" width="720">
   </a><br>
   <em>Two Hermes sessions: Qwen working on a coding task above, and Nemotron answering a story prompt below.</em>
 </p>
 
-<p align="center">
-  <a href="docs/screenshots/nvidia-sync-two-sparks.png">
-    <img src="docs/screenshots/nvidia-sync-two-sparks.png" alt="NVIDIA Sync dashboard showing separate memory, GPU activity, temperature and power readings for sparkone and sparktwo" width="720">
-  </a><br>
-  <em>NVIDIA Sync tracks memory use and recent GPU activity separately for each Spark.</em>
-</p>
+## Acknowledgments
 
-<p align="center">
-  <a href="docs/screenshots/macos-dock.png">
-    <img src="docs/screenshots/macos-dock.png" alt="macOS Dock with local app shortcuts" width="560">
-  </a><br>
-  <em>macOS Dock with local app shortcuts.</em>
-</p>
+Thanks to [sparkDash](https://github.com/MiaAI-Lab/sparkDash) by
+[Mia'a AI Lab](https://x.com/MiaAI_lab) for inspiring Spark Serve's live resource
+and inference metrics, decode/prefill benchmark workflow, and topology overview.
+Spark Serve implements these ideas in SwiftUI and its existing Python CLI,
+using its own telemetry and streaming protocol code.
 
 ## Offline verification
 
 ```sh
-python3 -m unittest discover -s tests -v
+python3 -m pytest tests -q
+make -f gui/Makefile smoke
 ```
 
 Fault-injection tests cover concurrent controllers, lost/offline ownership,
 legacy migration, active-job draining, explicit cancellation, stale generations,
 misrouted health, partial starts, exact-container cleanup, protected services,
-and preservation of single-node/distributed vLLM recipes. They use no network or GPU.
+and preservation of single-node/distributed vLLM recipes. Monitoring and benchmark
+tests cover counter resets, stale data, cancellation, token accounting, and
+bounded process cleanup. The native smoke test checks the Python-to-Swift data
+contract. These checks submit no inference requests and change no Spark workloads.

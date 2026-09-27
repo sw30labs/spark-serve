@@ -6,6 +6,22 @@ allocations. **Models** retains placement, start/stop, and Hermes selection.
 **Benchmarks** exercises an already-serving allocation and stores its results
 locally. Selecting Hermes does not select or move the monitored workload.
 
+Build and open the native app on an Apple Silicon Mac running **macOS 13 or
+newer**, with Command Line Tools installed. Quit any running copy before
+rebuilding, then run these commands from the repository root:
+
+```sh
+make -f gui/Makefile
+open gui/SparkServeApp.app
+```
+
+Monitoring starts automatically in Overview. Use Models to manage workloads,
+then choose a ready allocation in Benchmarks to run a decode test or prefill
+sweep. The app uses `watch` and `bench` from the same Python CLI described below.
+The [README screenshots](../README.md#screenshots) show the current interface
+with synthetic demo data captured September 26, 2026, not hardware performance
+measurements.
+
 ## Live metrics
 
 ```sh
@@ -94,11 +110,12 @@ partial evidence rather than appearing successful.
 
 ## Scope and provenance
 
-Spark-Dash's resource visibility, benchmark workflow, and topology presentation
-informed this integration. The implementation reuses Spark Serve's own
-telemetry and streaming protocol code, with native SwiftUI views and Python
-stdlib collectors. There is no second dashboard app, webview, Node server, or
-additional lifecycle controller.
+Thanks to [sparkDash](https://github.com/MiaAI-Lab/sparkDash) by
+[Mia'a AI Lab](https://x.com/MiaAI_lab) for the ideas behind live resource and
+inference metrics, the decode/prefill benchmark workflow, and the topology
+overview. Spark Serve implements these ideas with native SwiftUI views and
+Python stdlib collectors, reusing its own telemetry and streaming protocol
+code. Workload ownership remains with the existing Spark Serve controller.
 
 ## Development checks
 
