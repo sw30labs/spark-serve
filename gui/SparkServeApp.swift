@@ -29,6 +29,7 @@ struct YueWorker: Codable, Identifiable {
 }
 
 struct Container: Codable {
+    let id: String?
     let name: String
     let state: String
     let image: String
@@ -44,6 +45,8 @@ struct SparkNodeStatus: Codable, Identifiable {
     let served: String?
     let model: String?
     let backend: String?
+    let runtime: String?
+    let allocation_id: String?
     let phase: String?
     let error: String?
     let containers: [Container]
@@ -53,7 +56,7 @@ struct SparkNodeStatus: Codable, Identifiable {
     let allocation_hosts: [String]
     let can_use: Bool?
 
-    var sharedModel: Bool { backend == "vllm" && allocation_hosts.count > 1 }
+    var sharedModel: Bool { backend != "yue" && allocation_hosts.count > 1 }
     var canUseInHermes: Bool {
         ready && (can_use ?? (backend == "vllm" && (!sharedModel || node == "head")))
     }
@@ -154,7 +157,12 @@ final class CLIRunner: ObservableObject {
 
     private let home: URL?
     private let cliPath: String
+    let telemetry: TelemetryStore
+    let benchmarks: BenchmarkStore
     private var pollTimer: Timer?
+    private var refreshInFlight = false
+    private var shuttingDown = false
+    private var terminationObserver: NSObjectProtocol?
     @Published private var upProcess: Process?
     private var lineBuf = Data()
     private var lastDecodeError: String?
@@ -331,21 +339,45 @@ final class CLIRunner: ObservableObject {
     }
 
     init() {
-        home = SparkServePaths.home()
-        cliPath = home?.appendingPathComponent("spark-serve").path ?? ""
+        let resolvedHome = SparkServePaths.home()
+        home = resolvedHome
+        cliPath = resolvedHome?.appendingPathComponent("spark-serve").path ?? ""
+        telemetry = TelemetryStore(home: resolvedHome)
+        benchmarks = BenchmarkStore(home: resolvedHome)
+        terminationObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification, object: nil, queue: .main
+        ) { [weak self] _ in self?.shutdown() }
         startPolling()
+        telemetry.start()
+        benchmarks.refreshHistory()
     }
 
     deinit {
+        if let terminationObserver { NotificationCenter.default.removeObserver(terminationObserver) }
+        shutdown()
+    }
+
+    func shutdown() {
+        shuttingDown = true
         stopPolling()
-        upProcess?.terminate()
+        telemetry.stop()
+        benchmarks.stop()
+        if upProcess?.isRunning == true { upProcess?.terminate() }
     }
 
     func refresh() {
+        // A slow SSH status request must not accumulate behind timer/UI refreshes.
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in self?.refresh() }
+            return
+        }
+        guard !shuttingDown, !refreshInFlight else { return }
+        refreshInFlight = true
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             if self.cliPath.isEmpty || !FileManager.default.isExecutableFile(atPath: self.cliPath) {
                 DispatchQueue.main.async {
+                    self.refreshInFlight = false
                     self.bootState = .failed(message: "CLI not found. Set SPARK_SERVE_HOME to the repo root.")
                 }
                 return
@@ -353,6 +385,8 @@ final class CLIRunner: ObservableObject {
             let models = self.decode(["list", "--json"], as: [ModelEntry].self) ?? []
             let status = self.decode(["status", "--json"], as: ClusterStatus.self)
             DispatchQueue.main.async {
+                self.refreshInFlight = false
+                guard !self.shuttingDown else { return }
                 self.models = models
                 self.status = status
                 self.syncBootState(with: status)
@@ -968,12 +1002,24 @@ struct MainView: View {
     @State private var selectedModel: String?
     @State private var showNotes = true
     @State private var confirmCancelJobs = false
+    @State private var selectedTab = "overview"
 
     var body: some View {
         VStack(spacing: 12) {
             header
+            Picker("Workspace", selection: $selectedTab) {
+                Text("Overview").tag("overview")
+                Text("Models").tag("models")
+                Text("Benchmarks").tag("benchmarks")
+            }
+            .pickerStyle(.segmented)
             Divider()
-            ScrollView {
+            if selectedTab == "overview" {
+                OverviewView(telemetry: runner.telemetry)
+            } else if selectedTab == "benchmarks" {
+                BenchmarkView(benchmarks: runner.benchmarks, telemetry: runner.telemetry)
+            } else {
+              ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     if !runner.nodes.isEmpty {
                         HStack(alignment: .top, spacing: 12) {
@@ -994,6 +1040,7 @@ struct MainView: View {
                     controls
                 }
                 .padding(2)
+              }
             }
             Divider()
             logView.frame(minHeight: 100, maxHeight: 160)
@@ -1027,7 +1074,7 @@ struct MainView: View {
                 Text("spark-serve")
                     .font(.title2.bold())
                 if let s = runner.status {
-                    Text("\(s.head) + \(s.worker)  ·  independent model serving")
+                    Text("\(s.head) + \(s.worker)")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -1385,8 +1432,3 @@ struct ModelCard: View {
         return "\(model.ctx / 1024)k ctx"
     }
 }
-
-// Top-level entry point (avoids -parse-as-library + @main, which trips the
-// SwiftUICore "allowed client" link check for a module this size on
-// CommandLineTools / Swift 6.3).
-SparkServeApp.main()
