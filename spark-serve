@@ -14,6 +14,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -1534,6 +1535,30 @@ def build_parser() -> argparse.ArgumentParser:
     st = sub.add_parser("status", help="containers + /v1/models")
     st.add_argument("--json", action="store_true", help="emit status as JSON")
 
+    watch = sub.add_parser("watch", help="stream read-only resource and inference snapshots as JSON lines")
+    watch.add_argument("--json", action="store_true", help="JSON lines are the default output")
+    watch.add_argument("--interval", type=float, default=2.0, help="sample interval in seconds (default: 2)")
+
+    bench = sub.add_parser("bench", help="benchmark a managed serving allocation without restarting it")
+    bench_commands = bench.add_subparsers(dest="bench_cmd", required=True)
+    bench_run = bench_commands.add_parser("run", help="run a bounded decode or prefill benchmark")
+    bench_run.add_argument("--node", choices=["head", "worker"], required=True)
+    bench_run.add_argument("--kind", choices=["decode", "prefill"], default="decode")
+    bench_run.add_argument("--concurrency", type=int, default=1)
+    bench_run.add_argument("--requests", type=int, default=3, help="measured requests; warmup is recorded separately")
+    bench_run.add_argument("--max-tokens", type=int, default=128)
+    bench_run.add_argument("--prompt-tokens", type=int, default=512, help="synthetic prompt size target; actual server usage is recorded")
+    thinking = bench_run.add_mutually_exclusive_group()
+    thinking.add_argument("--thinking", dest="thinking", action="store_true")
+    thinking.add_argument("--no-thinking", dest="thinking", action="store_false")
+    bench_run.set_defaults(thinking=None)
+    bench_run.add_argument("--json", action="store_true", help="JSON-line progress is the default output")
+    bench_list = bench_commands.add_parser("list", help="show saved local benchmark runs")
+    bench_list.add_argument("--json", action="store_true")
+    bench_cancel = bench_commands.add_parser("cancel", help="cancel overlapping local benchmark requests")
+    bench_cancel.add_argument("--node", choices=["head", "worker", "both"], default="both")
+    bench_cancel.add_argument("--json", action="store_true")
+
     stop = sub.add_parser("stop", help="drain and stop managed workloads on the selected Sparks")
     stop.add_argument("--cancel-jobs", action="store_true", help="explicitly cancel active YuE jobs before stopping")
     stop.add_argument("--node", choices=["head", "worker", "both"], default="both")
@@ -1584,6 +1609,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> None:
     global _JSON_MODE
     args = build_parser().parse_args(argv)
+    if args.cmd in ("watch", "bench"):
+        _JSON_MODE = args.cmd == "watch" or args.bench_cmd == "run" or bool(args.json)
     cfg = load()
     if args.cmd == "list":
         if args.json:
@@ -1595,6 +1622,53 @@ def main(argv: list[str] | None = None) -> None:
             cmd_status_json(cfg)
         else:
             cmd_status(cfg)
+    elif args.cmd == "watch":
+        from spark_serve_monitor import watch
+        try:
+            watch(cfg, interval=args.interval)
+        except (ValueError, ControllerError) as exc:
+            die(str(exc))
+    elif args.cmd == "bench":
+        from spark_serve_benchmarks import run_benchmark, list_benchmarks, cancel_benchmarks
+        try:
+            if args.bench_cmd == "run":
+                from spark_serve_monitor import StatusCommand
+                status_source = StatusCommand()
+
+                def interrupt_benchmark(*_):
+                    raise KeyboardInterrupt
+
+                previous = signal.signal(signal.SIGTERM, interrupt_benchmark)
+                try:
+                    code = run_benchmark(
+                        cfg, status_source, node=args.node, kind=args.kind,
+                        concurrency=args.concurrency, requests=args.requests,
+                        max_tokens=args.max_tokens, prompt_tokens=args.prompt_tokens,
+                        thinking=args.thinking, ssh_run=ssh_cmd,
+                    )
+                finally:
+                    status_source.stop()
+                    signal.signal(signal.SIGTERM, previous)
+                if code:
+                    raise SystemExit(code)
+            elif args.bench_cmd == "list":
+                runs = list_benchmarks(cfg)
+                if args.json:
+                    print(json.dumps(runs))
+                else:
+                    for run in runs:
+                        print(f"{run['id']}  {run.get('status', 'unknown')}  {run.get('model', '')}")
+            else:
+                hosts = [cfg["cluster"][role] for role in (("head", "worker") if args.node == "both" else (args.node,))]
+                count = cancel_benchmarks(cfg, hosts=hosts)
+                if args.json:
+                    _emit("cancelled", count=count)
+                else:
+                    print(f"Cancelled {count} benchmark run(s)")
+        except (ValueError, OSError, ControllerError) as exc:
+            die(str(exc))
+        except KeyboardInterrupt:
+            die("Benchmark interrupted", 130)
     elif args.cmd == "stop":
         _JSON_MODE = bool(args.json)
         cmd_stop(cfg, cancel_jobs=args.cancel_jobs, node=args.node, json_mode=args.json)
