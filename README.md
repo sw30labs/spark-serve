@@ -1,7 +1,7 @@
 # spark-serve
 
-Mac CLI + SwiftUI helper for catalogued vLLM/NVIDIA NIM models and independent YuE song
-workers on a two-node [NVIDIA DGX Spark](https://www.nvidia.com/en-us/products/workstations/dgx-spark/)
+Mac CLI + SwiftUI helper for catalogued vLLM, NVIDIA NIM and TensorFold models,
+plus independent YuE song workers on a two-node [NVIDIA DGX Spark](https://www.nvidia.com/en-us/products/workstations/dgx-spark/)
 cluster. Single-node models can run independently on each Spark.
 
 **This is not how you set up a cluster.** Cabling, ConnectX-7 / QSFP, pairing
@@ -66,6 +66,7 @@ cp models.example.toml models.toml   # then edit [cluster]
 | Nemotron-3-Super-120B NVFP4 | 1 | 262K | [Independent Spark setup](docs/nemotron-super.md) |
 | Qwen3.8-Flash-Next NVFP4 | 1 | 262K | [Text, images and tools](docs/qwen38-nvfp4.md) |
 | Qwen3.8-Flash-Next NVFP4, vLLM 0.30 | 1 | 262K | [Separate runtime trial](docs/qwen38-v030.md) |
+| Qwen3.8-Flash-Next 4-bit, TensorFold | 1 | 262K | [Four-stream int8 trial](docs/qwen38-tensorfold.md) |
 | GLM-5.3-Flash NVFP4 | 2 | 128K | [Locally corrected NIM; qualified pilot](docs/glm53-nvfp4.md) |
 | GLM-5.3-Flash EXL3 | 2 | 850K | [Pinned EXL3 and DFlash2 trial](docs/glm53-exl3.md) |
 | MiMo-V2.6-Flash-RL | 2 | 300K | [TP2, DFlash, official MXFP4 checkpoint](docs/mimo-v26-flash.md) |
@@ -93,6 +94,13 @@ tools on one Spark. Run `./spark-serve pull qwen38` to prepare its pinned
 runtime and checkpoint, then `./spark-serve up qwen38`. It checks its assets
 before stopping the current model. See the [Qwen recipe](docs/qwen38-nvfp4.md)
 for setup, provenance and qualification details.
+
+`qwen38-tensorfold` adds a separate TensorFold trial: four streams, int8 KV,
+native 262K context, and Vontra's MLX-format 4-bit checkpoint running on CUDA.
+Prepare it with `./spark-serve pull qwen38-tensorfold --node worker`, then use
+the same app controls and Hermes destinations. It needs a separate weight
+download. See the [TensorFold recipe](docs/qwen38-tensorfold.md) for setup,
+monitoring limits, and the outstanding live qualification.
 
 GLM-5.3-Flash uses a locally corrected image derived from pinned NVIDIA NIM and
 the unchanged published NGC NVFP4 checkpoint across both Sparks. The correction
@@ -129,7 +137,7 @@ commands for an older transition cannot admit a worker or launch a model after a
 new transition starts. Commands hold that lock through their side effects,
 including when a parent process is interrupted.
 
-While a vLLM or NIM model starts, the CLI checks the exact containers it launched on
+While a managed language model starts, the CLI checks the exact containers it launched on
 every required node. An exited container or an unverifiable node ends the wait
 with its host and failure reason instead of leaving the app booting until the
 readiness timeout. Before cleanup, bounded logs and container states are saved
@@ -344,6 +352,12 @@ The vendored GLM EXL3 and Qwen v0.30 runtime sources retain their upstream
 [GLM MIT notice](recipes/glm53-exl3/runtime/upstream/LICENSE.MIT).
 Each recipe records its upstream source pins and file hashes.
 
+The TensorFold recipe credits [MiaAI-Lab's single-Spark integration](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold),
+[Ash Hart's TensorFold engine](https://github.com/ashhart/TensorFold), and
+[Vontra's checkpoint conversion](https://huggingface.co/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP).
+Pinned sources and retained notices are documented in the
+[recipe](docs/qwen38-tensorfold.md).
+
 ## Offline verification
 
 Use Python 3.11+ with pytest. On the configured Mac:
@@ -359,8 +373,8 @@ function-style and unittest-style tests in this repository.
 Fault-injection tests cover concurrent controllers, lost/offline ownership,
 legacy migration, active-job draining, explicit cancellation, stale generations,
 misrouted health, partial starts, exact-container cleanup, protected services,
-preservation of single-node/distributed vLLM recipes, and pinned NIM preparation
-and startup. Monitoring and benchmark tests cover counter resets, stale data,
+preservation of single-node/distributed vLLM recipes, and pinned NIM/TensorFold
+preparation and startup. Monitoring and benchmark tests cover counter resets, stale data,
 cancellation, token accounting, and bounded process cleanup. The native smoke
 test checks the Python-to-Swift data contract. These checks submit no inference
 requests and change no Spark workloads.

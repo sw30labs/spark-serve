@@ -56,7 +56,7 @@ containers. A distributed model has one inference endpoint spanning two Spark
 cards. Independent models have independent endpoints and metric streams.
 Resource metrics still exist when a node is idle or running YuE.
 
-Inference metrics are fetched from the allocation endpoint's `/metrics`
+vLLM inference metrics are fetched from the allocation endpoint's `/metrics`
 (NIM uses `/v1/metrics`, falling back to `/metrics` only after HTTP 404):
 
 - Running and waiting requests, and KV-cache utilization are current gauges.
@@ -64,6 +64,13 @@ Inference metrics are fetched from the allocation endpoint's `/metrics`
   deltas over the adjacent scrape interval.
 - TTFT and time per output token are histogram **means over that interval**,
   not lifetime averages or percentiles.
+
+TensorFold uses its patched `/health` JSON endpoint for reported in-flight
+requests and prompt/completion token rates. Prompt tokens are credited when
+the first output arrives, rather than continuously during prefill.
+Its pinned schema does not supply waiting
+requests, KV utilization, request rates or latency histograms; these stay
+unavailable. Native benchmarks can still measure client-observed latency.
 
 Allocation/container changes, counter resets, missing series, and gaps reset
 the rate baseline. The first observation therefore has no rate yet. The

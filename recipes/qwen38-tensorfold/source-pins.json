@@ -1,0 +1,46 @@
+{
+  "version": 1,
+  "upstream_url": "https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold",
+  "upstream_revision": "a3aa89835022c55ca8e55008c37785954834e04f",
+  "tensorfold_url": "https://github.com/ashhart/TensorFold",
+  "tensorfold_revision": "191188075bca56a7c71074a79375eb4c1cb22e1c",
+  "tensorfold_version": "0.3.6.3",
+  "base_image": "ghcr.io/miaai-lab/qwen3.8-flash-next-single-dgx-spark-tensorfold@sha256:fd30b84dce7a43daaa2be3443e1bd0e7c826923e9cb77a995c4720e76c752c64",
+  "base_platform": "linux/arm64",
+  "base_config_digest": "sha256:76df755806086057d04d8b5ee9842eb8b1e3b130f7399019a922e1b24a66c64d",
+  "upstream_image_tag": "v0.3.6.3-c1f5d72f8d16",
+  "local_image": "spark-serve-qwen38-tensorfold:0.1.0",
+  "manifest_sha256": "583d1e6bd1992016e37d9c86c18bbd16a2f08ecca5da221f335e36a7e662f34a",
+  "checkpoint_revision": "dadefa8066e3be900a0d148d0f5a2f4eb1cf6534",
+  "runtime_sha256": {
+    "runtime/Dockerfile": "b7d629911426db74916cba4f648338769d3c47332a36961b32bdd185ad686e9f",
+    "runtime/check_compatibility.py": "3aea53f7b64d87a7ac17e872eab3d7ce1df1eced4645104d55bbd5d91f51e45f",
+    "runtime/entrypoint.sh": "2203a23a2132a8f7209a0bf6dfe5108e6eeaff43eb59caaa8113131065cf74ae",
+    "runtime/installed-runtime.json": "2e956cefa137ee33339da911d39e7045c0f8042f37b3e6e3bb38d24060b4bc00",
+    "runtime/upstream/0001-cuda-live-token-counters.patch": "28b1db6dc8f9b087cd37ad34dc2af5a3822f89fc7ee2388db2c80041fcce4ebf",
+    "runtime/upstream/0002-flash-next-ssd-read-ahead.patch": "788a6f8fd7c4c92cd6b8dea5e09c458c020d27925e9908c2fb66768facd00aa9",
+    "runtime/upstream/0003-flash-next-ssd-native-reader.patch": "32abd73db19cb8ad2424500f6869c4486821ace3e573b8d366ad13051646d730",
+    "runtime/upstream/0004-flash-next-qsa-tiled-select.patch": "8c20f1339b6c0a39e45172b5804fc7fd2a02980077172df3b1583cac1f113eb6",
+    "runtime/upstream/0005-cuda-stream-draft-stats.patch": "f816b09c501a73d2760e4a01c9426a3359a4dd284c5ca3f2720f3c4990de00e4",
+    "runtime/upstream/0006-flash-next-prefill-rows.patch": "eb305fd379691d4ba14052630dcb64c7d8845372b8253768329795325a2b779f",
+    "runtime/upstream/0007-flash-next-copy-drafts.patch": "71ff22ef4ada80e4b03110017e52c9a8aaec541f2c8ffc24e3148811226d33d8",
+    "runtime/upstream/0008-flash-next-vision.patch": "493f7676340b53bfa0843099bf92829b2ce3a20e9638f82694256b47abb3093a",
+    "runtime/upstream/0009-flash-next-many-images.patch": "4ba6d5b2e0345c3f79f4bd14c8c0f8fcdec55621eae607d8535cd5b99ed930d0",
+    "runtime/upstream/CREDITS.md": "9641c397e04d06bed5e8417ea612334c9bf9c85d709a35e0544aeaeecc14acd5",
+    "runtime/upstream/LICENSE": "ed01c9ef861bcb1c20f028739d8c7102c6f04364ffe9903e5088c6d6449a4aff",
+    "runtime/upstream/TENSORFOLD-LICENSE": "be6a9ee4462784a762b21790954b8e76c4dcacc9fb6da2a40d03a8a9bddec93e",
+    "runtime/upstream/TENSORFOLD-THIRD_PARTY_NOTICES.md": "2e7ce3c19e1e4ed5113b7e9ae11d4bcfcf946a367de45eac643f4cafc6b74ea3",
+    "runtime/upstream-files.json": "01993ae24f71c1524ffaa29c6c0e01043a9e98f4b0c82ce9f116d2baf5b98b63",
+    "runtime/verify_runtime.py": "ec2c82bff3c8f0f6d2dc9da155facac64b9a2e1020fc4d6f72ffcfee209ec992"
+  },
+  "preparation_sha256": {
+    "verify.py": "e9b2178f1174a47778ad8a8e5d234d0364de9d37c6f353792f368384d92753b9",
+    "check_space.py": "785a24cdb33307396d83c2c086b6993de6c3390a553d529b4b0808d821abf227"
+  },
+  "policy": {
+    "checkpoint": "Independent Vontra MLX 4-bit/group-32 snapshot; existing NVIDIA recipes and checkpoints are unchanged.",
+    "patches": "Nine ordered patches from the pinned recipe; no optional language patch or unmerged tool-streaming patch.",
+    "runtime_authentication": "All 360 installed TensorFold files independently matched to the pinned TensorFold source plus patches and immutable image application layers.",
+    "initial_defaults": "Four streams, int8 KV cache,262144 context per stream; hardware quality/performance unqualified."
+  }
+}

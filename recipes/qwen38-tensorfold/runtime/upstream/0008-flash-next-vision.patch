@@ -1,0 +1,1356 @@
+diff --git tensorfold/families/qwen4_exp/__init__.py tensorfold/families/qwen4_exp/__init__.py
+index 47ac630..f0992b5 100644
+--- tensorfold/families/qwen4_exp/__init__.py
++++ tensorfold/families/qwen4_exp/__init__.py
+@@ -163,4 +163,5 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank:
+     return FlashNextEngine(Path(model_dir), depth=depth, confidence=confidence, max_len=context,
+                            context_explicit=options.get("context_explicit"), tp=int(tp), rank=int(rank),
+                            master=master, port=int(master_port), streams=max(1, int(options.get("parallel") or 1)),
+-                           ple_on_ssd=ple_on_ssd, kv_dtype=kv_dtype)
++                           ple_on_ssd=ple_on_ssd, kv_dtype=kv_dtype, vision=bool(options.get("vision", False)),
++                           vision_urls=bool(options.get("vision_urls", False)))
+diff --git tensorfold/families/qwen4_exp/cuda/attention.py tensorfold/families/qwen4_exp/cuda/attention.py
+index 822a160..700f7ff 100644
+--- tensorfold/families/qwen4_exp/cuda/attention.py
++++ tensorfold/families/qwen4_exp/cuda/attention.py
+@@ -169,7 +169,8 @@ def attention(q: torch.Tensor, kc: torch.Tensor, vc: torch.Tensor, pos0: torch.T
+ 
+ 
+ @triton.jit
+-def _pool(IKC, POOLED, POS0, W, INV, eps, R, DI: tl.constexpr, HALF: tl.constexpr, RATIO: tl.constexpr):
++def _pool(IKC, POOLED, POS0, W, INV, ROPE, DELTA, eps, R, DI: tl.constexpr, HALF: tl.constexpr,
++          RATIO: tl.constexpr, MODE: tl.constexpr = 0, S1: tl.constexpr = 11, S2: tl.constexpr = 10):
+     """Pool each complete RATIO-key block in fp32 order, then bf16 RMSNorm and rotate-half RoPE at its first position; recomputing a block preserves its bits."""
+ 
+     i = tl.program_id(0)
+@@ -190,7 +191,17 @@ def _pool(IKC, POOLED, POS0, W, INV, eps, R, DI: tl.constexpr, HALF: tl.constexp
+         xp = (xp / RATIO).to(tl.bfloat16).to(tl.float32)
+         xpn = (xp * rinv * tl.load(W + partner)).to(tl.bfloat16).to(tl.float32)
+         j = tl.where(d < HALF, d, tl.where(d < 2 * HALF, d - HALF, 0))
+-        ang = (RATIO * b).to(tl.float32) * tl.load(INV + j)
++        if MODE == 0:
++            ang = (RATIO * b).to(tl.float32) * tl.load(INV + j)
++        elif MODE == 1:                              # the block starts in text after images
++            ang = (RATIO * b + tl.load(DELTA)).to(tl.float32) * tl.load(INV + j)
++        else:                                        # the block's first token in an image prompt's chunk
++            row = RATIO * b - p0
++            pt = tl.load(ROPE + row * 3)
++            ph = tl.load(ROPE + row * 3 + 1)
++            pv = tl.load(ROPE + row * 3 + 2)
++            axis = tl.where((j % 3 == 1) & (j < 3 * S1), ph, tl.where((j % 3 == 2) & (j < 3 * S2), pv, pt))
++            ang = axis.to(tl.float32) * tl.load(INV + j)
+         cos, sin = tl.cos(ang), tl.sin(ang)
+         rot = tl.where(d < HALF, xn * cos - xpn * sin, tl.where(d < 2 * HALF, xpn * sin + xn * cos, xn))
+         tl.store(POOLED + b.to(tl.int64) * DI + d, rot.to(tl.bfloat16))
+@@ -323,19 +334,24 @@ SELECT_TILE = 4096
+ 
+ def qsa_select(iq: torch.Tensor, ikc: torch.Tensor, pooled: torch.Tensor, pos0: torch.Tensor, ik_scale: torch.Tensor,
+                inv_freq: torch.Tensor, eps: float, scratch: AttnScratch, rows: int,
+-               *, context: int | None = None) -> None:
++               *, context: int | None = None, rope=None, delta=None, sections=(11, 11, 10)) -> None:
+     """Pool the blocks the window completes, score and select each sparse row's blocks (scratch.ids/nk/sparse)."""
+ 
+-    qsa_pool(ikc, pooled, pos0, ik_scale, inv_freq, eps, scratch, rows)
++    qsa_pool(ikc, pooled, pos0, ik_scale, inv_freq, eps, scratch, rows, rope=rope, delta=delta, sections=sections)
+     qsa_rows(iq, pooled, pos0, scratch, rows, context=context)
+ 
+ 
+ def qsa_pool(ikc: torch.Tensor, pooled: torch.Tensor, pos0: torch.Tensor, ik_scale: torch.Tensor,
+-             inv_freq: torch.Tensor, eps: float, scratch: AttnScratch, rows: int) -> None:
+-    """The pooled key of every block that rows [P0, P0 + rows) complete."""
+-
+-    _pool[(rows // scratch.ratio + 2,)](ikc, pooled, pos0, ik_scale, inv_freq, eps, rows, DI=ikc.shape[1],
+-                                        HALF=inv_freq.numel(), RATIO=scratch.ratio, num_warps=1)
++             inv_freq: torch.Tensor, eps: float, scratch: AttnScratch, rows: int, *, rope=None, delta=None,
++             sections=(11, 11, 10)) -> None:
++    """The pooled key of every block that rows [P0, P0 + rows) complete, rotated at its first token's position:
++    ``delta`` [1] for text after images, ``rope`` [rows, 3] for an image prompt's chunk (as ``glue.attn_prep``)."""
++
++    mode = 2 if rope is not None else 1 if delta is not None else 0
++    _pool[(rows // scratch.ratio + 2,)](ikc, pooled, pos0, ik_scale, inv_freq,
++                                        rope if rope is not None else pos0, delta if delta is not None else pos0,
++                                        eps, rows, DI=ikc.shape[1], HALF=inv_freq.numel(), RATIO=scratch.ratio,
++                                        MODE=mode, S1=sections[1], S2=sections[2], num_warps=1)
+ 
+ 
+ def qsa_rows(iq: torch.Tensor, pooled: torch.Tensor, pos0: torch.Tensor, scratch: AttnScratch, rows: int, *,
+diff --git tensorfold/families/qwen4_exp/cuda/decode.py tensorfold/families/qwen4_exp/cuda/decode.py
+index 4bbca0b..8091193 100644
+--- tensorfold/families/qwen4_exp/cuda/decode.py
++++ tensorfold/families/qwen4_exp/cuda/decode.py
+@@ -245,12 +245,18 @@ def draft(e: Engine, streams: torch.Tensor, next_tokens: Sequence[int], position
+ 
+ @torch.no_grad()
+ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp: bool = True,
+-            resume: dict | None = None) -> int:
+-    """Commit the prompt in chunks, sample the first token; rows ignore chunking, so ``resume`` equals a fresh run."""
++            resume: dict | None = None, vision=None) -> int:
++    """Commit the prompt in chunks, sample the first token; rows ignore chunking, so ``resume`` equals a fresh run.
++    ``vision`` (``tensorfold.vision.qwen_cuda.EncodedVision``): the image rows take its features and every row its
++    t/h/w rotary positions; later text rotates at its position plus the prompt's offset."""
+ 
+     if not prompt:
+         raise ValueError("prefill requires at least one token")
++    if vision is not None and resume is not None:
++        raise ValueError("an image prompt prefills from its start")
+     w, st, pb = e.w, e.st, e.pbuf
++    if vision is not None and pb.attn.qsa and e.prefill_rows % pb.attn.ratio:   # a block's first row is in its chunk
++        raise ValueError(f"image prompts need TENSORFOLD_PREFILL_ROWS divisible by {pb.attn.ratio}")
+     use_mtp = mtp and w.mtp is not None and e.mbuf is not None
+     begin = 0
+     if resume is None:
+@@ -265,16 +271,36 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
+             st.set_mtp_len(st.mtp_len + 1)
+     last = None
+     history = st.ple_history
++    if vision is not None:
++        image_rows = torch.tensor(vision.rows, dtype=torch.int64, device=vision.features.device)
++        positions = vision.positions.t().contiguous()            # [prompt, 3] int32
++    try:
++        return _prefill_chunks(e, prompt, sampling, begin, history, use_mtp, vision,
++                               image_rows if vision is not None else None,
++                               positions if vision is not None else None)
++    finally:
++        pb.rope_rows = None
++
++
++def _prefill_chunks(e, prompt, sampling, begin, history, use_mtp, vision, image_rows, positions) -> int:
++    w, st, pb = e.w, e.st, e.pbuf
++    last = None
+     for start in range(begin, len(prompt), e.prefill_rows):
+         chunk = list(prompt[start:start + e.prefill_rows])
+         R = len(chunk)
+         final = start + R >= len(prompt)
++        features = None
++        if vision is not None:
++            pb.rope_rows = positions[start:start + R]
++            inside = ((image_rows >= start) & (image_rows < start + R)).nonzero().flatten()
++            if inside.numel():
++                features = (image_rows.index_select(0, inside) - start, vision.features.index_select(0, inside))
+         segs = stage(w, pb, [(st, chunk)])
+         if not final and history is not None:   # the next chunk's n-gram rows are read while the GPU runs this one
+             history = np.concatenate([history, np.asarray(chunk, dtype=np.int64)])[-(w.cfg.ngram_size - 1):]
+             read_ahead(w, history, prompt[start + R:start + R + e.prefill_rows])
+         # only the prompt's last row is sampled: the head runs on the final chunk alone
+-        logits = compute(w, segs, pb, logits=final)
++        logits = compute(w, segs, pb, logits=final, features=features)
+         if final:
+             last = logits.clone()
+         streams_last = pb.streams[R - 1:R].clone()
+@@ -284,6 +310,8 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
+                 mtp_forward(w, st, pb, nxt, pb.streams[:len(nxt)])
+                 st.set_mtp_len(st.mtp_len + len(nxt))
+         commit(w, st, pb, R, R)
++    if vision is not None:                           # decode continues at the image prompt's rotary offset
++        st.set_rope_delta(vision.rope_delta)
+     first = e.sample(last, [len(prompt)], sampling)[0]
+     e.last_streams = streams_last
+     e.first = first
+diff --git tensorfold/families/qwen4_exp/cuda/engine.py tensorfold/families/qwen4_exp/cuda/engine.py
+index 41abe5a..422e8c7 100644
+--- tensorfold/families/qwen4_exp/cuda/engine.py
++++ tensorfold/families/qwen4_exp/cuda/engine.py
+@@ -11,6 +11,22 @@ from typing import Any, Callable
+ from . import CONFIDENCE, DEPTH
+ 
+ MAX_DEPTH = 15           # a verify window of at most 16 rows
++# the image tower's workspace with --vision: measured peaks 0.76 GiB (a 4,096-token image) and 0.83 GiB (a
++# 256-frame video, encoded 16,384 patches at a time) over its 0.85 GiB of weights. TENSORFOLD_VISION_WORKSPACE_MIB
++# sets what startup reserves for it; 0 draws it, for the moment of an encode, from the system reserve (the decoder
++# returns it right after the image prompt's prefill)
++VISION_WORKSPACE = 5 * 2**28
++
++
++def vision_workspace() -> int:
++    import os
++
++    value = os.environ.get("TENSORFOLD_VISION_WORKSPACE_MIB")
++    if value is None or value == "":
++        return VISION_WORKSPACE
++    if not value.isdecimal() or int(value) > 16384:
++        raise ValueError(f"TENSORFOLD_VISION_WORKSPACE_MIB: 0 to 16,384 MiB, not {value!r}")
++    return int(value) * 2**20
+ KEEP = 8                 # prompt ends a concurrent decoder keeps to resume from
+ 
+ 
+@@ -21,7 +37,7 @@ class FlashNextEngine:
+                  draft_vocab: str | int | None = "default", max_len: int | None = None,
+                  context_explicit: bool | None = None, tp: int = 1, rank: int = 0, master: str = "", port: int = 29551,
+                  prefetch: bool = True, graphs: bool = True, streams: int = 1, ple_on_ssd: bool = False,
+-                 kv_dtype: str = "bf16") -> None:
++                 kv_dtype: str = "bf16", vision: bool = False, vision_urls: bool = False) -> None:
+         import torch
+ 
+         from .exl3_pack import admission, extra_files, is_exl3
+@@ -32,6 +48,9 @@ class FlashNextEngine:
+         if (exl3 or quant_method(read_config(model_dir)) == "modelopt") and tp != 1:
+             raise ValueError(f"{'EXL3 packs' if exl3 else 'NVFP4 checkpoints'} of Flash Next run on one GPU: drop --tp "
+                              "2, or serve the MLX checkpoint (Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP) on two")
++        if vision and (exl3 or streams < 2 or tp != 1):
++            raise ValueError("image input on Flash Next runs on one GPU with --parallel 2 or more, from the MLX "
++                             "checkpoint (Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP)")
+         if exl3 and ple_on_ssd:
+             raise ValueError("--ple-on-ssd reads the MLX checkpoint's n-gram tables; an EXL3 pack maps its own table "
+                              "from its file, so drop --ple-on-ssd")
+@@ -55,6 +74,7 @@ class FlashNextEngine:
+         self.tp, self.rank, self.depth, self.confidence = tp, rank, int(depth), float(confidence)
+         self.kv_dtype = check_kv(kv_dtype)
+         self.comm = None
++        self.vision = None                   # the image tower (``QwenCudaVision``) with --vision
+         ids = draft_token_ids(draft_vocab) if self.depth > 0 else None
+         if tp == 2:
+             from tensorfold.cuda.comm import NCCL
+@@ -75,8 +95,13 @@ class FlashNextEngine:
+                                                prefill_rows=rows)))
+         if exl3:
+             geometry = admission(geometry)
+-        self.capacity_plan = admit(model_dir, max_len, context_explicit, torch, geometry,
+-                                   indexed_weights(tp, mtp, mapped_tables=not ple_on_ssd), rank=rank, world=tp,
++        # --vision: the tower's bf16 weights and its workspace join the one admission
++        from tensorfold.vision.qwen_cuda import capacity_geometry, weight_transform as vision_weights
++
++        self.capacity_plan = admit(model_dir, max_len, context_explicit, torch,
++                                   capacity_geometry(geometry, model_dir, vision, rank, vision_workspace()),
++                                   vision_weights(indexed_weights(tp, mtp, mapped_tables=not ple_on_ssd), vision, rank),
++                                   rank=rank, world=tp,
+                                    gather=gather, extra_files=extra_files(model_dir) if exl3 else ())
+         self.max_len = self.capacity_plan["cache_slots"]
+         if tp == 2:
+@@ -88,6 +113,15 @@ class FlashNextEngine:
+             raise ValueError("this checkpoint has no MTP head, which Flash Next's CUDA engine drafts with: use one "
+                              "that has it, or --no-drafts for the serial reference (one token a round)")
+         self.w = w
++        if vision:
++            from tensorfold.vision.qwen_cuda import QwenCudaVision
++
++            self.vision = QwenCudaVision(model_dir, torch.device("cuda", 0),
++                                         allow_urls=vision_urls)
++            torch.cuda.empty_cache()
++            print(f"[tensorfold] vision: image{' and video' if self.vision.videos else ''} input, a "
++                  f"{self.vision.weight_bytes / 2**30:.2f} GiB tower with {vision_workspace() / 2**30:.2f} GiB of "
++                  f"workspace reserved{'; https URLs allowed' if vision_urls else ''}", flush=True)
+         # ``streams`` > 1: up to that many requests decoded together, every stream's chain in one forward
+         self.concurrent = streams > 1
+         self.multi = self.scheduler = None
+@@ -99,7 +133,7 @@ class FlashNextEngine:
+             self.e = None
+             self.multi = MultiDecoder(w, slots=streams, capacity=self.max_len, depth=self.depth,
+                                       confidence=self.confidence, keep=KEEP, kv_dtype=self.kv_dtype,
+-                                      prefill_rows=rows)
++                                      prefill_rows=rows, vision=self.vision)
+             self.scheduler = Scheduler(self.multi, max_streams=streams)
+         else:
+             self.e = Engine(w, capacity=self.max_len, max_rows=max(8, self.depth + 1), prefill_rows=rows,
+@@ -124,6 +158,9 @@ class FlashNextEngine:
+             from .decode import warm
+ 
+             warm(self.e)
++        if self.vision is not None:          # the tower's kernels load now, not on top of the first image request
++            self.vision.warm()
++            torch.cuda.empty_cache()
+         warm_s = time.perf_counter() - started
+         self.eos = tuple(w.cfg.eos)
+         self.served = 0
+@@ -279,12 +316,17 @@ class FlashNextEngine:
+         return stats
+ 
+     def generate(self, prompt: list[int], max_tokens: int, sampling,
+-                 on_tokens: Callable[[list[int]], bool | None], draft: bool = True) -> dict[str, Any]:
+-        """``draft=False``: one token a round with no MTP drafts, from a fresh prefill that leaves the kept states alone: the serial reference."""
++                 on_tokens: Callable[[list[int]], bool | None], draft: bool = True, *,
++                 vision=None) -> dict[str, Any]:
++        """``draft=False``: one token a round with no MTP drafts, from a fresh prefill that leaves the kept states alone: the serial reference; ``vision``: an image prompt's prepared pixels and positions."""
+ 
+         max_tokens = self._limit(prompt, max_tokens)
++        if vision is not None and self.vision is None:
++            raise ValueError("image inputs require starting this server with --vision")
+         if self.scheduler is not None:
+-            return self.scheduler.submit(list(prompt), max_tokens, sampling, draft, on_tokens)
++            if vision is None:
++                return self.scheduler.submit(list(prompt), max_tokens, sampling, draft, on_tokens)
++            return self.scheduler.submit(list(prompt), max_tokens, sampling, draft, on_tokens, vision=vision)
+         hit = self._resume(prompt) if draft else None
+         if self.tp == 2:                     # rank 0 decodes exactly what it hands rank 1
+             prompt, max_tokens, sampling, draft, _ = self._share(prompt, max_tokens, sampling, draft,
+diff --git tensorfold/families/qwen4_exp/cuda/forward.py tensorfold/families/qwen4_exp/cuda/forward.py
+index a091a18..ac5cea3 100644
+--- tensorfold/families/qwen4_exp/cuda/forward.py
++++ tensorfold/families/qwen4_exp/cuda/forward.py
+@@ -178,16 +178,23 @@ def attn_block(layer: LayerW, w: Weights, segs: Sequence[Seg], b: Buffers, R: in
+     a = layer.attn
+     _mm(b.mixed[:R], a.proj, b.xs_mixed[:R], b.pa[:R], b)
+     scale = c.head_dim ** -0.5
++    sections = getattr(c, "mrope_section", (11, 11, 10))
+     for st, a0, a1 in segs:
+         cache, ikc, pooled, pos, host_pos = _caches(layer, st, mtp)
+         bits = 0 if not cache.quantized else cache.bits
+         keys = context if context is not None else host_pos + a1 - a0
++        # rotary positions: an image prompt chunk's t/h/w rows, text after images at the stream's offset, or plain
++        rope = getattr(b, "rope_rows", None)
++        rope = rope[a0:a1] if rope is not None else None
++        delta = st.rope_delta_dev if rope is None and getattr(st, "rope_delta", 0) else None
+         glue.attn_prep(b.pa[a0:a1], pos, a.q_scale, a.k_scale, a.iq_scale, w.inv_freq, b.q[a0:], cache.k, cache.v,
+                        b.iq[a0:], ikc, c.eps, q_heads=c.heads, kv_heads=c.kv_heads, head_dim=c.head_dim,
+-                       index_heads=c.index_heads, index_dim=c.index_dim, ks=cache.ks, vs=cache.vs, bits=bits)
++                       index_heads=c.index_heads, index_dim=c.index_dim, ks=cache.ks, vs=cache.vs, bits=bits,
++                       rope=rope, delta=delta, sections=sections)
+         if b.prefill:
+             if b.attn.qsa:
+-                attn_mod.qsa_pool(ikc, pooled, pos, a.ik_scale, w.inv_freq, c.eps, b.attn, a1 - a0)
++                attn_mod.qsa_pool(ikc, pooled, pos, a.ik_scale, w.inv_freq, c.eps, b.attn, a1 - a0, rope=rope,
++                                  delta=delta, sections=sections)
+             for r0 in range(a0, a1, ATT_ROWS):
+                 n = min(ATT_ROWS, a1 - r0)
+                 b.pos_blk.fill_(host_pos + r0 - a0)
+@@ -199,7 +206,7 @@ def attn_block(layer: LayerW, w: Weights, segs: Sequence[Seg], b: Buffers, R: in
+             continue
+         if b.attn.qsa:
+             attn_mod.qsa_select(b.iq[a0:a1], ikc, pooled, pos, a.ik_scale, w.inv_freq, c.eps, b.attn, a1 - a0,
+-                                context=keys)
++                                context=keys, rope=rope, delta=delta, sections=sections)
+         o = attn_mod.attention(b.q[a0:a1], cache.k, cache.v, pos, b.attn, a1 - a0, scale, context=keys,
+                                ks=cache.ks, vs=cache.vs, bits=bits)
+         if len(segs) > 1:                       # the scratch output is the next stream's too
+@@ -409,12 +416,16 @@ def read_ahead(w: Weights, history: np.ndarray, tokens: Sequence[int]) -> None:
+             start(p.ngram.ids(history, toks))
+ 
+ 
+-def compute(w: Weights, segs: Sequence[Seg], b: Buffers, *, logits: bool = True, context: int | None = None):
++def compute(w: Weights, segs: Sequence[Seg], b: Buffers, *, logits: bool = True, context: int | None = None,
++            features=None):
+     """The forward's GPU work on staged rows (capturable); ``context`` bounds the attention launches."""
+ 
+     c = w.cfg
+     R = segs[-1][2]
+     _embed(w, b.ids[:R], c.streams, b.h[:R])
++    if features is not None:                         # image rows: the vision features in place of the embeddings
++        target, source = features                    # (window rows [n] int64, their features [n, hidden]), per stream
++        b.h.index_copy_(0, target, source.repeat(1, c.streams))
+     pending = None
+     for layer in w.layers:
+         pending = layer_forward(layer, w, segs, b, R, pending, context=context)
+diff --git tensorfold/families/qwen4_exp/cuda/glue.py tensorfold/families/qwen4_exp/cuda/glue.py
+index eb56c89..0261e8a 100644
+--- tensorfold/families/qwen4_exp/cuda/glue.py
++++ tensorfold/families/qwen4_exp/cuda/glue.py
+@@ -271,9 +271,10 @@ def rmsnorm(x: torch.Tensor, w: torch.Tensor, eps: float, group: int | None = No
+ 
+ 
+ @triton.jit
+-def _attn_prep(P, POS0, QW, KW, IW, INV, Q, KC, VC, KS, VS, IQ, IKC, eps,
++def _attn_prep(P, POS0, QW, KW, IW, INV, Q, KC, VC, KS, VS, IQ, IKC, ROPE, DELTA, eps,
+                PW: tl.constexpr, NQ: tl.constexpr, NKV: tl.constexpr, HD: tl.constexpr, NI: tl.constexpr,
+-               IHD: tl.constexpr, HALF: tl.constexpr, BITS: tl.constexpr):
++               IHD: tl.constexpr, HALF: tl.constexpr, BITS: tl.constexpr, MODE: tl.constexpr = 0,
++               S1: tl.constexpr = 11, S2: tl.constexpr = 10):
+     """Normalize stacked q/k/indexer heads in fp32, round to bf16, apply rotate-half RoPE and round again; store keys, values and raw indexer keys at POS0 + r; BITS 8 or 4 quantize keys and values and rotate q alike (q . Hk = Hq . k)."""
+ 
+     r = tl.program_id(0)
+@@ -310,7 +311,16 @@ def _attn_prep(P, POS0, QW, KW, IW, INV, Q, KC, VC, KS, VS, IQ, IKC, eps,
+             wp = tl.load(IW + partner, mask=live, other=0.0).to(tl.float32)
+         xpn = (xp * rinv * wp).to(tl.bfloat16).to(tl.float32)
+         i = tl.where(d < HALF, d, tl.where(d < 2 * HALF, d - HALF, 0))
+-        ang = pos.to(tl.float32) * tl.load(INV + i)
++        if MODE == 0:                                # text: the row's cache position
++            ang = pos.to(tl.float32) * tl.load(INV + i)
++        elif MODE == 1:                              # text after images: the position plus the stream's offset
++            ang = (pos + tl.load(DELTA)).to(tl.float32) * tl.load(INV + i)
++        else:                                        # an image prompt's rows: interleaved (t, h, w) positions
++            pt = tl.load(ROPE + r * 3)
++            ph = tl.load(ROPE + r * 3 + 1)
++            pv = tl.load(ROPE + r * 3 + 2)
++            axis = tl.where((i % 3 == 1) & (i < 3 * S1), ph, tl.where((i % 3 == 2) & (i < 3 * S2), pv, pt))
++            ang = axis.to(tl.float32) * tl.load(INV + i)
+         cos = tl.cos(ang)
+         sin = tl.sin(ang)
+         rot = tl.where(d < HALF, xn * cos - xpn * sin, tl.where(d < 2 * HALF, xpn * sin + xn * cos, xn))
+@@ -357,17 +367,22 @@ def _attn_prep(P, POS0, QW, KW, IW, INV, Q, KC, VC, KS, VS, IQ, IKC, eps,
+ 
+ def attn_prep(p: torch.Tensor, pos0: torch.Tensor, q_scale, k_scale, i_scale, inv_freq, q, kc, vc, iq, ikc,
+               eps: float, *, q_heads: int, kv_heads: int, head_dim: int, index_heads: int, index_dim: int,
+-              ks: torch.Tensor | None = None, vs: torch.Tensor | None = None, bits: int = 0) -> None:
+-    """Write the rows' queries (rotated when the cache is quantized), keys and values; ``bits`` 0 (bf16), 8 or 4 with scales ``ks``/``vs``."""
++              ks: torch.Tensor | None = None, vs: torch.Tensor | None = None, bits: int = 0,
++              rope: torch.Tensor | None = None, delta: torch.Tensor | None = None,
++              sections: tuple[int, int, int] = (11, 11, 10)) -> None:
++    """Write the rows' queries (rotated when the cache is quantized), keys and values; ``bits`` 0 (bf16), 8 or 4 with scales ``ks``/``vs``. Rotary positions: the cache position; plus ``delta`` [1] (text after images); or ``rope`` [rows, 3] (an image prompt's interleaved t/h/w positions, ``sections`` as the checkpoint's mrope_section)."""
+ 
+     rows, pw = p.shape
+     if bits and (ks is None or vs is None):
+         raise ValueError("a quantized KV cache needs its scale tensors")
+     if ks is None:
+         ks = vs = kc
++    mode = 2 if rope is not None else 1 if delta is not None else 0
+     _attn_prep[(rows, q_heads + kv_heads + index_heads + 1)](
+-        p, pos0, q_scale, k_scale, i_scale, inv_freq, q, kc, vc, ks, vs, iq, ikc, eps, PW=pw, NQ=q_heads, NKV=kv_heads,
+-        HD=head_dim, NI=index_heads, IHD=index_dim, HALF=inv_freq.numel(), BITS=bits, num_warps=2)
++        p, pos0, q_scale, k_scale, i_scale, inv_freq, q, kc, vc, ks, vs, iq, ikc,
++        rope if rope is not None else pos0, delta if delta is not None else pos0, eps, PW=pw, NQ=q_heads,
++        NKV=kv_heads, HD=head_dim, NI=index_heads, IHD=index_dim, HALF=inv_freq.numel(), BITS=bits, MODE=mode,
++        S1=sections[1], S2=sections[2], num_warps=2)
+ 
+ 
+ @triton.jit
+diff --git tensorfold/families/qwen4_exp/cuda/multi.py tensorfold/families/qwen4_exp/cuda/multi.py
+index 05e9e84..f24c97c 100644
+--- tensorfold/families/qwen4_exp/cuda/multi.py
++++ tensorfold/families/qwen4_exp/cuda/multi.py
+@@ -34,10 +34,11 @@ class MultiDecoder:
+ 
+     def __init__(self, w, *, slots: int, capacity: int, depth: int = DEPTH, confidence: float = CONFIDENCE,
+                  stop_eos: bool = True, keep: int = 8, kv_dtype: str = "bf16",
+-                 prefill_rows: int = PREFILL_ROWS) -> None:
++                 prefill_rows: int = PREFILL_ROWS, vision=None) -> None:
+         if w.comm is not None:
+             raise ValueError("concurrent Flash Next runs on one GPU for now")
+         self.w, self.depth, self.confidence, self.capacity = w, depth, confidence, capacity
++        self.vision = vision                         # the image tower (``QwenCudaVision``) with --vision, else None
+         # TENSORFOLD_MTP_COPY=1: a stream whose context repeats earlier text drafts the continuation (prompt lookup)
+         self.copy = os.environ.get("TENSORFOLD_MTP_COPY", "0") == "1"
+         self.eos = tuple(w.cfg.eos) if stop_eos else ()
+@@ -116,21 +117,33 @@ class MultiDecoder:
+             raise ValueError(f"a prompt of {len(s.prompt)} tokens leaves no room in the {self.capacity}-token context")
+         s.count = max(1, min(s.count, room))
+         t0 = time.perf_counter()
+-        st, resume, s.cached = self._slot_for(list(s.prompt), s.draft)
++        encoded = None
++        if getattr(s, "vision", None) is not None:       # an image prompt: its features and t/h/w positions
++            if self.vision is None:
++                raise ValueError("image inputs require starting this server with --vision")
++            encoded = self.vision.encode(s.vision, s.prompt)
++        image = encoded is not None
++        # image placeholders look alike whatever the image: an image prompt never resumes or is kept
++        st, resume, s.cached = self._slot_for(list(s.prompt), s.draft and not image)
+         e = _slot(self.w, st, self.buf, self.mbuf, self.pbuf, self.capacity)
+         mtp = s.draft and self.depth > 0 and self.mbuf is not None
+         try:
+-            first = prefill(e, s.prompt, s.sampling, mtp=mtp, resume=resume)
++            first = prefill(e, s.prompt, s.sampling, mtp=mtp, resume=resume, vision=encoded)
+         except Exception:
+             self.free.append(st)
+             raise
++        finally:
++            s.vision = None                              # the features are in the caches now
++            if image:                                    # the tower's scratch goes back to the system at once
++                encoded = None
++                torch.cuda.empty_cache()
+         s.sid, s.st = self.next_id, st
+         self.next_id += 1
+         if self.copy and s.draft:
+             from tensorfold.families.qwen3_5.cuda.decode import CopyIndex
+ 
+             s.copies = CopyIndex(COPY_MATCH)
+-        if s.draft:                    # the prompt's state; the MTP head has absorbed every position but the last
++        if s.draft and not image:         # the prompt's state; the MTP head has absorbed every position but the last
+             self._remember(list(s.prompt), st, st.snapshot(), e.last_streams.clone() if mtp else None)
+         s.context = list(s.prompt)
+         s.drafts = draft(e, e.last_streams, [first], st.pos + 1, min(self.depth, s.count - 1), s.sampling,
+diff --git tensorfold/families/qwen4_exp/cuda/state.py tensorfold/families/qwen4_exp/cuda/state.py
+index 395f273..4f30aaf 100644
+--- tensorfold/families/qwen4_exp/cuda/state.py
++++ tensorfold/families/qwen4_exp/cuda/state.py
+@@ -26,6 +26,7 @@ class Buffers:
+         dev = w.device
+         wide = c.streams * c.hidden
+         self.rows, self.prefill = rows, prefill
++        self.rope_rows = None          # an image prompt chunk's [rows, 3] int32 t/h/w positions, else None
+         head_rows = 1 if prefill else rows
+         bf, f32 = torch.bfloat16, torch.float32
+         self.ids = torch.zeros((rows,), dtype=torch.int32, device=dev)
+@@ -129,6 +130,9 @@ class State:
+         self.capacity = capacity
+         self.pos = 0
+         self.pos_dev = torch.zeros((1,), dtype=torch.int32, device=dev)
++        # text after an image prompt rotates at its cache position plus this offset (0: no images, the plain path)
++        self.rope_delta = 0
++        self.rope_delta_dev = torch.zeros((1,), dtype=torch.int32, device=dev)
+         lin = [l for l in w.layers if l.linear]
+         att = [l for l in w.layers if not l.linear]
+         self.lin_index = {l.index: i for i, l in enumerate(lin)}
+@@ -170,9 +174,14 @@ class State:
+         self.ple_history = w.cfg.ngram(0).initial_history() if w.cfg.ple_layers else None
+         self.ple_last = None
+         self.set_pos(0)
++        self.set_rope_delta(0)
+         self.mtp_drafted = 0
+         self.set_mtp_len(0)
+ 
++    def set_rope_delta(self, delta: int) -> None:
++        self.rope_delta = int(delta)
++        self.rope_delta_dev.fill_(int(delta))
++
+     def clone(self) -> "State":
+         """An independent copy (tests and A/B checks)."""
+ 
+@@ -218,5 +227,6 @@ class State:
+         self.ple_history = None if snap["ple_history"] is None else snap["ple_history"].copy()
+         self.ple_last = None
+         self.set_pos(snap["pos"])
++        self.set_rope_delta(0)                       # kept prompts are text only
+         self.mtp_drafted = 0
+         self.set_mtp_len(snap["mtp_len"])
+diff --git tensorfold/families/qwen4_exp/cuda/weights.py tensorfold/families/qwen4_exp/cuda/weights.py
+index cfd1d23..408f4d3 100644
+--- tensorfold/families/qwen4_exp/cuda/weights.py
++++ tensorfold/families/qwen4_exp/cuda/weights.py
+@@ -78,6 +78,7 @@ class Config:
+     bits: int
+     quant: str = "mlx"                 # "mlx" (affine 4-bit everywhere) or "modelopt" (NVFP4 routed experts)
+     nvfp4_group: int = 16              # the NVFP4 block size (the checkpoint's config_groups weights.group_size)
++    mrope_section: tuple[int, int, int] = (11, 11, 10)   # interleaved t/h/w rotary pairs (image and video positions)
+ 
+     @classmethod
+     def read(cls, model_dir: str | Path) -> "Config":
+@@ -116,6 +117,7 @@ class Config:
+             ple_eos=int(teos[0] if isinstance(teos, list) else teos) if teos is not None else 0,
+             eos=eos, group_size=int(quant.get("group_size", 32)), bits=int(quant.get("bits", 4)),
+             quant=method, nvfp4_group=group,
++            mrope_section=tuple(int(x) for x in rope.get("mrope_section", (11, 11, 10))),
+         )
+ 
+     @property
+diff --git tensorfold/serve_options.py tensorfold/serve_options.py
+index 4d959b3..772005d 100644
+--- tensorfold/serve_options.py
++++ tensorfold/serve_options.py
+@@ -17,6 +17,8 @@ def check(args: argparse.Namespace, family: Any, backend: str, config_dir: Any =
+         from tensorfold.vision.config import validate_vision_config
+ 
+         validate_vision_config(read_config(config_dir) if config_dir else {}, family.model_type)
++        if family.model_type == "qwen4_exp" and backend != "cuda":
++            raise ValueError("--vision for Flash Next runs on the CUDA engine; the MLX path has no image tower yet")
+     share = getattr(args, "decode_share", None)
+     if share is not None and backend == "cuda":
+         raise ValueError("--decode-share sets the Mac server's share; the CUDA engine runs a round after each 1,024 "
+diff --git tensorfold/server/messages.py tensorfold/server/messages.py
+index 24bbd82..dde2b67 100644
+--- tensorfold/server/messages.py
++++ tensorfold/server/messages.py
+@@ -28,6 +28,9 @@ def late_system_role(render: Callable[[list[dict[str, Any]]], Any]) -> str:
+         return "user"
+ 
+ 
++_VISUAL = ("image_url", "image", "video_url", "video")      # a video part reaches here only where videos are on
++
++
+ def normalize_messages(messages: list[dict[str, Any]], *, late_system: str = "system",
+                        allow_images: bool = False) -> list[dict[str, Any]]:
+     """Merge leading instructions as system text and retain later instructions as ``late_system`` so earlier conversation tokens stay unchanged."""
+@@ -45,12 +48,12 @@ def normalize_messages(messages: list[dict[str, Any]], *, late_system: str = "sy
+             raise RequestError("this server accepts text only; image, audio and video inputs are unsupported")
+         content = message.get("content")
+         if isinstance(content, list) and allow_images and any(
+-                isinstance(p, dict) and p.get("type") in ("image_url", "image") for p in content):
++                isinstance(p, dict) and p.get("type") in _VISUAL for p in content):
+             if role != "user":
+-                raise RequestError("images are supported only in user messages")
++                raise RequestError("images and videos are supported only in user messages")
+             for part in content:
+-                if not isinstance(part, dict) or part.get("type") not in ("text", "image_url", "image"):
+-                    raise RequestError("image messages may contain text and image_url parts only")
++                if not isinstance(part, dict) or part.get("type") not in ("text", *_VISUAL):
++                    raise RequestError("image messages may contain text and image_url (or video_url) parts only")
+                 if part["type"] == "text" and not isinstance(part.get("text"), str):
+                     raise RequestError("a text content part must contain a text string")
+             out.append({**message, "content": list(content)})
+diff --git tensorfold/server/prompts.py tensorfold/server/prompts.py
+index ebf64e7..12fb345 100644
+--- tensorfold/server/prompts.py
++++ tensorfold/server/prompts.py
+@@ -18,7 +18,7 @@ class RenderedPrompt:
+ 
+ def has_images(messages):
+     return any(isinstance(m, dict) and isinstance(m.get('content'), list)
+-               and any(isinstance(p, dict) and p.get('type') == 'image_url' for p in m['content'])
++               and any(isinstance(p, dict) and p.get('type') in ('image_url', 'video_url') for p in m['content'])
+                for m in messages or [])
+ 
+ 
+@@ -45,14 +45,24 @@ def prepare_images(frontend, messages, render, *, context_limit=None):
+     if frontend is None:
+         raise RequestError('image input requires a supported vision checkpoint served with --vision')
+     allow_urls = bool(getattr(frontend, 'allow_urls', False))
++    videos = bool(getattr(frontend, 'videos', False))       # a frontend that encodes video frames too
+     try:
+-        template, sources = split_images(messages, allow_urls=allow_urls)
++        template, sources = split_images(messages, allow_urls=allow_urls, allow_videos=videos)
+     except (ImageInputError, ValueError) as exc:
+         raise RequestError(str(exc)) from exc
+     slot = image_slot()
+     try:
+-        images = load_images(sources, allow_urls=allow_urls)
+-        prepared = frontend.prepare(render(template), images, max_prompt_tokens=context_limit)
++        from tensorfold.vision.images import ImageSource
++
++        images = load_images([s for s in sources if isinstance(s, ImageSource)], allow_urls=allow_urls)
++        clips = [s for s in sources if not isinstance(s, ImageSource)]
++        if clips:
++            from tensorfold.vision.videos import load_videos
++
++            clips = load_videos(clips, frontend.video_size, allow_urls=allow_urls)
++            prepared = frontend.prepare(render(template), images, videos=clips, max_prompt_tokens=context_limit)
++        else:
++            prepared = frontend.prepare(render(template), images, max_prompt_tokens=context_limit)
+     except (ImageInputError, ValueError, ImportError) as exc:
+         raise RequestError(str(exc)) from exc
+     finally:
+diff --git tensorfold/vision/config.py tensorfold/vision/config.py
+index ef30d5a..8c72df9 100644
+--- tensorfold/vision/config.py
++++ tensorfold/vision/config.py
+@@ -2,9 +2,13 @@
+ from __future__ import annotations
+ 
+ 
++FAMILIES = ('qwen3_5', 'qwen4_exp')     # the Qwen3.5/3.8 dense models, and Flash Next (same tower) on CUDA
++
++
+ def validate_vision_config(config, family):
+-    if family != 'qwen3_5':
+-        raise ValueError('--vision currently supports Qwen3.5/3.8 dense checkpoints with their vision tower')
++    if family not in FAMILIES:
++        raise ValueError('--vision currently supports Qwen3.5/3.8 dense and Flash Next checkpoints with their vision '
++                         'tower')
+     vision = config.get('vision_config')
+     text = config.get('text_config', config)
+     if not isinstance(vision, dict) or not vision:
+diff --git tensorfold/vision/images.py tensorfold/vision/images.py
+index cd4b1d2..e68c516 100644
+--- tensorfold/vision/images.py
++++ tensorfold/vision/images.py
+@@ -113,9 +113,10 @@ def _check_source(source: ImageSource, limits: ImageLimits, allow_urls: bool = F
+         raise ImageInputError("image URL is too long")
+ 
+ 
+-def split_images(messages: list[dict[str, Any]], *, limits: ImageLimits = DEFAULT_LIMITS, allow_urls: bool = False
+-                 ) -> tuple[list[dict[str, Any]], list[ImageSource]]:
+-    """Preserve ordered parts, replacing user image URLs with processor image markers."""
++def split_images(messages: list[dict[str, Any]], *, limits: ImageLimits = DEFAULT_LIMITS, allow_urls: bool = False,
++                 allow_videos: bool = False) -> tuple[list[dict[str, Any]], list[ImageSource]]:
++    """Preserve ordered parts, replacing user image URLs with processor image markers; ``allow_videos``: also
++    ``video_url`` parts (``VideoSource`` among the sources, a video marker in the template)."""
+     if not isinstance(messages, list) or not messages:
+         raise ImageInputError("messages must be a non-empty list")
+     output, sources = [], []
+@@ -142,18 +143,32 @@ def split_images(messages: list[dict[str, Any]], *, limits: ImageLimits = DEFAUL
+                 if not isinstance(part.get("text"), str) or any(part.get(key) for key in _MEDIA):
+                     raise ImageInputError("text parts must contain a text string without media")
+                 parts.append(dict(part))
++            elif kind == "video_url" and allow_videos:
++                from .videos import DEFAULT_VIDEO_LIMITS, video_source
++
++                if role != "user":
++                    raise ImageInputError("video_url parts are supported only in user messages")
++                if any(part.get(key) for key in _MEDIA - {"video_url"}):
++                    raise ImageInputError("video_url parts cannot contain other media")
++                videos = sum(type(s).__name__ == "VideoSource" for s in sources)
++                if videos >= DEFAULT_VIDEO_LIMITS.max_videos:
++                    raise ImageInputError(f"a request supports at most {DEFAULT_VIDEO_LIMITS.max_videos} videos")
++                sources.append(video_source(part.get("video_url"), DEFAULT_VIDEO_LIMITS, allow_urls))
++                parts.append({"type": "video"})
+             elif kind == "image_url":
+                 if role != "user":
+                     raise ImageInputError("image_url parts are supported only in user messages")
+                 if any(part.get(key) for key in _MEDIA - {"image_url"}):
+                     raise ImageInputError("image_url parts cannot contain other media")
+-                if len(sources) >= limits.max_images:
++                if sum(isinstance(s, ImageSource) for s in sources) >= limits.max_images:
+                     raise ImageInputError(f"a request supports at most {limits.max_images} images")
+                 source = _source(part.get("image_url"), limits, allow_urls)
+                 sources.append(source)
+                 parts.append({"type": "image", "detail": source.detail})
+             else:
+-                raise ImageInputError("content parts must be text or image_url; audio and video are unsupported")
++                raise ImageInputError("content parts must be text, image_url or video_url; audio is unsupported"
++                                      if allow_videos else
++                                      "content parts must be text or image_url; audio and video are unsupported")
+         output.append({**message, "content": parts})
+     return output, sources
+ 
+diff --git tensorfold/vision/images_http.py tensorfold/vision/images_http.py
+index 16d6627..f354aea 100644
+--- tensorfold/vision/images_http.py
++++ tensorfold/vision/images_http.py
+@@ -109,7 +109,7 @@ def _close_socket(sock: socket.socket) -> None:
+ 
+ 
+ def _request(host: str, port: int, target: str, addresses: list[tuple],
+-             max_bytes: int, deadline: float) -> tuple[bytes | None, str | None, str | None]:
++             max_bytes: int, deadline: float, media_types=MEDIA_TYPES) -> tuple[bytes | None, str | None, str | None]:
+     """A watchdog bounds slow headers and TLS handshakes, not just individual reads."""
+     timeout = _remaining(deadline)
+     family, kind, protocol, _, address = addresses[0]
+@@ -128,7 +128,7 @@ def _request(host: str, port: int, target: str, addresses: list[tuple],
+         sock.settimeout(_remaining(deadline))
+         sock.do_handshake()
+         connection.sock = sock
+-        connection.request("GET", target, headers={"Accept": ", ".join(MEDIA_TYPES), "Accept-Encoding": "identity",
++        connection.request("GET", target, headers={"Accept": ", ".join(media_types), "Accept-Encoding": "identity",
+                                                    "User-Agent": f"TensorFold/{__version__}"})
+         response = connection.getresponse()
+         _remaining(deadline)
+@@ -142,8 +142,9 @@ def _request(host: str, port: int, target: str, addresses: list[tuple],
+         if response.getheader("Content-Encoding", "identity").lower() != "identity":
+             raise ImageInputError("compressed HTTP image responses are unsupported")
+         media = response.getheader("Content-Type", "").split(";", 1)[0].strip().lower()
+-        if media not in MEDIA_TYPES:
+-            raise ImageInputError("image URL content type must be JPEG, PNG or WebP")
++        if media not in media_types:
++            raise ImageInputError("image URL content type must be JPEG, PNG or WebP" if media_types is MEDIA_TYPES
++                                  else f"media URL content type must be one of {', '.join(media_types)}")
+         length = response.getheader("Content-Length")
+         if length is not None:
+             if not length.isascii() or not length.isdecimal() or int(length) > max_bytes:
+@@ -166,13 +167,13 @@ def _request(host: str, port: int, target: str, addresses: list[tuple],
+ 
+ 
+ def fetch_image(url: str, *, max_bytes: int, deadline: float, max_redirects: int,
+-                max_url_chars: int) -> tuple[bytes, str]:
++                max_url_chars: int, media_types=MEDIA_TYPES) -> tuple[bytes, str]:
+     """Resolve and validate each redirect, then connect directly to its checked address."""
+     try:
+         for redirect in range(max_redirects + 1):
+             host, port, target = _url(url, max_url_chars)
+             addresses = _resolve(host, port, deadline)
+-            data, location, media = _request(host, port, target, addresses, max_bytes, deadline)
++            data, location, media = _request(host, port, target, addresses, max_bytes, deadline, media_types)
+             if location is None:
+                 return data, media
+             if redirect == max_redirects:
+diff --git tensorfold/vision/qwen_cuda.py tensorfold/vision/qwen_cuda.py
+index e5624f0..e74cd77 100644
+--- tensorfold/vision/qwen_cuda.py
++++ tensorfold/vision/qwen_cuda.py
+@@ -8,7 +8,8 @@ import math
+ from pathlib import Path
+ from typing import Any
+ 
+-MAX_PATCHES = 16384
++MAX_PATCHES = 16384                  # an image request's patches, and a video's per tower call
++MAX_VIDEO_PATCHES = 16 * 16384       # a request's video patches (~65k tokens), encoded MAX_PATCHES at a time
+ WORKSPACE_BYTES = 4 * 1024**3
+ 
+ 
+@@ -35,7 +36,8 @@ class EncodedVision:
+ def vision_config(model_dir: str | Path) -> dict:
+     raw = json.loads((Path(model_dir) / "config.json").read_text())
+     config = raw.get("vision_config")
+-    if not isinstance(config, dict) or config.get("model_type") != "qwen3_5":
++    # Flash Next (qwen4_exp) carries the Qwen3.5 tower unchanged (transformers: Qwen4ExpVisionModel is Qwen3.5's)
++    if not isinstance(config, dict) or config.get("model_type") not in ("qwen3_5", "qwen4_exp"):
+         raise ValueError("CUDA vision requires a Qwen3.5-compatible vision checkpoint")
+     if config.get("deepstack_visual_indexes"):
+         raise ValueError("CUDA Qwen vision does not support deepstack image features")
+@@ -110,7 +112,7 @@ def weight_transform(base, enabled: bool, rank: int):
+     return transform
+ 
+ 
+-def capacity_geometry(base, model_dir, enabled: bool, rank: int):
++def capacity_geometry(base, model_dir, enabled: bool, rank: int, workspace: int = WORKSPACE_BYTES):
+     def geometry(text):
+         from tensorfold.cuda.capacity import Geometry
+ 
+@@ -119,7 +121,7 @@ def capacity_geometry(base, model_dir, enabled: bool, rank: int):
+             return result
+         if rank == 0:
+             checkpoint_vision(model_dir)
+-        reserve = WORKSPACE_BYTES if rank == 0 else 128 * 1024**2
++        reserve = workspace if rank == 0 else 128 * 1024**2
+         return Geometry(lambda slots: result.bytes_at(slots) + reserve, result.reserve, result.minimum_slots)
+     return geometry
+ 
+@@ -140,8 +142,13 @@ class QwenCudaVision:
+         self.frontend = QwenImageProcessor.from_directory(model_dir)
+         raw = json.loads((Path(model_dir) / "config.json").read_text())
+         self.image_token = int(raw["image_token_id"])
++        # videos: Flash Next's frontend (the frame groups ride the image path; tested on that checkpoint)
++        self.videos = raw.get("model_type") == "qwen4_exp" and "video_token_id" in raw
++        self.media_tokens = frozenset({self.image_token} | ({int(raw["video_token_id"])} if self.videos else set()))
+         self.device = device
+-        config = Qwen3_5VisionConfig(**self.config)
++        # the tower's own fields: a Flash Next config also names its model type and an empty deepstack list
++        fields = {k: v for k, v in self.config.items() if k not in ("model_type", "deepstack_visual_indexes")}
++        config = Qwen3_5VisionConfig(**fields)
+         config._attn_implementation = "sdpa"
+         with torch.device("meta"):
+             tower = Qwen3_5VisionModel(config)
+@@ -169,41 +176,93 @@ class QwenCudaVision:
+         if tuple(prompt) != tuple(prepared.token_ids):
+             raise ValueError("vision preparation belongs to different prompt tokens")
+         grid = prepared.image_grid_thw
++        videos = getattr(prepared, "video_grid_thw", None)
++        if videos is not None and not self.videos:
++            raise ValueError("this server's vision frontend encodes images only")
+         if len(grid.shape) != 2 or grid.shape[1] != 3 or any(int(t) != 1 for t in grid[:, 0]):
+             raise ValueError("CUDA vision accepts images with one temporal grid, not video")
+         merge = self.config["spatial_merge_size"]
+-        if any(int(value) != value or value <= 0 for row in grid for value in row) or any(
+-                int(h) % merge or int(w) % merge for _, h, w in grid):
++        every = list(grid) + ([] if videos is None else list(videos))
++        if any(int(value) != value or value <= 0 for row in every for value in row) or any(
++                int(h) % merge or int(w) % merge for _, h, w in every):
+             raise ValueError("image grids must contain positive merge-aligned dimensions")
+         patches = sum(int(t) * int(h) * int(w) for t, h, w in grid)
+-        if patches <= 0 or patches > MAX_PATCHES:
++        clips = 0 if videos is None else sum(int(t) * int(h) * int(w) for t, h, w in videos)
++        if patches > MAX_PATCHES or (patches <= 0 and clips <= 0):
+             raise ValueError(f"image request exceeds the CUDA vision budget of {MAX_PATCHES} patches")
++        if clips > MAX_VIDEO_PATCHES:
++            raise ValueError(f"video request exceeds the CUDA vision budget of {MAX_VIDEO_PATCHES} patches")
+         patch_width = (self.config["in_channels"] * self.config["temporal_patch_size"] * self.config["patch_size"]**2)
+-        if tuple(prepared.pixel_values.shape) != (patches, patch_width):
++        if tuple(prepared.pixel_values.shape) != (patches, patch_width) or (
++                videos is not None and tuple(prepared.video_pixel_values.shape) != (clips, patch_width)):
+             raise ValueError("image patch tensor has an invalid shape")
+         if tuple(prepared.position_ids.shape) != (3, 1, len(prompt)):
+             raise ValueError("image positions must have shape (3, 1, prompt tokens)")
+-        rows = tuple(i for start, end in prepared.image_spans for i in range(start, end))
++        frames = tuple(getattr(prepared, "video_spans", ()))
++        spans = sorted(tuple(prepared.image_spans) + frames)
++        rows = tuple(i for start, end in spans for i in range(start, end))
+         positions = prepared.position_ids[:, 0, :].tolist()
+-        validate_encoded(rows, positions, prepared.rope_delta, prompt, self.image_token,
+-                         (patches // self.config["spatial_merge_size"]**2, self.config["out_hidden_size"]),
++        validate_encoded(rows, positions, prepared.rope_delta, prompt, self.media_tokens,
++                         ((patches + clips) // merge**2, self.config["out_hidden_size"]),
+                          self.config["out_hidden_size"])
+         with torch.inference_mode(), sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]):
+-            # a copy: the prepared arrays are read-only, and a tensor may not share them
+-            pixels = torch.tensor(prepared.pixel_values, dtype=torch.bfloat16, device=self.device)
+-            grids = torch.tensor(grid, dtype=torch.int64, device=self.device)
+-            features = self.tower(pixels, grid_thw=grids, return_dict=True).pooler_output
+-            features = features.to(dtype=torch.bfloat16).contiguous()
++            blocks = {}                                  # span start -> its features, in the tower's order
++            if patches:
++                # a copy: the prepared arrays are read-only, and a tensor may not share them
++                pixels = torch.tensor(prepared.pixel_values, dtype=torch.bfloat16, device=self.device)
++                grids = torch.tensor(grid, dtype=torch.int64, device=self.device)
++                features = self.tower(pixels, grid_thw=grids, return_dict=True).pooler_output
++                features = features.to(dtype=torch.bfloat16)
++                for (start, end), part in zip(prepared.image_spans, features.split([e - s for s, e in
++                                                                                    prepared.image_spans])):
++                    blocks[start] = part
++            if clips:
++                # frame groups never attend to one another: a video encodes a bounded run of them at a time
++                done, spans_left = 0, iter(frames)
++                for t, h, w in videos:
++                    t, h, w = int(t), int(h), int(w)
++                    step = max(1, MAX_PATCHES // (h * w))
++                    for g in range(0, t, step):
++                        n = min(step, t - g)
++                        pixels = torch.tensor(prepared.video_pixel_values[done:done + n * h * w],
++                                              dtype=torch.bfloat16, device=self.device)
++                        grids = torch.tensor([[n, h, w]], dtype=torch.int64, device=self.device)
++                        features = self.tower(pixels, grid_thw=grids, return_dict=True).pooler_output
++                        for part in features.to(dtype=torch.bfloat16).split(h * w // merge**2):
++                            start, end = next(spans_left)
++                            if end - start != part.shape[0]:
++                                raise ValueError("video frame features do not match their placeholders")
++                            blocks[start] = part
++                        done += n * h * w
++            features = torch.cat([blocks[start] for start, _ in spans]).contiguous()
+         if tuple(features.shape) != (len(rows), self.config["out_hidden_size"]):
+             raise ValueError("vision tower returned a different number of image features")
+         return EncodedVision(rows, features, torch.tensor(positions, dtype=torch.int32, device=self.device),
+                              prepared.rope_delta)
+ 
++    def warm(self) -> None:
++        """One tower pass over a 512 x 512 image's worth of patches, so a request never pays the first call's loads."""
++        import torch
++        from torch.nn.attention import SDPBackend, sdpa_kernel
++
++        side = 512 // self.config["patch_size"]
++        width = self.config["in_channels"] * self.config["temporal_patch_size"] * self.config["patch_size"]**2
++        with torch.inference_mode(), sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]):
++            pixels = torch.zeros((side * side, width), dtype=torch.bfloat16, device=self.device)
++            grids = torch.tensor([[1, side, side]], dtype=torch.int64, device=self.device)
++            self.tower(pixels, grid_thw=grids, return_dict=True)
++        torch.cuda.synchronize()
++
++    def video_size(self, frames: int, height: int, width: int) -> tuple[int, int]:
++        return self.frontend.video_size(frames, height, width)
++
+ 
+-def validate_encoded(rows, positions, delta: int, prompt, image_token: int, feature_shape, hidden: int) -> None:
+-    """Reject a payload that could overwrite text rows or misalign the language cache."""
++def validate_encoded(rows, positions, delta: int, prompt, image_token, feature_shape, hidden: int) -> None:
++    """Reject a payload that could overwrite text rows or misalign the language cache; ``image_token``: the
++    placeholder id, or the set of them (images and videos)."""
+     n = len(prompt)
+-    if list(rows) != [i for i, token in enumerate(prompt) if token == image_token]:
++    media = image_token if isinstance(image_token, (set, frozenset, tuple)) else {image_token}
++    if list(rows) != [i for i, token in enumerate(prompt) if token in media]:
+         raise ValueError("vision feature rows must match every image placeholder exactly")
+     if not rows or tuple(feature_shape) != (len(rows), hidden):
+         raise ValueError("vision feature count or width differs from the image placeholders")
+diff --git tensorfold/vision/qwen_processing.py tensorfold/vision/qwen_processing.py
+index 1a91af9..58f6950 100644
+--- tensorfold/vision/qwen_processing.py
++++ tensorfold/vision/qwen_processing.py
+@@ -4,6 +4,7 @@ from __future__ import annotations
+ 
+ from dataclasses import dataclass, replace
+ import json
++import re
+ from pathlib import Path
+ from typing import Any, Sequence
+ 
+@@ -19,10 +20,15 @@ class PreparedVisionPrompt:
+     rope_delta: int
+     image_spans: tuple[tuple[int, int], ...]
+     image_hashes: tuple[str, ...]
++    # videos (a CUDA frontend with ``videos``): patches, one (frames, height, width) grid each, one span a frame group
++    video_pixel_values: np.ndarray | None = None
++    video_grid_thw: np.ndarray | None = None
++    video_spans: tuple[tuple[int, int], ...] = ()
++    video_hashes: tuple[str, ...] = ()
+ 
+     @property
+     def visual_tokens(self) -> int:
+-        return sum(end - start for start, end in self.image_spans)
++        return sum(end - start for start, end in self.image_spans + self.video_spans)
+ 
+ 
+ def continued(prepared: PreparedVisionPrompt, tokens: Sequence[int], config: dict) -> PreparedVisionPrompt:
+@@ -30,8 +36,8 @@ def continued(prepared: PreparedVisionPrompt, tokens: Sequence[int], config: dic
+     tokens = tuple(int(t) for t in tokens)
+     if tokens[:len(prepared.token_ids)] != prepared.token_ids:
+         raise ValueError("a continued image prompt must start with the prepared prompt's tokens")
+-    positions, delta, spans = image_positions(tokens, prepared.image_grid_thw, config)
+-    if spans != prepared.image_spans:
++    positions, delta, spans, frames = media_positions(tokens, prepared.image_grid_thw, prepared.video_grid_thw, config)
++    if spans != prepared.image_spans or frames != prepared.video_spans:
+         raise ValueError("a continued image prompt may add text only")
+     positions.setflags(write=False)
+     return replace(prepared, token_ids=tokens, position_ids=positions, rope_delta=delta)
+@@ -39,29 +45,55 @@ def continued(prepared: PreparedVisionPrompt, tokens: Sequence[int], config: dic
+ 
+ def image_positions(tokens: Sequence[int], grids: Sequence[Sequence[int]], config: dict):
+     """Calculate Qwen's three image rotary axes and continuation delta without importing MLX."""
++    positions, delta, spans, _ = media_positions(tokens, grids, None, config)
++    return positions, delta, spans
++
++
++def media_positions(tokens: Sequence[int], grids: Sequence[Sequence[int]], video_grids, config: dict):
++    """Qwen3.5's rope index (transformers ``get_rope_index``): text counts up on all three axes; each image, and each
++    frame group of a video (its own ``<|vision_start|>`` block after its timestamp), sits at the next position with
++    rows and columns on the h and w axes, and the text after it resumes past its larger side. ``video_grids`` None:
++    videos are refused. Returns the positions [3, 1, n], the decode offset, image spans and frame-group spans."""
+     merge = int(config["vision_config"]["spatial_merge_size"])
+     image = int(config["image_token_id"])
++    video = int(config.get("video_token_id", -1))
+     start_token, end_token = int(config["vision_start_token_id"]), int(config["vision_end_token_id"])
+     tokens = [int(t) for t in tokens]
+-    if int(config.get("video_token_id", -1)) in tokens:
++    if video_grids is None and video in tokens:
+         raise ValueError("Video inputs are not supported by the Qwen image frontend")
++    frames = []
++    for raw in video_grids if video_grids is not None else ():
++        if len(raw) != 3:
++            raise ValueError("A video grid must have temporal, height and width dimensions")
++        t, h, w = (int(x) for x in raw)
++        if min(t, h, w, merge) <= 0 or h % merge or w % merge:
++            raise ValueError("A video grid must contain frames and merge-aligned positive dimensions")
++        frames.extend([(1, h, w)] * t)                  # one block a frame group, as transformers splits the grid
++    pending = {image: list(grids), video: frames}
++    used = {image: 0, video: 0}
++    spans = {image: [], video: []}
+     positions = np.zeros((3, 1, len(tokens)), dtype=np.int32)
+-    spans, cursor, next_pos = [], 0, 0
+-    for raw in grids:
++    cursor, next_pos, n = 0, 0, len(tokens)
++    while True:
++        begin = next((i for i in range(cursor, n) if tokens[i] == image or tokens[i] == video), None)
++        if begin is None:
++            break
++        kind = tokens[begin]
++        what = "image" if kind == image else "video"
++        if used[kind] >= len(pending[kind]):
++            raise ValueError(f"The prompt contains {what} tokens without a corresponding {what}")
++        raw = pending[kind][used[kind]]
++        used[kind] += 1
+         if len(raw) != 3:
+             raise ValueError("An image grid must have temporal, height and width dimensions")
+         t, h, w = (int(x) for x in raw)
+         if t != 1 or min(h, w, merge) <= 0 or h % merge or w % merge:
+             raise ValueError("An image grid must contain one frame and merge-aligned positive dimensions")
+-        try:
+-            begin = tokens.index(image, cursor)
+-        except ValueError as error:
+-            raise ValueError("Image grid has no matching image tokens in the prompt") from error
+         h, w = h // merge, w // merge
+         end = begin + h * w
+         if (begin == 0 or tokens[begin - 1] != start_token or end >= len(tokens)
+-                or tokens[end] != end_token or tokens[begin:end] != [image] * (h * w)):
+-            raise ValueError("Image placeholders must match the processed image grid exactly")
++                or tokens[end] != end_token or tokens[begin:end] != [kind] * (h * w)):
++            raise ValueError(f"{what.capitalize()} placeholders must match the processed {what} grid exactly")
+         text = np.arange(next_pos, next_pos + begin - cursor, dtype=np.int32)
+         positions[:, 0, cursor:begin] = text
+         base = next_pos + begin - cursor
+@@ -69,12 +101,14 @@ def image_positions(tokens: Sequence[int], grids: Sequence[Sequence[int]], confi
+         positions[1, 0, begin:end] = base + np.repeat(np.arange(h, dtype=np.int32), w)
+         positions[2, 0, begin:end] = base + np.tile(np.arange(w, dtype=np.int32), h)
+         next_pos, cursor = base + max(h, w), end
+-        spans.append((begin, end))
+-    if image in tokens[cursor:]:
+-        raise ValueError("The prompt contains image tokens without a corresponding image")
++        spans[kind].append((begin, end))
++    if used[image] < len(pending[image]):
++        raise ValueError("Image grid has no matching image tokens in the prompt")
++    if used[video] < len(frames):
++        raise ValueError("Video grid has no matching video tokens in the prompt")
+     positions[:, 0, cursor:] = np.arange(next_pos, next_pos + len(tokens) - cursor, dtype=np.int32)
+     delta = next_pos - cursor
+-    return positions, delta, tuple(spans)
++    return positions, delta, tuple(spans[image]), tuple(spans[video])
+ 
+ 
+ def _processor_options(model_dir: Path, vision: dict) -> dict:
+@@ -119,6 +153,13 @@ class QwenImageProcessor:
+             raise ValueError("The local tokenizer does not define the checkpoint's image token")
+         if tokenizer.convert_tokens_to_ids(self.image_token) != int(config["image_token_id"]):
+             raise ValueError("The local tokenizer's image token does not match the checkpoint")
++        # video markers: the pad token and the block the chat template wraps it in
++        self.video_token = self.vision_start = self.vision_end = self.video_marker = None
++        if all(key in config for key in ("video_token_id", "vision_start_token_id", "vision_end_token_id")):
++            self.video_token, self.vision_start, self.vision_end = (
++                tokenizer.convert_ids_to_tokens(int(config[key]))
++                for key in ("video_token_id", "vision_start_token_id", "vision_end_token_id"))
++            self.video_marker = f"{self.vision_start}{self.video_token}{self.vision_end}"
+ 
+     @classmethod
+     def from_directory(cls, model_dir: str | Path) -> "QwenImageProcessor":
+@@ -127,27 +168,38 @@ class QwenImageProcessor:
+         if not path.is_dir():
+             raise ValueError("Image preprocessing requires a local checkpoint directory")
+         config = json.loads((path / "config.json").read_text())
+-        if config.get("model_type") != "qwen3_5" or not config.get("vision_config"):
+-            raise ValueError("Image preprocessing currently supports Qwen3.5/3.8 dense multimodal checkpoints only")
++        if config.get("model_type") not in ("qwen3_5", "qwen4_exp") or not config.get("vision_config"):
++            raise ValueError("Image preprocessing currently supports Qwen3.5/3.8 dense and Flash Next multimodal "
++                             "checkpoints only")
+         AutoTokenizer, ImageProcessor = _processor_runtime()
+         tokenizer = AutoTokenizer.from_pretrained(str(path), local_files_only=True, trust_remote_code=False)
+         processor = ImageProcessor(**_processor_options(path, config["vision_config"]))
+         return cls(config, processor, tokenizer)
+ 
+-    def prepare(self, rendered_prompt: str, images: Sequence[Any], *, max_visual_tokens: int = 4096,
+-                max_prompt_tokens: int | None = None) -> PreparedVisionPrompt:
+-        """Expand image markers and calculate request-local rotary metadata without touching the GPU."""
+-        if not images or max_visual_tokens < 1:
++    def prepare(self, rendered_prompt: str, images: Sequence[Any], *, videos: Sequence[Any] = (),
++                max_visual_tokens: int = 4096, max_prompt_tokens: int | None = None) -> PreparedVisionPrompt:
++        """Expand image (and video) markers and calculate request-local rotary metadata without touching the GPU.
++        A video marker (``<|vision_start|><|video_pad|><|vision_end|>``) becomes one timestamped block a frame group,
++        ``<t seconds><|vision_start|>pads<|vision_end|>``, as Qwen3-VL's processor writes it."""
++        if (not images and not videos) or max_visual_tokens < 1:
+             raise ValueError("Image preprocessing needs images and a positive visual-token budget")
+         if rendered_prompt.count(self.image_token) != len(images):
+             raise ValueError("The rendered prompt must contain exactly one image marker for each image")
++        if videos and self.video_token is None:
++            raise ValueError("this checkpoint's config names no video token")
++        if videos and rendered_prompt.count(self.video_token) != len(videos):
++            raise ValueError("The rendered prompt must contain exactly one video marker for each video")
+         if len(images) > max_visual_tokens:
+             raise ValueError("The image count exceeds the visual-token budget")
+         vision = self.config["vision_config"]
+         factor = int(vision["patch_size"]) * int(vision["spatial_merge_size"])
+-        limit = max_visual_tokens // len(images)
+-        per_image = min(int(getattr(self.processor, "max_pixels", limit * factor**2)), limit * factor**2)
++        merge = int(vision["spatial_merge_size"])
++        expected_width = (int(vision.get("in_channels", 3)) * int(vision["temporal_patch_size"])
++                          * int(vision["patch_size"])**2)
+         parts, grids = [], []
++        if images:
++            limit = max_visual_tokens // len(images)
++            per_image = min(int(getattr(self.processor, "max_pixels", limit * factor**2)), limit * factor**2)
+         for image in images:
+             cap = min(per_image, 256 * factor**2) if getattr(image, "detail", "auto") == "low" else per_image
+             result = self.processor(images=[image.to_pil()], max_pixels=cap,
+@@ -155,30 +207,95 @@ class QwenImageProcessor:
+             pixels, grid = np.asarray(result["pixel_values"]), np.asarray(result["image_grid_thw"], dtype=np.int64)
+             if grid.shape != (1, 3) or pixels.ndim != 2:
+                 raise ValueError("The image processor returned an invalid patch/grid shape")
+-            expected_width = (int(vision.get("in_channels", 3)) * int(vision["temporal_patch_size"])
+-                              * int(vision["patch_size"])**2)
+             if pixels.shape != (int(np.prod(grid[0])), expected_width):
+                 raise ValueError("The processed image patches do not match the checkpoint's vision geometry")
+             parts.append(pixels)
+             grids.append(grid[0])
+-        grid = np.asarray(grids, dtype=np.int64)
+-        merge = int(vision["spatial_merge_size"])
++        grid = np.asarray(grids, dtype=np.int64).reshape(-1, 3)
+         counts = [int(np.prod(row)) // merge**2 for row in grid]
+         if sum(counts) > max_visual_tokens:
+             raise ValueError("Processed images exceed the visual-token budget; reduce image resolution or count")
+-        text = rendered_prompt.split(self.image_token)
+-        expanded = text[0] + "".join(self.image_token * n + rest for n, rest in zip(counts, text[1:]))
+-        encoded = self.tokenizer(expanded, add_special_tokens=False, return_attention_mask=False)
++        clips = [self._video_patches(video) for video in videos]
++        markers = [self.image_token] + ([self.video_marker, self.video_token] if videos else [])
++        pieces = re.split("(" + "|".join(re.escape(m) for m in markers) + ")", rendered_prompt)
++        image_counts, clip_iter, expanded = iter(counts), iter(zip(videos, clips)), []
++        for piece in pieces:
++            if piece == self.image_token:
++                expanded.append(self.image_token * next(image_counts))
++            elif piece in (self.video_marker, self.video_token):
++                video, (_, video_grid) = next(clip_iter)
++                seqlen = int(video_grid[1] * video_grid[2]) // merge**2
++                expanded.append("".join(f"<{t:.1f} seconds>{self.vision_start}{self.video_token * seqlen}"
++                                        f"{self.vision_end}"
++                                        for t in video.timestamps(int(vision["temporal_patch_size"]))))
++            else:
++                expanded.append(piece)
++        encoded = self.tokenizer("".join(expanded), add_special_tokens=False, return_attention_mask=False)
+         tokens = tuple(int(t) for t in encoded["input_ids"])
+         if max_prompt_tokens is not None and len(tokens) > max_prompt_tokens:
+             raise ValueError("The expanded image prompt exceeds the token budget; reduce image resolution or prompt length")
+-        positions, delta, spans = image_positions(tokens, grid, self.config)
+-        pixels = np.concatenate(parts, axis=0)
+-        for array in (pixels, grid, positions):
+-            array.setflags(write=False)
++        video_grid = np.asarray([g for _, g in clips], dtype=np.int64).reshape(-1, 3) if videos else None
++        positions, delta, spans, frames = media_positions(tokens, grid, video_grid, self.config)
++        pixels = (np.concatenate(parts, axis=0) if parts else np.zeros((0, expected_width), dtype=np.float32))
++        video_pixels = np.concatenate([p for p, _ in clips], axis=0) if videos else None
++        for array in (pixels, grid, positions, video_pixels, video_grid):
++            if array is not None:
++                array.setflags(write=False)
+         return PreparedVisionPrompt(tokens, pixels, grid, positions, delta, spans,
+-                                    tuple(image.content_hash for image in images))
++                                    tuple(image.content_hash for image in images), video_pixels, video_grid, frames,
++                                    tuple(video.content_hash for video in videos))
+ 
++    def video_size(self, frames: int, height: int, width: int) -> tuple[int, int]:
++        """A video's frame size for the tower: Qwen3-VL's ``smart_resize`` with its per-frame cap (at most 768 tokens a
++        frame group, at least ~134), the whole video within ``TENSORFOLD_VIDEO_TOKENS`` (16,384) tokens."""
++        import math
++        import os
++
++        vision = self.config["vision_config"]
++        factor = int(vision["patch_size"]) * int(vision["spatial_merge_size"])
++        temporal = int(vision["temporal_patch_size"])
++        budget = int(os.environ.get("TENSORFOLD_VIDEO_TOKENS") or 16384)
++        shortest, longest = 128 * factor**2, budget * temporal * factor**2
++        per_frame = max(min(768 * factor**2, longest // max(1, frames)), int(shortest * 1.05))
++        max_pixels = per_frame * frames
++        if frames < temporal:
++            raise ValueError(f"a video needs at least {temporal} frames")
++        if height < factor or width < factor:
++            scale = max(factor / height, factor / width)
++            height, width = int(height * scale), int(width * scale)
++        if max(height, width) / min(height, width) > 200:
++            raise ValueError("a video's aspect ratio must be under 200")
++        h_bar, w_bar = round(height / factor) * factor, round(width / factor) * factor
++        t_bar = round(frames / temporal) * temporal
++        if t_bar * h_bar * w_bar > max_pixels:
++            beta = math.sqrt((frames * height * width) / max_pixels)
++            h_bar = max(factor, math.floor(height / beta / factor) * factor)
++            w_bar = max(factor, math.floor(width / beta / factor) * factor)
++        elif t_bar * h_bar * w_bar < shortest:
++            beta = math.sqrt(shortest / (frames * height * width))
++            h_bar, w_bar = math.ceil(height * beta / factor) * factor, math.ceil(width * beta / factor) * factor
++        return h_bar, w_bar
++
++    def _video_patches(self, video) -> tuple[np.ndarray, np.ndarray]:
++        """Normalized patches [groups * h * w, C * T * p * p] and the (groups, h, w) grid of one decoded video, in the
++        tower's order (Qwen3-VL's ``patchify``; an odd last frame repeats)."""
++        vision = self.config["vision_config"]
++        p, merge, temporal = (int(vision[k]) for k in ("patch_size", "spatial_merge_size", "temporal_patch_size"))
++        frames = np.asarray(video.frames)
++        count, height, width, channels = frames.shape
++        if height % (p * merge) or width % (p * merge) or channels != int(vision.get("in_channels", 3)):
++            raise ValueError("decoded video frames do not match the tower's patch grid")
++        if count % temporal:
++            frames = np.concatenate([frames, np.repeat(frames[-1:], temporal - count % temporal, axis=0)])
++        options = self.processor
++        mean = np.asarray(getattr(options, "image_mean", [0.5] * channels), dtype=np.float32)
++        std = np.asarray(getattr(options, "image_std", [0.5] * channels), dtype=np.float32)
++        scale = np.float32(getattr(options, "rescale_factor", 1 / 255))
++        x = ((frames.astype(np.float32) * scale - mean) / std).transpose(0, 3, 1, 2)       # [T, C, H, W]
++        gt, gh, gw = x.shape[0] // temporal, height // p, width // p
++        x = x.reshape(gt, temporal, channels, gh // merge, merge, p, gw // merge, merge, p)
++        x = x.transpose(0, 3, 6, 4, 7, 2, 1, 5, 8)
++        return np.ascontiguousarray(x.reshape(gt * gh * gw, channels * temporal * p * p)), np.asarray([gt, gh, gw])
+     def estimate_workspace_bytes(self, prepared: PreparedVisionPrompt) -> int:
+         """The tower's measured workspace (unmeasured: every layer's activations at once) plus this request's arrays."""
+         vision = self.config["vision_config"]
+diff --git tensorfold/vision/videos.py tensorfold/vision/videos.py
+new file mode 100644
+index 0000000..271f7ce
+--- /dev/null
++++ tensorfold/vision/videos.py
+@@ -0,0 +1,172 @@
++"""CPU video inputs: bounded bytes, frames sampled at a fixed rate, decoded straight to the tower's resolution."""
++
++from __future__ import annotations
++
++import hashlib
++import io
++import math
++import time
++from dataclasses import dataclass, field
++from typing import Any, Callable
++
++import numpy as np
++
++from .images import _data_bytes
++from .images_http import ImageInputError, fetch_image
++
++VIDEO_MEDIA_TYPES = {"video/mp4": "mp4", "video/webm": "webm", "video/quicktime": "mov", "video/x-matroska": "mkv"}
++
++
++@dataclass(frozen=True, slots=True)
++class VideoLimits:
++    max_videos: int = 2
++    max_encoded_bytes: int = 64 * 1024 * 1024
++    max_total_encoded_bytes: int = 96 * 1024 * 1024
++    max_dimension: int = 8192
++    max_seconds: float = 3600.0          # of footage; frames past the sampled ones are decoded and dropped
++    fps: float = 2.0                      # frames sampled a second (Qwen3-VL's rate)
++    min_frames: int = 4
++    max_frames: int = 256                 # a longer video is sampled more sparsely, over its whole length
++    timeout_seconds: float = 20.0
++    total_timeout_seconds: float = 120.0
++    max_redirects: int = 3
++    max_url_chars: int = 4096
++
++
++DEFAULT_VIDEO_LIMITS = VideoLimits()
++
++
++@dataclass(frozen=True, slots=True)
++class VideoSource:
++    url: str
++
++
++@dataclass(frozen=True, slots=True)
++class VideoInput:
++    frames: np.ndarray            # [frames, height, width, 3] uint8, already at the tower's resolution
++    indices: tuple[int, ...]      # each frame's index in the source
++    fps: float                    # the source's frame rate
++    content_hash: str = field(init=False)
++
++    def __post_init__(self) -> None:
++        if (not isinstance(self.frames, np.ndarray) or self.frames.dtype != np.uint8 or self.frames.ndim != 4
++                or self.frames.shape[-1] != 3 or len(self.indices) != self.frames.shape[0] or not self.indices
++                or not math.isfinite(self.fps) or self.fps <= 0):
++            raise ImageInputError("video input requires RGB frames, one index each and a positive frame rate")
++        self.frames.setflags(write=False)
++        digest = hashlib.sha256(b"tensorfold-video-v1\0" + np.asarray(self.frames.shape, dtype=">u4").tobytes())
++        digest.update(np.asarray(self.indices, dtype=">u8").tobytes())
++        digest.update(self.frames.tobytes())
++        object.__setattr__(self, "content_hash", digest.hexdigest())
++
++    def timestamps(self, temporal: int) -> list[float]:
++        """Each group of ``temporal`` frames' time: the mean of its first and last frame (Qwen3-VL's processor)."""
++        indices = list(self.indices)
++        if len(indices) % temporal:
++            indices.extend(indices[-1] for _ in range(temporal - len(indices) % temporal))
++        seconds = [i / self.fps for i in indices]
++        return [(seconds[i] + seconds[i + temporal - 1]) / 2 for i in range(0, len(seconds), temporal)]
++
++
++def video_source(value: Any, limits: VideoLimits, allow_urls: bool) -> VideoSource:
++    if not isinstance(value, dict) or not isinstance(value.get("url"), str) or not value["url"]:
++        raise ImageInputError("video_url must contain a non-empty url string")
++    url = value["url"]
++    if url.startswith("data:"):
++        if len(url) > limits.max_encoded_bytes * 3 // 2 + 256:
++            raise ImageInputError("video data URL exceeds the encoded byte limit")
++    elif not url.startswith("https://"):
++        raise ImageInputError("videos require data URLs or public HTTPS URLs")
++    elif not allow_urls:
++        raise ImageInputError("video URLs are off on this server; send the video as a data URL, or start the server "
++                              "with --vision-urls")
++    elif len(url) > limits.max_url_chars:
++        raise ImageInputError("video URL is too long")
++    return VideoSource(url)
++
++
++def _av():
++    try:
++        import av
++    except ImportError:
++        raise ImageInputError("video inputs require PyAV (pip install av)") from None
++    return av
++
++
++def sample_indices(total: int, fps: float, limits: VideoLimits) -> np.ndarray:
++    """Qwen3-VL's frame choice: ``limits.fps`` frames a second (at least min_frames, at most max_frames) spread
++    evenly over the whole video."""
++    count = int(total / fps * limits.fps)
++    count = min(max(count, limits.min_frames), limits.max_frames, total)
++    return np.linspace(0, total - 1, count).round().astype(int)
++
++
++def decode_video(data: bytes, size: Callable[[int, int, int], tuple[int, int]], limits: VideoLimits,
++                 deadline: float) -> VideoInput:
++    """Decode the sampled frames of one video, each scaled to ``size(frames, height, width)`` (bicubic)."""
++    av = _av()
++    try:
++        with av.open(io.BytesIO(data), mode="r") as container:
++            if not container.streams.video:
++                raise ImageInputError("the video has no video stream")
++            stream = container.streams.video[0]
++            stream.thread_type = "AUTO"
++            width, height = int(stream.codec_context.width or 0), int(stream.codec_context.height or 0)
++            if min(width, height) <= 0 or max(width, height) > limits.max_dimension:
++                raise ImageInputError("video dimensions are missing or exceed the pixel limit")
++            rate = stream.average_rate or stream.guessed_rate or 24
++            fps = float(rate)
++            seconds = float(stream.duration * stream.time_base) if stream.duration else (
++                container.duration / 1e6 if container.duration else 0.0)
++            total = int(stream.frames or round(seconds * fps))
++            if not 0 < fps <= 1000 or total <= 0:
++                raise ImageInputError("the video's frame count or rate is missing")
++            if total / fps > limits.max_seconds:
++                raise ImageInputError(f"videos are limited to {limits.max_seconds / 60:.0f} minutes")
++            wanted = sample_indices(total, fps, limits)
++            out_h, out_w = size(len(wanted), height, width)
++            keep = set(int(i) for i in wanted)
++            frames, indices = [], []
++            for n, frame in enumerate(container.decode(stream)):
++                if n > wanted[-1] or time.monotonic() >= deadline:
++                    break
++                if n in keep:
++                    frames.append(frame.to_ndarray(format="rgb24", width=out_w, height=out_h,
++                                                   interpolation="BICUBIC"))
++                    indices.append(n)
++            if time.monotonic() >= deadline:
++                raise ImageInputError("video decoding exceeds the time limit")
++    except ImageInputError:
++        raise
++    except (OSError, ValueError, MemoryError) as exc:
++        raise ImageInputError(f"video bytes are invalid or unsupported ({type(exc).__name__}); use MP4 or "
++                              "WebM") from None
++    if len(frames) < 2:
++        raise ImageInputError("the video has fewer than two decodable frames")
++    return VideoInput(np.stack(frames), tuple(indices), fps)
++
++
++def load_videos(sources: list[VideoSource], size: Callable[[int, int, int], tuple[int, int]], *,
++                limits: VideoLimits = DEFAULT_VIDEO_LIMITS, allow_urls: bool = False) -> list[VideoInput]:
++    """Bound encoded bytes and decoding time across the videos of one request."""
++    if len(sources) > limits.max_videos:
++        raise ImageInputError(f"a request supports at most {limits.max_videos} videos")
++    total = 0
++    deadline = time.monotonic() + limits.total_timeout_seconds
++    output = []
++    for source in sources:
++        remaining = min(limits.max_encoded_bytes, limits.max_total_encoded_bytes - total)
++        if remaining <= 0 or time.monotonic() >= deadline:
++            raise ImageInputError("video request exceeds the total byte or time limit")
++        if source.url.startswith("data:"):
++            data = _data_bytes(source.url, remaining)
++        elif allow_urls:
++            data, _ = fetch_image(source.url, max_bytes=remaining,
++                                  deadline=min(deadline, time.monotonic() + limits.timeout_seconds),
++                                  max_redirects=limits.max_redirects, max_url_chars=limits.max_url_chars,
++                                  media_types=VIDEO_MEDIA_TYPES)
++        else:
++            raise ImageInputError("video URLs are off on this server")
++        total += len(data)
++        output.append(decode_video(data, size, limits, deadline))
++    return output

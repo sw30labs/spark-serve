@@ -1,0 +1,285 @@
+{
+  "model": "Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP",
+  "revision": "dadefa8066e3be900a0d148d0f5a2f4eb1cf6534",
+  "files": [
+    {
+      "path": ".gitattributes",
+      "size": 1570,
+      "lfs": null,
+      "git_blob_sha1": "52373fe24473b1aa44333d318f578ae6bf04b49b"
+    },
+    {
+      "path": "LICENSE",
+      "size": 3235,
+      "lfs": null,
+      "git_blob_sha1": "9557a8961782792814714b7488346732c043793d"
+    },
+    {
+      "path": "README.md",
+      "size": 10057,
+      "lfs": null,
+      "git_blob_sha1": "ab474a49b9f69999ed41e7e2605be72e75b5459d"
+    },
+    {
+      "path": "chat_template.jinja",
+      "size": 8952,
+      "lfs": null,
+      "git_blob_sha1": "c0c686f9c38d70d179fb7b5f5aa7530bc913dda3"
+    },
+    {
+      "path": "config.json",
+      "size": 5361,
+      "lfs": null,
+      "git_blob_sha1": "4922175c0f2ad9165d9f42984118dc463017f034"
+    },
+    {
+      "path": "generation_config.json",
+      "size": 202,
+      "lfs": null,
+      "git_blob_sha1": "023756cfadf88e5bf69eefeee3e172f38c448d64"
+    },
+    {
+      "path": "merges.txt",
+      "size": 3353259,
+      "lfs": null,
+      "git_blob_sha1": "a494e019ca1502219fd0128658b979e5f05ae8e8"
+    },
+    {
+      "path": "model-00001-of-00022.safetensors",
+      "size": 5283195887,
+      "lfs": {
+        "sha256": "308f20b7e35a3e525f36eca0df286f6d1043cfeb621e7bbcf372a834c99cd66d",
+        "size": 5283195887,
+        "pointerSize": 135
+      }
+    },
+    {
+      "path": "model-00002-of-00022.safetensors",
+      "size": 5250035137,
+      "lfs": {
+        "sha256": "8af1a616f2f39dbfe6ee92e959afb2414623fcb299aff1ced55984bfe810d608",
+        "size": 5250035137,
+        "pointerSize": 135
+      }
+    },
+    {
+      "path": "model-00003-of-00022.safetensors",
+      "size": 5250035154,
+      "lfs": {
+        "sha256": "519a0472252ac9a51af020686f462aa6be82ce655f948fd5f054d70949de17a6",
+        "size": 5250035154,
+        "pointerSize": 135
+      }
+    },
+    {
+      "path": "model-00004-of-00022.safetensors",
+      "size": 5250035160,
+      "lfs": {
+        "sha256": "b1ad7e951969eb8dc4e92762dc2e50bd47353c95990ae207db5da393d441400f",
+        "size": 5250035160,
+        "pointerSize": 135
+      }
+    },
+    {
+      "path": "model-00005-of-00022.safetensors",
+      "size": 5250035164,
+      "lfs": {
+        "sha256": "9ca797304c563bb65f2356b67d444511b11744bc5b5c8ec8345ae7d97d3e251c",
+        "size": 5250035164,
+        "pointerSize": 135
+      }
+    },
+    {
+      "path": "model-00006-of-00022.safetensors",
+      "size": 5250035184,
+      "lfs": {
+        "sha256": "8aab4c1dce7d8a0af645426b66d1caf30245d422d4c6b7029583959d675a1827",
+        "size": 5250035184,
+        "pointerSize": 135
+      }
+    },
+    {
+      "path": "model-00007-of-00022.safetensors",
+      "size": 5067850140,
+      "lfs": {
+        "sha256": "7908da37b2e3fa7f0de8b9734dad0759be7dc445716f3acd59c20c4842638db9",
+        "size": 5067850140,
+        "pointerSize": 135
+      }
+    },
+    {
+      "path": "model-00008-of-00022.safetensors",
+      "size": 5337131618,
+      "lfs": {
+        "sha256": "85beff20f250bfe63e95f12c0460512aab92bcde8f7408fe9c20e3de0321bc1d",
+        "size": 5337131618,
+        "pointerSize": 135
+      }
+    },
+    {
+      "path": "model-00009-of-00022.safetensors",
+      "size": 5337131558,
+      "lfs": {
+        "sha256": "f7c03ae640e9bf0f7813ef2b2980afa83a883c02b3988e814e9921055fc08a28",
+        "size": 5337131558,
+        "pointerSize": 135
+      }
+    },
+    {
+      "path": "model-00010-of-00022.safetensors",
+      "size": 4970130103,
+      "lfs": {
+        "sha256": "6897f52227533e720b243d6aef24c1293ad1eb02a1bb2ec6a6e4dc48d56d0c8f",
+        "size": 4970130103,
+        "pointerSize": 135
+      }
+    },
+    {
+      "path": "model-00011-of-00022.safetensors",
+      "size": 5341257482,
+      "lfs": {
+        "sha256": "905d27f9db887284289a043f9638020258c5f90d52122cdce2e7aef941a431f2",
+        "size": 5341257482,
+        "pointerSize": 135
+      }
+    },
+    {
+      "path": "model-00012-of-00022.safetensors",
+      "size": 4967968541,
+      "lfs": {
+        "sha256": "c4d2bb76fa4613f7386ddaa7045608c320f9736623211a814aa28fb370530dec",
+        "size": 4967968541,
+        "pointerSize": 135
+      }
+    },
+    {
+      "path": "model-00013-of-00022.safetensors",
+      "size": 5337131651,
+      "lfs": {
+        "sha256": "1f20a5e1f2256b2fb6a78fef52f9e66daa970f4318ab1be3abb32a1effedbbf3",
+        "size": 5337131651,
+        "pointerSize": 135
+      }
+    },
+    {
+      "path": "model-00014-of-00022.safetensors",
+      "size": 5337131799,
+      "lfs": {
+        "sha256": "860d12691792df5f08c9dfe245dc356773741f1edcc1fd430672ef06ac387635",
+        "size": 5337131799,
+        "pointerSize": 135
+      }
+    },
+    {
+      "path": "model-00015-of-00022.safetensors",
+      "size": 4970130195,
+      "lfs": {
+        "sha256": "259fb7577b8248f6dcbe6a932fe5d2f1c8869eda761ef3394fe6ad06065f216c",
+        "size": 4970130195,
+        "pointerSize": 135
+      }
+    },
+    {
+      "path": "model-00016-of-00022.safetensors",
+      "size": 5341257440,
+      "lfs": {
+        "sha256": "e931785f9ff4e0a567bf8c06df37639be46b4dae156e0f8b39b9d32a03d75792",
+        "size": 5341257440,
+        "pointerSize": 135
+      }
+    },
+    {
+      "path": "model-00017-of-00022.safetensors",
+      "size": 4967968481,
+      "lfs": {
+        "sha256": "4f4610dc4a862bf9d93d70cfd0ec037e8e7943a734794d34eb5c0d748b74747a",
+        "size": 4967968481,
+        "pointerSize": 135
+      }
+    },
+    {
+      "path": "model-00018-of-00022.safetensors",
+      "size": 5337131695,
+      "lfs": {
+        "sha256": "afdb4828920186600f9d61537d1465979fb36692f4eddb8c5a961a6b72964b77",
+        "size": 5337131695,
+        "pointerSize": 135
+      }
+    },
+    {
+      "path": "model-00019-of-00022.safetensors",
+      "size": 5337131801,
+      "lfs": {
+        "sha256": "869d34c6e8f7db79bd4e54b9833d5b0db45eefac860c9bd64fbd312bf862a667",
+        "size": 5337131801,
+        "pointerSize": 135
+      }
+    },
+    {
+      "path": "model-00020-of-00022.safetensors",
+      "size": 4970130135,
+      "lfs": {
+        "sha256": "5ca2f994fec1aa06fefef6646b9f072cf70f7f73aa8dab4c7c1a9a424afb4a52",
+        "size": 4970130135,
+        "pointerSize": 135
+      }
+    },
+    {
+      "path": "model-00021-of-00022.safetensors",
+      "size": 5341257436,
+      "lfs": {
+        "sha256": "58def6762f29cc798437e5649a56ee75d053faca69138a2454dbdb34bb8a37c3",
+        "size": 5341257436,
+        "pointerSize": 135
+      }
+    },
+    {
+      "path": "model-00022-of-00022.safetensors",
+      "size": 3715570974,
+      "lfs": {
+        "sha256": "30a3c82b573d813a1d2349f1c05c308c0d415f3ca1bb67caa0bfaad8a6afa7a3",
+        "size": 3715570974,
+        "pointerSize": 135
+      }
+    },
+    {
+      "path": "model.safetensors.index.json",
+      "size": 420813,
+      "lfs": null,
+      "git_blob_sha1": "b6e0c44edc3e4640fc18e38295819c0e0002a08f"
+    },
+    {
+      "path": "preprocessor_config.json",
+      "size": 390,
+      "lfs": null,
+      "git_blob_sha1": "2ea84a437d448ff71b08df68fdd949d5cc4ebb64"
+    },
+    {
+      "path": "qwen-logo.png",
+      "size": 11203,
+      "lfs": null,
+      "git_blob_sha1": "559e037931bded333328cb920e297700a0c06a22"
+    },
+    {
+      "path": "tokenizer.json",
+      "size": 12809320,
+      "lfs": {
+        "sha256": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3",
+        "size": 12809320,
+        "pointerSize": 133
+      }
+    },
+    {
+      "path": "tokenizer_config.json",
+      "size": 17928,
+      "lfs": null,
+      "git_blob_sha1": "5de744b3fca2129d7186979ae47c06be33903243"
+    },
+    {
+      "path": "vocab.json",
+      "size": 6722759,
+      "lfs": null,
+      "git_blob_sha1": "0aa0ce0658d60ac4a5d609f4eadb0e8e43514176"
+    }
+  ]
+}
