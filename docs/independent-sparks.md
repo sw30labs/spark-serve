@@ -35,9 +35,17 @@ not stop Qwen or change Hermes's selected endpoint. To switch the client after
 either endpoint is ready:
 
 ```sh
-./spark-serve use --node worker   # select Nemotron in Hermes
-./spark-serve use --node head     # return to Qwen
+./spark-serve use --node worker   # Hermes on this Mac selects Nemotron
+./spark-serve use --node head     # Hermes on this Mac returns to Qwen
+./spark-serve use --node worker --hermes-target spark  # Hermes on the head uses Nemotron
 ```
+
+The app offers **Use in Hermes (Mac)** and **Use in Hermes (Spark)**. Mac updates
+this Mac's `~/.hermes/config.yaml`; Spark updates that file over SSH on the
+configured head (sparkone in this setup). The model can run on either Spark.
+Only the chosen client's config changes. The head needs an existing Hermes
+config and Python with `ruamel.yaml` or `PyYAML`; its Hermes virtual environment
+is preferred. Config updates preserve permissions and use atomic replacement.
 
 `use` verifies the selected endpoint and its recorded container allocation, then
 changes Hermes configuration under the controller lock. It does not restart,
@@ -65,7 +73,8 @@ checkmarks and health indicators remain independent while a peer starts or fails
 
 `status --json` retains the legacy head endpoint fields and adds `nodes` with
 each node's observed model, endpoint, readiness, containers, phase and error.
-`active_node` reports Hermes's configured selection. A distributed worker can be
+`active_node` and the **Hermes (Mac)** badge report the Mac configuration only.
+Spark selections are confirmed in the activity log. A distributed worker can be
 healthy as a headless rank; `can_use` is false because its client API is on the head.
 
 ## Ownership and recovery

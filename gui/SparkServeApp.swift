@@ -95,6 +95,16 @@ struct ClusterStatus: Codable {
     var active_node: String? = nil
 }
 
+enum HermesTarget: String, CaseIterable {
+    case local, spark
+
+    var title: String { self == .local ? "Hermes (Mac)" : "Hermes (Spark)" }
+
+    func useArguments(node: String) -> [String] {
+        ["use", "--node", node, "--hermes-target", rawValue, "--json"]
+    }
+}
+
 enum BootState {
     case idle
     case launching(model: String)
@@ -475,7 +485,7 @@ final class CLIRunner: ObservableObject {
         }
     }
 
-    func useInHermes(node: String) {
+    func useInHermes(node: String, target: HermesTarget = .local) {
         guard !isBusy, nodes.first(where: { $0.node == node })?.canUseInHermes == true else { return }
         activeCommand = "use"
         transitionNode = node
@@ -483,15 +493,15 @@ final class CLIRunner: ObservableObject {
         bootState = .idle
         lineBuf = Data()
         didReportHermesSelection = false
-        let process = makeProcess(["use", "--node", node, "--json"])
+        let process = makeProcess(target.useArguments(node: node))
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = pipe
         upProcess = process
-        appendLog("  connecting Hermes to \(hostName(node))…")
+        appendLog("  connecting \(target.title) to \(hostName(node))…")
         do { try process.run() }
         catch {
-            bootState = .failed(message: "Could not connect Hermes: \(error.localizedDescription)")
+            bootState = .failed(message: "Could not connect \(target.title): \(error.localizedDescription)")
             upProcess = nil
             activeCommand = nil
             return
@@ -500,10 +510,10 @@ final class CLIRunner: ObservableObject {
             if code == 0 {
                 runner.bootState = .idle
                 if !runner.didReportHermesSelection {
-                    runner.appendLog("  Hermes now uses \(runner.hostName(node))")
+                    runner.appendLog("  \(target.title) now uses \(runner.hostName(node))")
                 }
             } else if case .failed = runner.bootState { }
-            else { runner.bootState = .failed(message: "Hermes connection failed; see log") }
+            else { runner.bootState = .failed(message: "\(target.title) connection failed; see log") }
             runner.activeCommand = nil
         }
     }
@@ -743,7 +753,9 @@ final class CLIRunner: ObservableObject {
             let host = obj["host"] as? String ?? hostName(obj["node"] as? String ?? "head")
             let served = obj["served"] as? String
             let label = models.first(where: { $0.served_name == served })?.label ?? served
-            appendLog("  Hermes uses \(host)\(label.map { ": \($0)" } ?? "")")
+            let target = HermesTarget(rawValue: obj["hermes_target"] as? String ?? "local") ?? .local
+            let destination = (obj["hermes_host"] as? String).map { " on \($0)" } ?? ""
+            appendLog("  \(target.title)\(destination) uses \(host)\(label.map { ": \($0)" } ?? "")")
             didReportHermesSelection = true
         case "waiting":
             if case .rebooting = bootState {
@@ -1251,7 +1263,7 @@ struct SparkNodePanel: View {
                 Text(node.host).font(.headline)
                 Spacer()
                 if runner.status?.active_node == node.node {
-                    Text("Hermes")
+                    Text("Hermes (Mac)")
                         .font(.caption2.weight(.semibold))
                         .padding(.horizontal, 6)
                         .padding(.vertical, 3)
@@ -1294,17 +1306,24 @@ struct SparkNodePanel: View {
             .buttonStyle(.borderedProminent)
             .disabled(!startEnabled)
             .accessibilityLabel("Start \(selectedModel?.label ?? "selected model") on \(node.host)")
+            Button(node.sharedModel ? "Stop both Sparks" : "Stop") {
+                runner.stop(node: node.sharedModel ? "both" : node.node)
+            }
+            .buttonStyle(.bordered)
+            .disabled(runner.isBusy || (!node.ours_running && !node.ready && node.model == nil))
+            .accessibilityLabel(node.sharedModel ? "Stop both Sparks" : "Stop \(node.host)")
             HStack(spacing: 8) {
-                Button(node.sharedModel ? "Stop both Sparks" : "Stop") {
-                    runner.stop(node: node.sharedModel ? "both" : node.node)
-                }
-                .buttonStyle(.bordered)
-                .disabled(runner.isBusy || (!node.ours_running && !node.ready && node.model == nil))
-                .accessibilityLabel(node.sharedModel ? "Stop both Sparks" : "Stop \(node.host)")
-                Button("Use in Hermes") { runner.useInHermes(node: node.node) }
+                ForEach(HermesTarget.allCases, id: \.self) { target in
+                    Button("Use in \(target.title)") {
+                        runner.useInHermes(node: node.node, target: target)
+                    }
                     .buttonStyle(.bordered)
                     .disabled(runner.isBusy || !node.canUseInHermes)
-                    .accessibilityLabel("Use \(node.host) in Hermes")
+                    .accessibilityLabel("Use model on \(node.host) in \(target.title)")
+                    .help(target == .local
+                          ? "Update Hermes on this Mac"
+                          : "Update Hermes on \(runner.status?.head ?? "the head Spark")")
+                }
             }
         }
         .padding(12)

@@ -67,3 +67,6 @@ unsupported["hosts"] = (unsupported["hosts"] as! [[String: Any]]).map { original
 telemetry.receive(try data(unsupported))
 check(telemetry.snapshot?.hosts.first?.resources.gpu_memory_used_bytes == nil, "Unreported GPU memory must stay absent")
 print("Native protocol smoke passed: status, telemetry, benchmark events/history, ISO dates, bounded history, stale state, null metrics.")
+
+check(HermesTarget.local.useArguments(node: "head") == ["use", "--node", "head", "--hermes-target", "local", "--json"], "Mac Hermes must keep its local target")
+check(HermesTarget.spark.useArguments(node: "worker") == ["use", "--node", "worker", "--hermes-target", "spark", "--json"], "Spark Hermes target must be separate from the model node")
