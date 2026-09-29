@@ -10,7 +10,10 @@ receipts. Treat distributed ranks as one allocation with one inference endpoint;
 reject partial replacement. Scope solo changes to the selected host. Expose
 allocation identity and engine runtime separately from lifecycle mode. Hermes
 selection chooses a client endpoint; it does not move workloads or determine
-monitoring scope.
+monitoring scope. Client destination is also explicit: `local` updates the Mac;
+`spark` updates Hermes on the original configured head over SSH. Choosing a
+worker endpoint never redirects the config write to that worker. Keep the
+existing `active_node` field and badge specific to the Mac client.
 
 **Trade-off.** Independent workloads remain independent, but ambiguous distributed
 ownership requires both-node reconciliation. This is explicit two-node placement,

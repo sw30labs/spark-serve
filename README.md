@@ -79,7 +79,10 @@ then retarget Hermes after readiness. Single-node recipes such as
 They default to the head, preserving any independent worker workload. Select
 `--node worker` to use the second Spark. For example, keep Qwen on the head while
 running `./spark-serve up nemotron-super --node worker`, then choose the client
-with `./spark-serve use --node head` or `--node worker`. See
+with `./spark-serve use --node head` or `--node worker`. The app has separate
+**Use in Hermes (Mac)** and **Use in Hermes (Spark)** buttons. Add
+`--hermes-target spark` to update Hermes on the configured head via SSH, even
+when selecting a model on the worker. The default remains this Mac. See
 [independent Spark control](docs/independent-sparks.md) for setup and recovery.
 
 Qwen3.8-Flash-Next uses NVIDIA NVFP4 weights, native 262K context, images and
