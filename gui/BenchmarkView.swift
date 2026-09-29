@@ -61,7 +61,7 @@ struct BenchmarkView: View {
             Text("Runs a warmup, then bounded test requests against the selected allocation. Hermes selection is unchanged.")
                 .font(.caption).foregroundStyle(.secondary)
             if targets.isEmpty {
-                Text("A ready managed vLLM or NIM allocation is required. Start a model in Models and wait for live status.")
+                Text("A ready managed vLLM, NIM or TensorFold allocation is required. Start a model in Models and wait for live status.")
                     .font(.callout).foregroundStyle(.secondary)
             } else {
                 Picker("Target", selection: $targetID) {
@@ -288,6 +288,9 @@ private struct BenchmarkMetadata: View {
         VStack(alignment: .leading, spacing: 4) {
             Text("\(run.hosts.joined(separator: " + ")) · \(run.endpoint)")
             Text("\(run.runtime.engine ?? "Unknown runtime") · \(run.runtime.image ?? "Image not recorded")")
+            if run.runtime.engine == "tensorfold" {
+                Text("Catalog settings: streams \(run.runtime.streamsText) · KV cache \(run.runtime.cacheText) · Context \(run.runtime.contextText)")
+            }
             Text("Concurrency \(run.config.concurrency) · \(run.config.requests) requests · max output \(run.config.max_tokens) · approximate prompt \(run.config.prompt_tokens)")
             if run.kind == "prefill", let lengths = run.config.prompt_lengths {
                 Text("Requested context sizes: \(lengths.map(String.init).joined(separator: ", "))")
@@ -320,6 +323,11 @@ private struct BenchmarkComparison: View {
                 Divider()
                 row("Test / state", "\(first.kind) / \(first.status)", "\(second.kind) / \(second.status)")
                 row("Runtime", first.runtime.engine ?? "—", second.runtime.engine ?? "—")
+                if first.runtime.engine == "tensorfold" || second.runtime.engine == "tensorfold" {
+                    row("Configured streams", first.runtime.streamsText, second.runtime.streamsText)
+                    row("Configured KV cache", first.runtime.cacheText, second.runtime.cacheText)
+                    row("Configured context", first.runtime.contextText, second.runtime.contextText)
+                }
                 row("Hosts", first.hosts.joined(separator: " + "), second.hosts.joined(separator: " + "))
                 row("Concurrency / requests", "\(first.config.concurrency) / \(first.config.requests)", "\(second.config.concurrency) / \(second.config.requests)")
                 row("Prompt target / output cap", "\(first.config.prompt_tokens) / \(first.config.max_tokens)", "\(second.config.prompt_tokens) / \(second.config.max_tokens)")
@@ -332,6 +340,10 @@ private struct BenchmarkComparison: View {
                 row("Median prefill tok/s (estimate)", MetricFormat.number(first.summary?.p50?.prefill_tokens_per_second_estimate), MetricFormat.number(second.summary?.p50?.prefill_tokens_per_second_estimate))
             }
             .font(.caption).monospacedDigit().textSelection(.enabled)
+            if first.runtime.engine == "tensorfold" || second.runtime.engine == "tensorfold" {
+                Text("Configured runtime values were read from the catalog when each run began.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             DisclosureGroup("Recorded runtime identities") {
                 HStack(alignment: .top, spacing: 20) {
                     BenchmarkMetadata(run: first).frame(maxWidth: .infinity, alignment: .leading)

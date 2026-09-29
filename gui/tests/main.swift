@@ -22,6 +22,25 @@ check(status.nodes?.count == 2, "Two physical host status rows should decode")
 check(snapshot.hosts.count == 2, "Two host telemetry records should decode")
 check(!runs.isEmpty, "Real saved run fixture should decode")
 check(runs.allSatisfy { $0.startedDate != nil }, "Backend ISO timestamps must parse")
+let oldRuntime = try decoder.decode(BenchmarkRuntime.self, from: data(["engine": "vllm", "image": "sha256:pinned"]))
+check(oldRuntime.settings == nil && oldRuntime.max_model_len == nil, "Older benchmark history must decode without runtime settings")
+let tensorfoldRuntime = try decoder.decode(BenchmarkRuntime.self, from: data([
+    "engine": "tensorfold", "image": "sha256:pinned", "max_model_len": 262144, "settings_source": "catalog",
+    "settings": ["parallel": 4, "kv_dtype": "int8", "model_revision": "pinned"],
+]))
+check(tensorfoldRuntime.streamsText == "4" && tensorfoldRuntime.cacheText == "int8", "TensorFold benchmark settings must decode")
+check(tensorfoldRuntime.max_model_len == 262144, "TensorFold benchmark context must be retained")
+check(tensorfoldRuntime.settings_source == "catalog", "Configured runtime settings must retain their source")
+
+var benchmarkAllocation = (fixture["snapshot"] as! [String: Any])["allocations"] as! [[String: Any]]
+for runtime in ["tensorfold", "vllm", "nim", "unknown"] {
+    benchmarkAllocation[0]["runtime"] = runtime
+    for ready in [true, false] {
+        benchmarkAllocation[0]["ready"] = ready
+        let allocation = try decoder.decode(AllocationTelemetry.self, from: data(benchmarkAllocation[0]))
+        check(allocation.supportsBenchmark == (ready && runtime != "unknown"), "Only supported, ready runtimes may be benchmarked")
+    }
+}
 
 let telemetry = TelemetryStore(home: nil)
 var changing = fixture["snapshot"] as! [String: Any]

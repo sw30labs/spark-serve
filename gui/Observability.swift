@@ -132,7 +132,7 @@ struct AllocationTelemetry: Decodable, Identifiable {
 
     var title: String { served_name ?? model ?? "Managed workload" }
     var benchmarkNode: String { nodes.contains("head") ? "head" : (nodes.first ?? "head") }
-    var supportsBenchmark: Bool { ready && (runtime == "vllm" || runtime == "nim") }
+    var supportsBenchmark: Bool { ready && ["vllm", "nim", "tensorfold"].contains(runtime ?? "") }
 }
 
 struct InferenceMetrics: Decodable {

@@ -32,6 +32,16 @@ struct BenchmarkRun: Decodable, Identifiable {
 struct BenchmarkRuntime: Decodable {
     let engine: String?
     let image: String?
+    let settings: BenchmarkRuntimeSettings?
+    let settings_source: String?
+    let max_model_len: Int?
+    var streamsText: String { settings?.parallel.map(String.init) ?? "—" }
+    var cacheText: String { settings?.kv_dtype ?? "—" }
+    var contextText: String { max_model_len.map { "\($0.formatted()) tokens" } ?? "—" }
+}
+struct BenchmarkRuntimeSettings: Decodable {
+    let parallel: Int?
+    let kv_dtype: String?
 }
 struct BenchmarkAllocation: Decodable {
     let id: String?

@@ -28,6 +28,8 @@ REQUEST_SECONDS = 120
 POLL_SECONDS = 0.2
 IDENTITY_SECONDS = 5
 EVENT_SECONDS = 2
+TENSORFOLD_SETTINGS = ("model_revision", "parallel", "kv_dtype", "vision", "ple_on_ssd",
+                      "mtp_drafts", "mtp_confidence", "thinking", "temperature", "top_p", "top_k")
 
 
 class BenchmarkCancelled(RuntimeError):
@@ -205,10 +207,18 @@ def _identity(cfg, status, owners, node):
     if (parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username
             or parsed.password or parsed.query or parsed.fragment or parsed.path not in ("", "/")):
         raise ControllerError("benchmark endpoint must be a configured HTTP(S) origin")
+    engine = selected.get("runtime") or (model.get("wrapper") if model.get("wrapper") in ("nim", "tensorfold") else "vllm")
+    runtime = {"engine": engine, "image": model.get("image") or cfg["cluster"].get("image")}
+    if engine == "tensorfold":
+        # Retain public launch settings for comparisons without copying runtime
+        # environment or host paths into saved benchmark history.
+        settings = model.get("tensorfold") or {}
+        runtime["settings"] = {key: settings[key] for key in TENSORFOLD_SETTINGS if key in settings}
+        runtime["settings_source"] = "catalog"
+        runtime["max_model_len"] = model.get("max_model_len")
     return {"model": model_id, "served_name": model["served_name"], "node": node,
             "hosts": sorted(hosts), "endpoint": endpoint + "/v1",
-            "runtime": {"engine": selected.get("runtime") or ("nim" if model.get("wrapper") == "nim" else "vllm"),
-                        "image": model.get("image") or cfg["cluster"].get("image")},
+            "runtime": runtime,
             "allocation": {"id": allocation_id, "containers": sorted(containers, key=lambda c: (c["host"], c["id"]))}}
 
 

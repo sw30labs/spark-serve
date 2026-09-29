@@ -56,6 +56,12 @@ FAMILIES = {name for names in GAUGES.values() for name in names} | set(COUNTERS.
 _SAMPLE = re.compile(r'^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{(.*)\})?\s+([^\s]+)(?:\s+[^\s]+)?$')
 _LABEL = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:[^"\\]|\\.)*)"(?:,|$)')
 MAX_BYTES = 2 * 1024 * 1024
+SUPPORTED_RUNTIMES = ("vllm", "nim", "tensorfold")
+TENSORFOLD_GAUGES = {"requests_running": ("tensorfold:requests_running",)}
+TENSORFOLD_COUNTERS = {
+    "prompt_tokens_per_second": "tensorfold:prompt_tokens_total",
+    "generation_tokens_per_second": "tensorfold:completion_tokens_total",
+}
 
 
 def _number(value):
@@ -135,6 +141,31 @@ def parse_prometheus(body, served_name=None, runtime="vllm"):
     return values
 
 
+def parse_tensorfold_health(body):
+    """Read the pinned CUDA live-counter patch, not the MLX health schema.
+
+    The patch has no queue, cache occupancy, completed-request count or latency
+    histogram. Its prefill duration total alone cannot establish mean latency.
+    Prompt totals advance at first output; running counts in-flight engine calls.
+    """
+    if len(body.encode("utf-8")) > MAX_BYTES:
+        raise ValueError("metrics response exceeds 2 MiB")
+    try:
+        health = json.loads(body)
+    except RecursionError as exc:
+        raise ValueError("TensorFold health response is too deeply nested") from exc
+    if not isinstance(health, dict) or health.get("backend") != "tensorfold" or health.get("ok") is not True:
+        raise ValueError("TensorFold health response is not ready or has an unsupported schema")
+    values = {}
+    for field in ("requests_running", "prompt_tokens_total", "completion_tokens_total"):
+        value = health.get(field)
+        # Actual counters are JSON integers; keep them within exact JSON/Swift
+        # numeric range and exclude booleans, strings and fractional values.
+        if not isinstance(value, bool) and isinstance(value, int) and 0 <= value <= 2**53 - 1:
+            values[("tensorfold:" + field, ())] = value
+    return values
+
+
 class InferenceMetrics:
     """Counter baselines live only for one allocation/container/endpoint identity."""
 
@@ -147,16 +178,20 @@ class InferenceMetrics:
         self.previous_at = None
 
     def update(self, body, now, served_name=None, runtime="vllm"):
-        values = parse_prometheus(body, served_name, runtime)
+        tensorfold = runtime == "tensorfold"
+        values = parse_tensorfold_health(body) if tensorfold else parse_prometheus(body, served_name, runtime)
+        gauges = TENSORFOLD_GAUGES if tensorfold else GAUGES
+        counter_names = TENSORFOLD_COUNTERS if tensorfold else COUNTERS
+        histograms = {} if tensorfold else HISTOGRAMS
         result = dict.fromkeys(METRIC_KEYS)
-        for output, names in GAUGES.items():
+        for output, names in gauges.items():
             for name in names:
                 series = [value for (family, _), value in values.items() if family == name]
                 if series:
                     result[output] = min(100.0, max(series) * 100) if output == "kv_cache_percent" else sum(series)
                     break
         counters = {key: value for key, value in values.items()
-                    if key[0] not in {name for names in GAUGES.values() for name in names}}
+                    if key[0] not in {name for names in gauges.values() for name in names}}
         elapsed = now - self.previous_at if self.previous_at is not None else 0
         continuous = (0 < elapsed <= self.max_gap and counters.keys() == self.previous.keys()
                       and all(value >= self.previous[key] for key, value in counters.items()))
@@ -167,10 +202,10 @@ class InferenceMetrics:
                 rows = [value for (name, _), value in deltas.items() if name == family]
                 return sum(rows) if rows else None
 
-            for output, name in COUNTERS.items():
+            for output, name in counter_names.items():
                 value = total(name)
                 result[output] = value / elapsed if value is not None else None
-            for output, names in HISTOGRAMS.items():
+            for output, names in histograms.items():
                 for name in names:
                     count, duration = total(name + "_count"), total(name + "_sum")
                     if count is not None and duration is not None:
@@ -417,7 +452,7 @@ def _fetch_metrics_path(endpoint, path, timeout):
     deadline.daemon = True
     deadline.start()
     try:
-        connection.request("GET", path, headers={"Accept": "text/plain"})
+        connection.request("GET", path, headers={"Accept": "application/json" if path == "/health" else "text/plain"})
         transport[0] = connection.sock
         if expired.is_set():
             abort()
@@ -439,7 +474,8 @@ def _fetch_metrics_path(endpoint, path, timeout):
 def fetch_metrics(endpoint, runtime="vllm"):
     # NIM documents /v1/metrics and unprefixed metric names. A few vLLM-backed
     # images expose /metrics instead; only a 404 permits this fallback.
-    paths = ("/v1/metrics", "/metrics") if runtime == "nim" else ("/metrics",)
+    paths = (("/v1/metrics", "/metrics") if runtime == "nim" else
+             ("/health",) if runtime == "tensorfold" else ("/metrics",))
     deadline = time.monotonic() + 3
     for index, path in enumerate(paths):
         remaining = deadline - time.monotonic()
@@ -482,7 +518,7 @@ class AllocationCollector:
                     self.metrics = metrics
                     self.sampled_at, self.received_at = time.time(), time.monotonic()
                     self.state = "live" if supported else "unsupported"
-                    self.error = None if supported else "No supported vLLM metric families exposed"
+                    self.error = None if supported else "No supported inference counters exposed"
                 backoff = self.interval if supported else min(30, max(10, self.interval))
             except (OSError, ValueError, http.client.HTTPException) as exc:
                 accumulator.reset()
@@ -540,7 +576,7 @@ class Monitor:
             status_error = self.status_error
         current = allocations_from_status(status)
         wanted = {allocation_identity(item): item for item in current
-                  if item["ready"] and not status_stale and item["runtime"] in ("vllm", "nim")}
+                  if item["ready"] and not status_stale and item["runtime"] in SUPPORTED_RUNTIMES}
         for identity in list(self.allocations):
             if identity not in wanted:
                 self.allocations.pop(identity).stop()
@@ -554,7 +590,7 @@ class Monitor:
             if collector:
                 allocation.update(collector.snapshot(now))
             else:
-                supported = allocation["runtime"] in ("vllm", "nim")
+                supported = allocation["runtime"] in SUPPORTED_RUNTIMES
                 allocation.update(metrics_state="unavailable" if supported else "unsupported",
                                   sampled_at=None, error=status_error or ("Allocation status is stale" if status_stale
                                                                        else "Allocation is not ready" if supported
