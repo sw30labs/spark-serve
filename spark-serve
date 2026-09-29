@@ -57,6 +57,9 @@ from spark_serve_controller import (
 )
 from spark_serve_nodes import launch_config, node_url, placement
 from spark_serve_nim import validate_nim_plan, nim_docker_argv, parse_nim_primary_node
+from spark_serve_tensorfold import (
+    validate_tensorfold_plan, tensorfold_docker_argv, tensorfold_health_ready,
+)
 
 HERE = Path(__file__).resolve().parent
 CATALOG = HERE / "models.toml"
@@ -229,6 +232,15 @@ def inner_argv(cfg: dict, model: dict, rank: int, headless: bool) -> list[str]:
 
 
 def docker_run_script(cfg: dict, model: dict, rank: int, headless: bool) -> str:
+    if model.get("wrapper") == "tensorfold":
+        if rank != 0 or headless:
+            raise ControllerError("TensorFold supports a single rank on the selected Spark")
+        assignment = cfg.get("_spark_serve_placement") or {}
+        mid = assignment.get("model") or next(
+            key for key, value in cfg["models"].items() if value is model or value == model
+        )
+        plan = validate_tensorfold_plan(cfg, mid)
+        return docker_create_start_script(tensorfold_docker_argv(plan, assignment.get("generation", "")), rank)
     if model.get("wrapper") == "nim":
         assignment = cfg.get("_spark_serve_placement") or {}
         mid = assignment.get("model") or next(
@@ -617,11 +629,15 @@ def probe_ready_path(cfg: dict, model: dict, timeout: int = 4) -> bool:
     if path == "/v1/models":
         return True  # The caller separately verifies the exact served ID.
     url = cfg["cluster"]["lan_url"].rstrip("/") + path
-    return ssh_cmd(
+    proc = ssh_cmd(
         cfg, cfg["cluster"]["head"],
         shlex.join(["curl", "-sf", "--max-time", str(timeout), url]),
         check=False, timeout=timeout + 10,
-    ).returncode == 0
+    )
+    return proc.returncode == 0 and (
+        model.get("wrapper") != "tensorfold"
+        or tensorfold_health_ready(proc.stdout, model.get("max_model_len"))
+    )
 
 
 def _container_running(state: str) -> bool:
@@ -737,9 +753,9 @@ def collect_status(cfg: dict) -> dict:
                 except (ValueError, TypeError):
                     identity_valid = False
         valid = bool(identity_valid and served == model.get("served_name"))
-        if valid and model.get("wrapper") == "nim":
-            # NIM can list its model before its engine is loaded. Its nginx
-            # liveness endpoint is not model readiness either.
+        if valid and model.get("wrapper") in ("nim", "tensorfold"):
+            # A matching model listing is necessary but does not establish
+            # backend engine readiness.
             valid = probe_ready_path(scoped, model)
         if assigned.get("phase") in ("draining", "stopping", "failed", "rebooting"):
             valid = False
@@ -852,7 +868,7 @@ def cmd_list_json(cfg: dict) -> None:
             "ctx": int(m.get("max_model_len") or 0),
             "image": m.get("image", ""),
             "notes": m.get("notes", ""),
-            "backend": "nim" if m.get("wrapper") == "nim" else "vllm",
+            "backend": m["wrapper"] if m.get("wrapper") in ("nim", "tensorfold") else "vllm",
             "topology": "single" if int(m.get("nnodes") or cfg["cluster"]["nnodes"]) == 1 else "distributed",
             "wrapper": m.get("wrapper", "vllm"),
             "hermes_provider": m.get("hermes_provider", "spark"),
@@ -1021,14 +1037,11 @@ def wait_models(
             check_started()
         body = probe_v1(cfg, timeout=4)
         ids = parse_v1_ids(body)
-        if expect_served:
-            if expect_served in ids:
-                if check_started:
-                    check_started()
-                return True, expect_served, body
-        else:
-            hit = next((i for i in ids if i in catalog), None)
-            if hit:
+        hit = expect_served if expect_served in ids else (None if expect_served else next((i for i in ids if i in catalog), None))
+        if hit:
+            health_model = next((m for m in cfg.get("models", {}).values()
+                                 if m.get("served_name") == hit and m.get("wrapper") == "tensorfold"), None)
+            if health_model is None or probe_ready_path(cfg, health_model):
                 if check_started:
                     check_started()
                 return True, hit, body
@@ -1048,8 +1061,12 @@ def wait_ready(
     ready_path: str = "/v1/models",
     on_poll=None,
     check_started=None,
+    health_model: dict | None = None,
 ) -> tuple[bool, str | None, str]:
     path = ready_path or "/v1/models"
+    if health_model is None and expect_served:
+        health_model = next((m for m in cfg.get("models", {}).values()
+                             if m.get("served_name") == expect_served and m.get("wrapper") == "tensorfold"), None)
     if path.rstrip("/") == "/v1/models":
         return wait_models(
             cfg, timeout=timeout, expect_served=expect_served, on_poll=on_poll,
@@ -1068,7 +1085,9 @@ def wait_ready(
             check=False,
             timeout=14,
         )
-        if proc.returncode == 0:
+        health_ok = (health_model is None or health_model.get("wrapper") != "tensorfold"
+                     or tensorfold_health_ready(proc.stdout, health_model.get("max_model_len")))
+        if proc.returncode == 0 and health_ok:
             body = probe_v1(cfg, timeout=4)
             ids = parse_v1_ids(body)
             served = expect_served if expect_served in ids else next((mid for mid in ids if mid in catalog_served_names(cfg)), None)
@@ -1236,7 +1255,8 @@ def cmd_pull(cfg: dict, name: str, node: str | None = None) -> None:
     if recipe:
         scripts = {"qwen38-nvfp4": "prepare_qwen38.py", "nemotron-super-nvfp4": "prepare_nemotron.py",
                    "glm53-nvfp4": "prepare_glm53.py", "mimo-v26-flash": "prepare_mimo26.py",
-                   "glm53-exl3": "prepare_glm53_exl3.py", "qwen38-v030": "prepare_qwen38_v030.py"}
+                   "glm53-exl3": "prepare_glm53_exl3.py", "qwen38-v030": "prepare_qwen38_v030.py",
+                   "qwen38-tensorfold": "prepare_qwen38_tensorfold.py"}
         if recipe not in scripts:
             die(f"unknown preparation recipe {recipe!r} for {mid}")
         command = [
@@ -1549,6 +1569,7 @@ def _bring_up(
         ready_path=ready_path,
         on_poll=lambda elapsed: sink.event("poll", elapsed=elapsed),
         check_started=monitor.check,
+        **({"health_model": model} if model.get("wrapper") == "tensorfold" else {}),
     )
     if ok:
         hermes = maybe_hermes_json(cfg, mid, model, skip=no_hermes)
@@ -1574,6 +1595,11 @@ def model_preflight(cfg: dict, mid: str, model: dict, sink: _Sink) -> None:
     if (not isinstance(arguments, list) or not arguments
             or any(not isinstance(arg, str) or not arg for arg in arguments)):
         raise ControllerError(f"{mid}: preflight_args must be a nonempty list of strings")
+    if model.get("wrapper") == "tensorfold":
+        # The prepared image's own parser checks precisely the launch arguments
+        # without a GPU or network, before the controller may stop anything.
+        plan = validate_tensorfold_plan(cfg, mid)
+        arguments = [*arguments, "--serve-args-json", json.dumps(plan.argv, separators=(",", ":"))]
     preflight_timeout = model.get("preflight_timeout", 120)
     if (isinstance(preflight_timeout, bool) or not isinstance(preflight_timeout, int)
             or not 1 <= preflight_timeout <= 3600):
@@ -1665,12 +1691,26 @@ def cmd_up(
             # Fail before Controller.switch can drain or stop a live model.
             model_ready_timeout(model)
             wrapper = model.get("wrapper") or "vllm"
-            if wrapper not in ("vllm", "dsv4", "dsv4-vision", "nim"):
+            if wrapper not in ("vllm", "dsv4", "dsv4-vision", "nim", "tensorfold"):
                 raise ControllerError(f"unknown model wrapper {wrapper!r}")
             if wrapper == "nim":
                 validate_nim_plan(scoped, mid)
                 if not model.get("preflight_args"):
                     raise ControllerError("NIM requires prepared-assets preflight before stopping a workload")
+            if wrapper == "tensorfold":
+                validate_tensorfold_plan(scoped, mid)
+                # Resolve only on the selected Spark. Both preflight and create
+                # use this immutable image even if its local tag moves later.
+                proc = ssh_cmd(scoped, scoped["cluster"]["head"], shlex.join([
+                    "docker", "image", "inspect", "--format", "{{.Id}}", model["image"],
+                ]), check=False, timeout=30)
+                image_id = (proc.stdout or "").strip()
+                if proc.returncode or not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
+                    raise ControllerError(
+                        f"{mid}: prepared image unavailable; current workload was not changed. "
+                        f"Run spark-serve pull {mid} --node {selected} to prepare it."
+                    )
+                model["image"] = image_id
             model_preflight(scoped, mid, model, sink)
         Controller(cfg, ssh_cmd, sink.event).switch(
             mid,
