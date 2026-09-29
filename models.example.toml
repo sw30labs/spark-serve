@@ -276,6 +276,43 @@ args = [
 ]
 
 
+# GLM-5.3-Flash NVFP4 — NVIDIA's two-GB10 NIM profile.
+# Prepare both nodes: ./spark-serve pull glm53
+# Native architecture supports 1M; this initial local profile targets 128K.
+[models.glm53]
+aliases = ["glm", "glm53", "glm-5.3-flash"]
+label = "GLM-5.3-Flash NVFP4"
+image = "sha256:161214462d6696699210c0aef16b2ba706e5a8ad692e2c9490aaa70d190e794c"
+recipe = "glm53-nvfp4"
+wrapper = "nim"
+container = "nim_glm53"
+nnodes = 2
+tensor_parallel = 2
+hf_mount = "/cache/huggingface"
+serve_path = "/cache/huggingface/spark-serve/glm53-nvfp4/models/nim-aa28e1f-nvfp4"
+served_name = "glm-5.3-flash"
+drop_caches = true
+shm_size = "16g"
+ready_timeout = 3600
+ready_path = "/v1/health/ready"
+max_model_len = 131072
+hermes_provider = "spark"
+hermes_context_length = 131072
+hermes_supports_vision = true
+preflight_args = ["/cache/huggingface/spark-serve/glm53-nvfp4/verify.py", "/cache/huggingface/spark-serve/glm53-nvfp4/models/nim-aa28e1f-nvfp4", "--expected-manifest-sha256", "9d69f5c64b423a3da262dd64d35b3db30209aa8a5a60698cc819a45e86e17564"]
+notes = "Two Sparks. Coding, tools, images and documents. Thinking on. Initial 128K profile; requires prepared NIM assets."
+
+[models.glm53.nim]
+model_source = "ngc"
+model_revision = "nim-aa28e1f-nvfp4"
+manager_port = 20000
+worker_port = 8002
+handshake_timeout = 600
+
+[models.glm53.env]
+NIM_KV_CACHE_PERCENT = "0.92"
+NIM_MODEL_PROFILE = "d3c5ed87ba2f6ed5424d46a191fde9d1c53f424d3d454372fae8873205a04b8b"
+
 # MiMo-V2.6-Flash-RL — official MXFP4/FP8 checkpoint, two Sparks, TP2.
 # Prepare: ./spark-serve pull mimo26
 # Weights download on the head, then one QSFP copy to the worker.
@@ -347,4 +384,190 @@ args = [
   "--tool-call-parser", "mimo",
   "--enable-auto-tool-choice",
   "--default-chat-template-kwargs", "{\"enable_thinking\":false}",
+]
+
+
+# GLM-5.3-Flash EXL3 TR3 4bpw — separate two-Spark trial.
+# Prepare: ./spark-serve pull glm53-exl3; start: ./spark-serve up glm53-exl3
+[models.glm53-exl3]
+aliases = ["glm-exl3", "glm53exl3"]
+label = "GLM-5.3-Flash EXL3"
+image = "spark-serve-glm53-exl3:0.1.0"
+recipe = "glm53-exl3"
+hf_id = "Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw"
+serve_path = "/cache/huggingface/spark-serve/glm53-exl3/models/target/25a44fdbf16862a46b7cc9921142c6c81350af2f"
+served_name = "glm-5.3-flash-exl3"
+wrapper = "vllm"
+container = "vllm_glm53_exl3"
+nnodes = 2
+tensor_parallel = 2
+hf_mount = "/cache/huggingface"
+drop_caches = true
+shm_size = "32g"
+docker_extra = ["--ulimit", "memlock=-1:-1", "--ulimit", "stack=67108864", "--cap-add", "IPC_LOCK"]
+ready_timeout = 3600
+preflight_timeout = 900
+max_model_len = 850000
+max_num_seqs = 4
+gpu_memory_utilization = 0.85
+hermes_provider = "spark"
+hermes_context_length = 850000
+host_ip_head = "192.168.100.10"
+host_ip_worker = "192.168.100.11"
+hermes_supports_vision = true
+preflight_args = ["/opt/spark-serve/glm53-exl3/verify.py", "/cache/huggingface/spark-serve/glm53-exl3", "--expected-manifest-sha256", "aede20b8ceb6cee9421f11e19d7a30b5aa99d3c96cd7f596fe564d785a975fa8"]
+notes = "Two Sparks. EXL3 4bpw, sparse FP8 MLA, DFlash2 k7, vision + tools. 850K configured; 785,766-token retrieval passed. Tight RAM headroom; shared-load prefill deferral observed. See local qualification."
+
+[models.glm53-exl3.env]
+MAX_NUM_BATCHED_TOKENS = "7168"
+HF_HOME = "/cache/huggingface"
+HF_HUB_OFFLINE = "1"
+TRANSFORMERS_OFFLINE = "1"
+VLLM_CACHE_ROOT = "/cache/huggingface/spark-serve/glm53-exl3/runtime-cache/vllm"
+XDG_CACHE_HOME = "/cache/huggingface/spark-serve/glm53-exl3/runtime-cache"
+TRITON_CACHE_DIR = "/cache/huggingface/spark-serve/glm53-exl3/runtime-cache/triton"
+TILELANG_CACHE_DIR = "/cache/huggingface/spark-serve/glm53-exl3/runtime-cache/tilelang"
+CUDA_CACHE_PATH = "/cache/huggingface/spark-serve/glm53-exl3/runtime-cache/cuda"
+FLASHINFER_WORKSPACE_BASE = "/cache/huggingface/spark-serve/glm53-exl3/runtime-cache"
+VLLM_ENGINE_READY_TIMEOUT_S = "3600"
+VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS = "1800"
+TORCH_CUDA_ARCH_LIST = "12.1a"
+FLASHINFER_CUDA_ARCH_LIST = "12.1a"
+FLASHINFER_DISABLE_VERSION_CHECK = "1"
+PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True"
+VLLM_NO_USAGE_STATS = "1"
+DO_NOT_TRACK = "1"
+VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS = "1"
+NCCL_NVLS_ENABLE = "0"
+EXL3_FUSED_MOE = "1"
+EXL3_MOE_ROW_TILE = "0"
+EXL3_TEMP_ROWS_FUSED = "32"
+EXL3_FAT_SORTED = "0"
+EXL3_FAT_BATCHED = "0"
+EXL3_FAT_KERNEL = "1"
+EXL3_FAT_GROUPED = "1"
+GLM53_SUPPRESS_STOPS_IN_REASONING = "1"
+GLM53_MIXED_PREFILL_CHUNK = "fair"
+GLM53_FAIR_PREFILL_CHUNK = "256"
+GLM53_FAIR_PREFILL_SHARE = "0.30"
+GLM53_FAIR_PREFILL_MAX_INTERVAL_MS = "2000"
+GLM53_FAIR_PREFILL_MAX_STEP_MS = "2000"
+GLM53_FAIR_PREFILL_MAX_CHUNKS = "1"
+GLM53_KV_CAPACITY_LOG = "1"
+GLM53_ADAPTIVE_K = "off"
+GLM53_DENSE_FP8 = "off"
+GLM53_EXL3_MOE_FAST = "0"
+GLM53_KDA_BF16_LARGE_M = "0"
+GLM53_APC_NO_STORE = "1"
+GLM53_INDEXER_WORKSPACE = "rightsize"
+GLM53_DRAFT_KV_COMPACT = "1"
+GLM53_SPINWAIT_MS = "stock"
+GLM53_EXPOSE_CACHE_RESET = "0"
+GLM53_LOAD_CLONE = "1"
+GLM53_LOAD_PREFETCH = "0"
+DEFAULT_MAX_NEW_TOKENS = "65536"
+ABLIT = "0"
+
+[models.glm53-exl3.vllm]
+args = [
+  "--served-model-name", "glm-5.3-flash-exl3",
+  "--host", "0.0.0.0", "--port", "8000",
+  "--tensor-parallel-size", "2",
+  "--quantization", "exl3",
+  "--max-model-len", "850000",
+  "--gpu-memory-utilization", "0.85",
+  "--max-num-seqs", "4",
+  "--max-num-batched-tokens", "7168",
+  "--kv-cache-dtype", "fp8",
+  "--kv-cache-memory-bytes", "15032385536",
+  "--load-format", "instanttensor",
+  "--speculative-config", '{"method":"dflash","model":"/cache/huggingface/spark-serve/glm53-exl3/models/draft/dc77ff1c99eeb2df044ee3d4f0094eb033fee410","num_speculative_tokens":7,"kv_cache_dtype":"auto","draft_sample_method":"probabilistic","rejection_sample_method":"standard","draft_tensor_parallel_size":2}',
+  "--cudagraph-capture-sizes", "1", "2", "4", "8", "16", "24", "32",
+  "--enable-prefix-caching",
+  "--no-enable-flashinfer-autotune",
+  "--tool-call-parser", "glm47", "--enable-auto-tool-choice",
+  "--reasoning-parser", "glm45",
+  "--chat-template", "/opt/glm53/chat_template.jinja",
+  "--limit-mm-per-prompt", '{"image":48,"video":1}',
+  "--mm-processor-kwargs", '{"max_image_tokens":2048}',
+  "--mm-processor-cache-gb", "1",
+  "--skip-mm-profiling",
+]
+
+
+# Candidate lane: same NVIDIA weights; vLLM 0.30, native context, FP32 SSM.
+[models.qwen38-v030]
+aliases = ["qwen-v030", "qwen38-030"]
+label = "Qwen3.8-Flash-Next NVFP4 vLLM 0.30"
+image = "spark-serve-qwen38-v030:0.1.0"
+recipe = "qwen38-v030"
+hf_id = "nvidia/Qwen3.8-Flash-Next-NVFP4"
+serve_path = "/cache/huggingface/hub/models--nvidia--Qwen3.8-Flash-Next-NVFP4/snapshots/fc694b54fb0174e0913e6adf86691ef85a4ead47"
+served_name = "qwen3.8-flash-next-v030"
+wrapper = "vllm"
+container = "vllm_qwen38_v030"
+nnodes = 1
+tensor_parallel = 1
+hf_mount = "/cache/huggingface"
+drop_caches = true
+shm_size = "32g"
+docker_extra = ["--ulimit", "memlock=-1:-1", "--ulimit", "stack=67108864", "--memory", "102g", "--memory-swap", "102g"]
+ready_timeout = 3600
+preflight_timeout = 900
+max_model_len = 262144
+max_num_seqs = 4
+gpu_memory_utilization = 0.78
+hermes_provider = "spark"
+hermes_context_length = 262144
+hermes_supports_vision = true
+preflight_args = ["/opt/spark-serve/qwen38-v030/verify.py", "/cache/huggingface/hub/models--nvidia--Qwen3.8-Flash-Next-NVFP4/snapshots/fc694b54fb0174e0913e6adf86691ef85a4ead47", "--expected-manifest-sha256", "a3ec3c29bb6f68217a1f109c5ee02b89cf4fdfa1158f4e1626acb2343334d8ad"]
+notes = "TP1 vLLM 0.30 trial: native 262K, MTP 3, FP8 KV 12 GiB, FP32 SSM. Passed thinking/fast tools and vision plus 230K retrieval; no measured speed gain over the historical recipe. See qualification and memory limits."
+
+[models.qwen38-v030.env]
+HF_HOME = "/cache/huggingface"
+HF_HUB_OFFLINE = "1"
+TRANSFORMERS_OFFLINE = "1"
+VLLM_CACHE_ROOT = "/cache/huggingface/spark-serve/qwen38-v030/runtime-cache/vllm"
+XDG_CACHE_HOME = "/cache/huggingface/spark-serve/qwen38-v030/runtime-cache"
+TRITON_CACHE_DIR = "/cache/huggingface/spark-serve/qwen38-v030/runtime-cache/triton"
+FLASHINFER_WORKSPACE_BASE = "/cache/huggingface/spark-serve/qwen38-v030/runtime-cache/flashinfer"
+VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR = "/cache/huggingface/spark-serve/qwen38-v030/runtime-cache/flashinfer-autotune"
+VLLM_PLE_MMAP_DIR = "/cache/huggingface/spark-serve/qwen38-v030/runtime-cache/ple_mmap"
+VLLM_PLE_MMAP_ADVICE = "1"
+VLLM_MTP_DRAFT_VOCAB = "/opt/spark-serve/qwen38-v030/upstream/draft_vocab_en_code_47k.txt"
+VLLM_USE_V2_MODEL_RUNNER = "1"
+VLLM_ENGINE_READY_TIMEOUT_S = "3600"
+MAX_JOBS = "2"
+FLASHINFER_NVCC_THREADS = "1"
+CUTE_DSL_ARCH = "sm_121a"
+TORCH_CUDA_ARCH_LIST = "12.1a"
+FLASHINFER_CUDA_ARCH_LIST = "12.1a"
+NCCL_NET = "Socket"
+NCCL_IB_DISABLE = "1"
+
+[models.qwen38-v030.vllm]
+args = [
+  "--served-model-name", "qwen3.8-flash-next-v030",
+  "--host", "0.0.0.0", "--port", "8000",
+  "--tensor-parallel-size", "1",
+  "--max-model-len", "262144",
+  "--max-num-seqs", "4",
+  "--max-num-batched-tokens", "2048",
+  "--gpu-memory-utilization", "0.78",
+  "--load-format", "safetensors",
+  "--safetensors-load-strategy", "lazy",
+  "--enable-chunked-prefill",
+  "--kv-cache-dtype", "fp8",
+  "--kv-cache-memory-bytes", "12884901888",
+  "--engram-config", "{\"cpu_offload\":true}",
+  "--mamba-cache-mode", "align",
+  "--mamba-ssm-cache-dtype", "float32",
+  "--enable-prefix-caching",
+  "--no-async-scheduling",
+  "--reasoning-parser", "qwen3",
+  "--tool-call-parser", "qwen3_coder",
+  "--enable-auto-tool-choice",
+  "--default-chat-template-kwargs", "{\"enable_thinking\":true}",
+  "--speculative-config", "{\"method\":\"mtp\",\"num_speculative_tokens\":3,\"use_local_argmax_reduction\":true,\"disable_eagle_block_drop\":true,\"index_share_for_mtp_iteration\":true}",
+  "--compilation-config", "{\"mode\":0,\"cudagraph_mode\":\"FULL_DECODE_ONLY\"}",
 ]

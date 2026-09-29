@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "upstream_url": "https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark",
+  "upstream_revision": "b8439110eec0230facbe4ddf0dffe01b8f769be0",
+  "base_image": "docker.io/vllm/vllm-openai@sha256:4864d46625cbc3307623e29ac742030655e27249feba7b97ec925ce4cc4dfb56",
+  "local_image": "spark-serve-qwen38-v030:0.1.0",
+  "manifest_sha256": "a3ec3c29bb6f68217a1f109c5ee02b89cf4fdfa1158f4e1626acb2343334d8ad",
+  "checkpoint_revision": "fc694b54fb0174e0913e6adf86691ef85a4ead47",
+  "runtime_sha256": {
+    "runtime/Dockerfile": "644f066c0955412ca5aafe90b272dc121179cd2128ee912e41b12fc4b9493e35",
+    "runtime/apply_patches.py": "a275ef128339cb1a8aaea8d1653c4a4b3a34ec7fa27afdaa8cb24687bcb3236c",
+    "runtime/check_compatibility.py": "7862911dd3a30065f4a95fecb2c70eccc002879de101ea0e5941215fecf4c9eb",
+    "runtime/entrypoint.sh": "9f542e4aa0266c453304fb5242801f4097974c48c3107af0c68952dd87a55437",
+    "runtime/upstream/LICENSE": "0d96a4ff68ad6d4b6f1f30f713b18d5184912ba8dd389f86aa7710db079abcb0",
+    "runtime/upstream/draft_vocab_en_code_47k.txt": "ee819d2560b52ba1351acdd1c4a0244b77bb60694a7660c6363097a482b0afb5",
+    "runtime/upstream/patch_mtp_draft_vocab.py": "2c7d19b8021f2c439920ae7f7df6f7b008eb635256a8423ef03e168d3984911f",
+    "runtime/upstream/patch_mtp_draft_vocab_v030.py": "0fdfe23b91de313eb175d4a9c9ccbf395c6e9bec977c473ae4434d90a0714087",
+    "runtime/upstream/patch_ple_mmap_v030.py": "b63bb3d86ececfe5d0dac7f4c072407c9745fab7b6ed856175bc8f668c107309",
+    "runtime/upstream/patch_qsa_fp8_kv_v030.py": "5cf2e4c16dae7aea92bd9846f158c3d75fcc041b9aecaa570e62403d1f0aa9d4",
+    "runtime/upstream-files.json": "fac3f067864ba0a6829aa33fc91b250b68778e489ade1cf1c298ed4445f46f00",
+    "runtime/verify_runtime.py": "67c0579c6cb0522ce3b425960c44579523af69d154d83d1ab7ada1151be97814"
+  },
+  "preparation_sha256": {
+    "verify.py": "29133c6dcac3bad763364f011c44764275b486d148470e095b2abb4ff51910bd"
+  },
+  "policy": {
+    "checkpoint": "Reuse original NVIDIA snapshot without modifying the existing Qwen recipe.",
+    "ssm_dtype": "float32 preserves checkpoint state precision; upstream author timings used bfloat16.",
+    "ple_cache": "A separate mmap cache requires approximately 47.68 GiB of additional disk at first launch."
+  }
+}

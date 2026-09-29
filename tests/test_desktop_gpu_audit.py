@@ -102,5 +102,5 @@ class DesktopAuditTests(unittest.TestCase):
         self.assertIn('--query-compute-apps=pid,process_name,used_gpu_memory', source)
         compile(source, '<remote-audit>', 'exec')
         namespace = {}
-        exec(source[:source.index('import json, socket, subprocess, sys')], namespace)
+        exec(source[:len(inspect.getsource(classify_gpu_processes))], namespace)
         self.assertEqual(self.classify(), namespace['classify_gpu_processes'](f'123, {EXE}, 340', self.root))

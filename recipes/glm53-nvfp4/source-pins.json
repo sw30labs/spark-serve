@@ -1,0 +1,21 @@
+{
+  "image": "sha256:161214462d6696699210c0aef16b2ba706e5a8ad692e2c9490aaa70d190e794c",
+  "image_tag": "spark-serve-glm53:marlin-gate-up-maxglobal-e4m3-v1",
+  "architecture": "linux/arm64",
+  "checkpoint_revision": "nim-aa28e1f-nvfp4",
+  "checkpoint_files": 130,
+  "checkpoint_bytes": 194692707910,
+  "manifest_sha256": "9d69f5c64b423a3da262dd64d35b3db30209aa8a5a60698cc819a45e86e17564",
+  "upstream_file_listing": "https://api.ngc.nvidia.com/v2/models/nim/zai-org/glm-5.3-flash/versions/nim-aa28e1f-nvfp4/files",
+  "source_documentation": "https://docs.nvidia.com/nim/vision-language-models/latest/deploy-on-dgx-spark.html",
+  "base_image": "nvcr.io/nim/zai-org/glm-5.3-flash@sha256:0bd2a1f4ffacf4ee61e1f8c1b48071a6713b51bad954ab0ca627c24be84f43f8",
+  "base_image_tag": "nvcr.io/nim/zai-org/glm-5.3-flash:2.1.2-variant",
+  "image_patch": {
+    "revision": "marlin-gate-up-maxglobal-e4m3-v1",
+    "files": {
+      "Dockerfile": "561ff51425fe4aa61dd6808281999ef45cdd3c204170b10500fe1025f321a66c",
+      "patch_runtime.py": "bc82f06083686d8fa82184b53eded475bd01cdf6570212becea4097e45bb3f8a",
+      "nvfp4_scale_reconcile.py": "4357bba3403f0eabc7675d7916e4b5b0ec2c783ba4f0e83acd74e87e2aa37c17"
+    }
+  }
+}

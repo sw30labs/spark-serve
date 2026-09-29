@@ -1,6 +1,6 @@
 # spark-serve
 
-Mac CLI + SwiftUI helper for catalogued vLLM models and independent YuE song
+Mac CLI + SwiftUI helper for catalogued vLLM/NVIDIA NIM models and independent YuE song
 workers on a two-node [NVIDIA DGX Spark](https://www.nvidia.com/en-us/products/workstations/dgx-spark/)
 cluster. Single-node models can run independently on each Spark.
 
@@ -65,6 +65,9 @@ cp models.example.toml models.toml   # then edit [cluster]
 | DeepSeek-V4-Flash | 2 | 1M | [Startup and recovery](docs/ds4-startup-recovery.md) |
 | Nemotron-3-Super-120B NVFP4 | 1 | 262K | [Independent Spark setup](docs/nemotron-super.md) |
 | Qwen3.8-Flash-Next NVFP4 | 1 | 262K | [Text, images and tools](docs/qwen38-nvfp4.md) |
+| Qwen3.8-Flash-Next NVFP4, vLLM 0.30 | 1 | 262K | [Separate runtime trial](docs/qwen38-v030.md) |
+| GLM-5.3-Flash NVFP4 | 2 | 128K | [Locally corrected NIM; qualified pilot](docs/glm53-nvfp4.md) |
+| GLM-5.3-Flash EXL3 | 2 | 850K | [Pinned EXL3 and DFlash2 trial](docs/glm53-exl3.md) |
 | MiMo-V2.6-Flash-RL | 2 | 300K | [TP2, DFlash, official MXFP4 checkpoint](docs/mimo-v26-flash.md) |
 
 Context values are catalog limits. Each recipe records the extent of its local
@@ -91,10 +94,24 @@ runtime and checkpoint, then `./spark-serve up qwen38`. It checks its assets
 before stopping the current model. See the [Qwen recipe](docs/qwen38-nvfp4.md)
 for setup, provenance and qualification details.
 
-MiMo-V2.6-Flash-RL serves the official MXFP4 checkpoint on both Sparks with a
-300K context. Run `./spark-serve pull mimo26`, then `./spark-serve up mimo26`.
-Preparation downloads the weights on the head and copies that tree to the worker.
-See the [MiMo recipe](docs/mimo-v26-flash.md).
+GLM-5.3-Flash uses a locally corrected image derived from pinned NVIDIA NIM and
+the unchanged published NGC NVFP4 checkpoint across both Sparks. The correction
+addresses Marlin's handling of unequal gate/up scales and adds E4M3 scale rounding;
+it is a local runtime modification, not an official NVIDIA patch. Existing installations
+should merge `[models.glm53]`, `[models.glm53.nim]` and `[models.glm53.env]` from
+the example catalog. Run `./spark-serve pull glm53`, then
+`./spark-serve up glm53 --no-hermes` for initial qualification. Its configured
+context is 128K and thinking stays enabled. Preparation resumes interrupted
+downloads, verifies the publisher's SHA-256 digests, and reproducibly builds and
+checks the pinned derivative image. Independent builds on both Sparks produced
+the same image ID. The [GLM runbook](docs/glm53-nvfp4.md) covers provenance,
+numerical evidence, acceptance commands, Hermes vision support and recovery.
+The September 19 qualification passed coding, tools, images, actual Hermes
+integration, 95,144-token retrieval and twelve small requests at concurrency four.
+It also verified Hermes selection and the app's two-Spark serving state. The
+95K retrieval took 311 seconds; full 128K, sustained load and comparative model
+quality remain unqualified. The runbook records the GB10 profile's dense-attention
+fallback and the local numerical correction's limits.
 
 `up yue` starts two **independent** workers. Each can render a different song or
 take. This uses the existing SSH hosts and Mac app, while YuE keeps its own
@@ -112,7 +129,7 @@ commands for an older transition cannot admit a worker or launch a model after a
 new transition starts. Commands hold that lock through their side effects,
 including when a parent process is interrupted.
 
-While a vLLM model starts, the CLI checks the exact containers it launched on
+While a vLLM or NIM model starts, the CLI checks the exact containers it launched on
 every required node. An exited container or an unverifiable node ends the wait
 with its host and failure reason instead of leaving the app booting until the
 readiness timeout. Before cleanup, bounded logs and container states are saved
@@ -135,7 +152,7 @@ foreign workloads separately; Spark Serve does not claim ownership from a name
 prefix or a port number.
 
 `status --json` retains vLLM fields and adds per-node `nodes`, `active_node`, `mode`, `phase`, `transition_error`,
-`yue_workers`, and `ready_workers`. Distributed vLLM readiness requires the expected
+`yue_workers`, and `ready_workers`. Distributed model readiness requires the expected
 container on **both** nodes plus the expected served ID; a head-only response is
 sufficient only for an explicitly single-node recipe. YuE readiness requires the
 same worker identity and generation from control and HTTP, validated pinned assets,
@@ -321,17 +338,29 @@ and inference metrics, decode/prefill benchmark workflow, and topology overview.
 Spark Serve implements these ideas in SwiftUI and its existing Python CLI,
 using its own telemetry and streaming protocol code.
 
+The vendored GLM EXL3 and Qwen v0.30 runtime sources retain their upstream
+[GLM license](recipes/glm53-exl3/runtime/upstream/LICENSE) and
+[Qwen license](recipes/qwen38-v030/runtime/upstream/LICENSE) (AGPLv3), plus the
+[GLM MIT notice](recipes/glm53-exl3/runtime/upstream/LICENSE.MIT).
+Each recipe records its upstream source pins and file hashes.
+
 ## Offline verification
 
+Use Python 3.11+ with pytest. On the configured Mac:
+
 ```sh
-python3 -m pytest tests -q
+~/miniconda3/bin/python3 -m pytest tests -q
 make -f gui/Makefile smoke
 ```
+
+Use the equivalent interpreter path on other installations. Pytest runs both the
+function-style and unittest-style tests in this repository.
 
 Fault-injection tests cover concurrent controllers, lost/offline ownership,
 legacy migration, active-job draining, explicit cancellation, stale generations,
 misrouted health, partial starts, exact-container cleanup, protected services,
-and preservation of single-node/distributed vLLM recipes. Monitoring and benchmark
-tests cover counter resets, stale data, cancellation, token accounting, and
-bounded process cleanup. The native smoke test checks the Python-to-Swift data
-contract. These checks submit no inference requests and change no Spark workloads.
+preservation of single-node/distributed vLLM recipes, and pinned NIM preparation
+and startup. Monitoring and benchmark tests cover counter resets, stale data,
+cancellation, token accounting, and bounded process cleanup. The native smoke
+test checks the Python-to-Swift data contract. These checks submit no inference
+requests and change no Spark workloads.

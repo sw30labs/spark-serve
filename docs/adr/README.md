@@ -1,6 +1,7 @@
 # Architecture decisions
 
-Recorded retrospectively from shipped code at `585eeeb` and existing runbooks.
+The initial records describe shipped code at `585eeeb` and existing runbooks;
+later records and amendments cover subsequent changes.
 Dates below are record dates, not reconstructed approval dates. All are accepted.
 
 | ADR | Decision |
@@ -14,6 +15,7 @@ Dates below are record dates, not reconstructed approval dates. All are accepted
 | [0007](0007-inference-benchmark-method.md) | Bounded inference tests with server token accounting |
 | [0008](0008-benchmark-leases.md) | Revocable benchmark leases cover physical hosts |
 | [0009](0009-yue-capacity-experiments.md) | Isolate YuE capacity experiments from production |
+| [0010](0010-nim-backend.md) | Run NIM through the existing fenced controller |
 
 Keep ADRs short: context, decision, trade-off, evidence. Amend clarifications in
 place. For a changed decision, add a new numbered ADR and link the superseded

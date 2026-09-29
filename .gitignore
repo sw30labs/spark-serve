@@ -5,6 +5,7 @@ __pycache__/
 gui/SparkServeApp.app/
 gui-poc/
 models.toml
+models.toml.bak*
 GUI_RESEARCH.md
 benchmark-results/
 tests/workloads/local/

@@ -56,6 +56,7 @@ from spark_serve_controller import (
     atomic_json,
 )
 from spark_serve_nodes import launch_config, node_url, placement
+from spark_serve_nim import validate_nim_plan, nim_docker_argv, parse_nim_primary_node
 
 HERE = Path(__file__).resolve().parent
 CATALOG = HERE / "models.toml"
@@ -228,6 +229,17 @@ def inner_argv(cfg: dict, model: dict, rank: int, headless: bool) -> list[str]:
 
 
 def docker_run_script(cfg: dict, model: dict, rank: int, headless: bool) -> str:
+    if model.get("wrapper") == "nim":
+        assignment = cfg.get("_spark_serve_placement") or {}
+        mid = assignment.get("model") or next(
+            key for key, value in cfg["models"].items() if value is model or value == model
+        )
+        plan = validate_nim_plan(cfg, mid)
+        full = nim_docker_argv(
+            plan, rank, assignment.get("generation", ""),
+            primary_node=cfg.get("_nim_primary_node"),
+        )
+        return docker_create_start_script(full, rank)
     name = container_name(cfg, model)
     image = model["image"]
     wrapper = model.get("wrapper") or "vllm"
@@ -251,6 +263,11 @@ def docker_run_script(cfg: dict, model: dict, rank: int, headless: bool) -> str:
         full = base + ["--entrypoint", "bash", image, "-lc", inner]
     else:
         full = base + [image, *argv]
+    return docker_create_start_script(full, rank)
+
+
+def docker_create_start_script(full: list[str], rank: int) -> str:
+    """Every backend creates and starts through the same generation fence."""
     # Create is CPU-only. Starting an immutable ID is a separate guarded action:
     # a delayed old create cannot launch a GPU workload or revive a removed ID.
     start = '''import json, os, pathlib, subprocess, sys
@@ -595,6 +612,18 @@ def probe_v1(cfg: dict, timeout: int = 5) -> str:
     ).stdout.strip()
 
 
+def probe_ready_path(cfg: dict, model: dict, timeout: int = 4) -> bool:
+    path = model.get("ready_path") or "/v1/models"
+    if path == "/v1/models":
+        return True  # The caller separately verifies the exact served ID.
+    url = cfg["cluster"]["lan_url"].rstrip("/") + path
+    return ssh_cmd(
+        cfg, cfg["cluster"]["head"],
+        shlex.join(["curl", "-sf", "--max-time", str(timeout), url]),
+        check=False, timeout=timeout + 10,
+    ).returncode == 0
+
+
 def _container_running(state: str) -> bool:
     st = (state or "").strip().lower()
     return st == "running" or st.startswith("up")
@@ -632,7 +661,7 @@ def endpoint_config(cfg: dict, node: str) -> dict:
     return result
 
 
-def _active_client_node(cfg: dict) -> str | None:
+def _active_client_node(cfg: dict, nodes: list[dict]) -> str | None:
     # Read only the selected provider/model. Never expose keys from the config.
     try:
         try:
@@ -643,7 +672,10 @@ def _active_client_node(cfg: dict) -> str | None:
             data = yaml.safe_load(HERMES_CONFIG.read_text()) or {}
         provider = data.get("model", {}).get("provider")
         url = data.get("providers", {}).get(provider, {}).get("base_url", "").rstrip("/")
-        return next((node for node in ("head", "worker") if url == node_url(cfg, node) + "/v1"), None)
+        selected_model = data.get("model", {}).get("default")
+        return next((item["node"] for item in nodes
+                     if item.get("can_use") and item.get("served") == selected_model
+                     and url == node_url(cfg, item["node"]) + "/v1"), None)
     except (OSError, ValueError, TypeError, AttributeError, ImportError):
         return None
 
@@ -705,6 +737,10 @@ def collect_status(cfg: dict) -> dict:
                 except (ValueError, TypeError):
                     identity_valid = False
         valid = bool(identity_valid and served == model.get("served_name"))
+        if valid and model.get("wrapper") == "nim":
+            # NIM can list its model before its engine is loaded. Its nginx
+            # liveness endpoint is not model readiness either.
+            valid = probe_ready_path(scoped, model)
         if assigned.get("phase") in ("draining", "stopping", "failed", "rebooting"):
             valid = False
         if assignments and assigned.get("mode") in ("none", "yue", "unknown"):
@@ -760,7 +796,7 @@ def collect_status(cfg: dict) -> dict:
               "ours_running": head["ours_running"],
               "vllm_running": any(c["running"] for n in nodes for c in n["containers"]),
               "port_busy": head["port_busy"], "v1_models_raw": head["v1_models_raw"], **managed,
-              "nodes": nodes, "active_node": _active_client_node(cfg)}
+              "nodes": nodes, "active_node": _active_client_node(cfg, nodes)}
     if managed.get("mode") == "yue":
         result["ready"] = all(item["ready"] for item in nodes)
         result["served"] = "yue" if result["ready"] else None
@@ -816,7 +852,7 @@ def cmd_list_json(cfg: dict) -> None:
             "ctx": int(m.get("max_model_len") or 0),
             "image": m.get("image", ""),
             "notes": m.get("notes", ""),
-            "backend": "vllm",
+            "backend": "nim" if m.get("wrapper") == "nim" else "vllm",
             "topology": "single" if int(m.get("nnodes") or cfg["cluster"]["nnodes"]) == 1 else "distributed",
             "wrapper": m.get("wrapper", "vllm"),
             "hermes_provider": m.get("hermes_provider", "spark"),
@@ -859,6 +895,7 @@ def pick_log_container(cfg: dict, host: str) -> str:
     """Prefer a running vllm_* (or stop_names) container over the default name."""
     default = container_name(cfg)
     stop = [str(n) for n in (cfg["cluster"].get("stop_names") or [])]
+    stop.extend(str(m["container"]) for m in cfg.get("models", {}).values() if m.get("container"))
     out = ssh_cmd(cfg, host, "docker ps --format '{{.Names}}'", check=False).stdout.strip()
     running = [ln.strip() for ln in out.splitlines() if ln.strip()]
     for n in running:
@@ -1198,7 +1235,8 @@ def cmd_pull(cfg: dict, name: str, node: str | None = None) -> None:
     recipe = model.get("recipe")
     if recipe:
         scripts = {"qwen38-nvfp4": "prepare_qwen38.py", "nemotron-super-nvfp4": "prepare_nemotron.py",
-                   "mimo-v26-flash": "prepare_mimo26.py"}
+                   "glm53-nvfp4": "prepare_glm53.py", "mimo-v26-flash": "prepare_mimo26.py",
+                   "glm53-exl3": "prepare_glm53_exl3.py", "qwen38-v030": "prepare_qwen38_v030.py"}
         if recipe not in scripts:
             die(f"unknown preparation recipe {recipe!r} for {mid}")
         command = [
@@ -1340,6 +1378,90 @@ class _Sink:
         raise SystemExit(code)
 
 
+def _bring_up_nim(
+    cfg: dict, mid: str, no_hermes: bool, no_wait: bool, sink: _Sink,
+    print_cmd: bool = False, generation: str | None = None,
+) -> dict | None:
+    """NIM owns its rendezvous; the controller still owns both containers."""
+    model, c = cfg["models"][mid], cfg["cluster"]
+    plan = validate_nim_plan(cfg, mid)
+    if print_cmd:
+        preview = copy.deepcopy(cfg)
+        preview.setdefault("_spark_serve_placement", {"model": mid, "hosts": [c["head"], c["worker"]]})
+        preview["_spark_serve_placement"]["generation"] = "00000000-0000-0000-0000-000000000001"
+        print("# NIM starts rank 0 first; production reads its immutable container log for NIM_PRIMARY_NODE.")
+        print(docker_run_script(preview, model, 0, False), end="")
+        preview["_nim_primary_node"] = c.get("master_addr") or "192.0.2.1"
+        print("# Rank 1 example only: the primary address below is replaced by the observed NIM handshake.")
+        print(docker_run_script(preview, model, 1, True), end="")
+        return None
+    if not generation:
+        raise ControllerError("NIM startup requires controller ownership of both Sparks")
+    cfg.pop("_nim_primary_node", None)
+    sink.event("start", model=mid, label=model.get("label") or mid, image=model["image"],
+               served=model["served_name"], ctx=int(model.get("max_model_len") or 0),
+               url=c["lan_url"] + "/v1", nnodes=2, backend="nim", topology="distributed")
+    if parse_v1_ids(probe_v1(cfg)):
+        raise ControllerError("model API is still serving after stop; refusing NIM launch")
+    if model.get("drop_caches", True):
+        for host in (c["worker"], c["head"]):
+            sink.event("drop_caches", host=host, output=drop_caches(cfg, host))
+    monitor = _StartupMonitor(cfg, sink)
+
+    def start_rank(rank: int) -> None:
+        host = c["head" if rank == 0 else "worker"]
+        script = guarded_remote_script(generation, docker_run_script(cfg, model, rank, rank == 1))
+        proc = ssh_cmd(cfg, host, script, check=False)
+        known = monitor.remember(host, rank, proc.stdout)
+        if proc.returncode or not known:
+            detail = ((proc.stderr or "") + (proc.stdout or "")).strip()[-1200:]
+            monitor.fail(f"{host}: NIM rank {rank} launch failed: " + (detail or "no immutable container ID"))
+        sink.event("head_start" if rank == 0 else "worker_start", host=host, output=proc.stdout.strip())
+
+    start_rank(0)
+    handshake_started = time.monotonic()
+    primary = None
+    while time.monotonic() - handshake_started < plan.handshake_timeout:
+        monitor.check()
+        proc = ssh_cmd(
+            cfg, c["head"], "set -o pipefail\n" + shlex.join([
+                "docker", "logs", "--tail", "300", monitor.containers[0]["id"],
+            ]) + " 2>&1 | tail -c 65536", check=False, timeout=15,
+        )
+        if proc.returncode:
+            monitor.fail(f"{c['head']}: cannot observe NIM primary-node handshake")
+        try:
+            primary = parse_nim_primary_node(proc.stdout)
+        except ControllerError as exc:
+            monitor.fail(str(exc))
+        if primary:
+            break
+        sink.event("poll", elapsed=int(time.monotonic() - handshake_started),
+                   detail="waiting for NIM primary-node handshake")
+        time.sleep(3)
+    if not primary:
+        monitor.fail("NIM rank 0 did not advertise NIM_PRIMARY_NODE before the handshake timeout")
+    cfg["_nim_primary_node"] = primary
+    start_rank(1)
+    monitor.check()
+    if no_wait:
+        sink.event("hermes", detail="skipped (--no-wait)")
+        sink.event("launched")
+        return {"containers": copy.deepcopy(monitor.containers), "served": None}
+    path = model["ready_path"]
+    sink.event("waiting", ready_path=path, hermes_hint=f"provider spark, -m {model['served_name']}")
+    start = time.monotonic()
+    ok, served, body = wait_ready(
+        cfg, timeout=model_ready_timeout(model), expect_served=model["served_name"], ready_path=path,
+        on_poll=lambda elapsed: sink.event("poll", elapsed=elapsed), check_started=monitor.check,
+    )
+    if not ok:
+        monitor.fail("NIM did not report model readiness and the expected served ID before the startup timeout")
+    sink.event("hermes", detail=maybe_hermes_json(cfg, mid, model, skip=no_hermes))
+    sink.event("ready", served=served, elapsed=int(time.monotonic() - start), body=body)
+    return {"containers": copy.deepcopy(monitor.containers), "served": served}
+
+
 def _bring_up(
     cfg: dict,
     name: str,
@@ -1353,6 +1475,8 @@ def _bring_up(
     c = cfg["cluster"]
     if cfg.get("_spark_serve_placement"):
         cfg["_spark_serve_placement"]["generation"] = generation or ""
+    if model.get("wrapper") == "nim":
+        return _bring_up_nim(cfg, mid, no_hermes, no_wait, sink, print_cmd, generation)
     nnodes = int(model.get("nnodes") or c["nnodes"])
     if print_cmd:
         ranks = [(0, False, "head/rank0")]
@@ -1450,6 +1574,10 @@ def model_preflight(cfg: dict, mid: str, model: dict, sink: _Sink) -> None:
     if (not isinstance(arguments, list) or not arguments
             or any(not isinstance(arg, str) or not arg for arg in arguments)):
         raise ControllerError(f"{mid}: preflight_args must be a nonempty list of strings")
+    preflight_timeout = model.get("preflight_timeout", 120)
+    if (isinstance(preflight_timeout, bool) or not isinstance(preflight_timeout, int)
+            or not 1 <= preflight_timeout <= 3600):
+        raise ControllerError(f"{mid}: preflight_timeout must be an integer from 1 to 3600 seconds")
     c = cfg["cluster"]
     nnodes = int(model.get("nnodes") or c["nnodes"])
     if nnodes not in (1, 2):
@@ -1466,7 +1594,8 @@ def model_preflight(cfg: dict, mid: str, model: dict, sink: _Sink) -> None:
             "-e", "NVIDIA_VISIBLE_DEVICES=void", "-e", "CUDA_VISIBLE_DEVICES=",
         ]
         if not model.get("skip_default_cache_mount"):
-            command.extend(["-v", f"{c['hf_cache_host']}:{model.get('hf_mount') or '/cache/huggingface'}:ro"])
+            cache = (c.get("worker_hf_cache_host") or c["hf_cache_host"]) if rank == 1 else c["hf_cache_host"]
+            command.extend(["-v", f"{cache}:{model.get('hf_mount') or '/cache/huggingface'}:ro"])
         for mount in model.get("mounts") or []:
             if not isinstance(mount, dict):
                 continue
@@ -1480,11 +1609,11 @@ def model_preflight(cfg: dict, mid: str, model: dict, sink: _Sink) -> None:
         remote = (
             "set -euo pipefail\n"
             f"image_id=$({inspect})\n"
-            "timeout --signal=TERM --kill-after=10s 120s "
+            f"timeout --signal=TERM --kill-after=10s {preflight_timeout}s "
             + shlex.join(command) + ' "$image_id" ' + shlex.join(arguments) + "\n"
         )
         sink.event("preflight", model=mid, host=host, detail="checking local image and prepared weights")
-        proc = ssh_cmd(cfg, host, remote, check=False, timeout=145)
+        proc = ssh_cmd(cfg, host, remote, check=False, timeout=preflight_timeout + 25)
         if proc.returncode:
             output = ((proc.stderr or "") + (proc.stdout or "")).strip()[-8192:]
             selected_node = cfg.get("_spark_serve_placement", {}).get("node")
@@ -1535,6 +1664,13 @@ def cmd_up(
             model = scoped["models"][mid]
             # Fail before Controller.switch can drain or stop a live model.
             model_ready_timeout(model)
+            wrapper = model.get("wrapper") or "vllm"
+            if wrapper not in ("vllm", "dsv4", "dsv4-vision", "nim"):
+                raise ControllerError(f"unknown model wrapper {wrapper!r}")
+            if wrapper == "nim":
+                validate_nim_plan(scoped, mid)
+                if not model.get("preflight_args"):
+                    raise ControllerError("NIM requires prepared-assets preflight before stopping a workload")
             model_preflight(scoped, mid, model, sink)
         Controller(cfg, ssh_cmd, sink.event).switch(
             mid,

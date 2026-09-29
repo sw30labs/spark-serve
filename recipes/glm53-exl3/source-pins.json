@@ -1,0 +1,52 @@
+{
+  "version": 1,
+  "upstream_url": "https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks",
+  "upstream_revision": "b2c5986324a7bac7b02bf0a47ed7b92b25e56016",
+  "base_image": "ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks@sha256:447114ee77d14c9b4732ee23978ada2a0ee9027868a231d6fd42700a8b25be1d",
+  "local_image": "spark-serve-glm53-exl3:0.1.0",
+  "manifest_sha256": "aede20b8ceb6cee9421f11e19d7a30b5aa99d3c96cd7f596fe564d785a975fa8",
+  "checkpoint_revisions": {
+    "target": "25a44fdbf16862a46b7cc9921142c6c81350af2f",
+    "draft": "dc77ff1c99eeb2df044ee3d4f0094eb033fee410"
+  },
+  "runtime_sha256": {
+    "runtime/Dockerfile": "023a9e763f422525f0f8ffa9f356444bdeafbd5b128fbe752c09ca8567bde21e",
+    "runtime/entrypoint.sh": "2770e1f5fb6ad7aecfeb99b15193155cbeca069075fbabaabec7304dc3b00be7",
+    "runtime/overlay-order.txt": "ea2d54cbfc7964a7dc501ebdc726b3312a8a9807a58378b08688cc6e4a77a2cd",
+    "runtime/upstream/LICENSE": "8d56b405468aad11f87ab5763f901e276e08d9646ff5c8481b1762b6b789e9ed",
+    "runtime/upstream/LICENSE.MIT": "d48b01844af2aa68bc3fbea765069b94d70adb0c67dc4a62ca605c067aec9ab3",
+    "runtime/upstream/ablit_runtime.py": "60b1ad3d42b139770504aa595b5744c0112b62c2f11dd38524abe9b234ff9623",
+    "runtime/upstream/chat_template.jinja": "7a5a0dda1331a7c40d930961cc1cb3b57c3b52625250c13372fe006ba2e9dfdb",
+    "runtime/upstream/exl3.py": "849e25882ab7901fbdd7227990a4f125809e1f79288ce6506311b6e6a53e6fb2",
+    "runtime/upstream/patch_ablit.py": "cd7fef3e0a236605941d7f34217f2de4026de6e1b256ffafe772bb421c2f5e40",
+    "runtime/upstream/patch_adaptive_k.py": "b7a874f897085a39b6b736084769fbad8e2444b3c098fc23f461a22f62b46b79",
+    "runtime/upstream/patch_apc_no_store.py": "19a4f29ca997fcd35a1a67de60dac9c0c4f11cc7c64a0085435d3e07e1544043",
+    "runtime/upstream/patch_apc_per_group_retention.py": "1885eca6737cb256bed198414b2ae9c430ed432cdcc2a02088625b41133a3014",
+    "runtime/upstream/patch_cache_reset.py": "8292aab26b5e92c268fb603a99df30016e92210bfa6b82a1e707c8543bb49f1c",
+    "runtime/upstream/patch_cold_load_uma.py": "42a9504353c13e6f6ed6fd901d736e8246625d6df451a1f27c876d9e66d99486",
+    "runtime/upstream/patch_default_max_new_tokens.py": "c73e57be0fe979daa3938e43a1eaefd9a59f0e5278ebbbd5cca01595b246b2c7",
+    "runtime/upstream/patch_dense_fp8.py": "ada9cdd910e96736b43050a5034f7fd47e6e07dadbbe9adbe6113b9a308c198b",
+    "runtime/upstream/patch_glm5_drafter_group.py": "56cea092c1bd80de80ba844a151b38e898186854ccb8debebc12d6b1d2f07ece",
+    "runtime/upstream/patch_glm_video_placeholders.py": "68a27e9030ef1c2c750727a651107020d700cb5305e02fd2f3e6c95c6017ea10",
+    "runtime/upstream/patch_hybrid_prefix_hit.py": "892adc99bfab6c1a649b3b0da0fc3b186ba2d9f57adadc97a344471b7074ab0b",
+    "runtime/upstream/patch_indexer_workspace.py": "a52848ed34973a46408addaf21bbce013c965f7f94020557a05f13ff8640a5ad",
+    "runtime/upstream/patch_kpool_tail_seed_stride.py": "c8f053979801baaf2af711b4730648781215a15ab438ab7858acd71980566d87",
+    "runtime/upstream/patch_kpool_tail_slotmap.py": "601e17ace90ce6945d29edf0b994b91fa6c9cbb389774fd0f1252f31a19c26bd",
+    "runtime/upstream/patch_kv_capacity_log.py": "3875440f7812c572655c9fe8827542631f78c3788f3e13fe068c893da64f2241",
+    "runtime/upstream/patch_loadclone.py": "9f475e8205d6be5280280808a2476c1dbeaa725ad2c26ce6095835e5738f80ad",
+    "runtime/upstream/patch_mamba_align_chunking.py": "78e4b754b70fa474306a410d753614e4ba5965ef44e53abc864a493c6f193b89",
+    "runtime/upstream/patch_mamba_align_state_free.py": "991fff352d2d166e294bae21ee7e7beadad7fab01ca723bbeb03b00b2fc7fe82",
+    "runtime/upstream/patch_scheduler_decode_floor.py": "d5713ec6eac0d7a971c4fb33782298f8496a547c829407ad2427d709ba118eb4",
+    "runtime/upstream/patch_skip_cudagraph_profile.py": "f2d5abb4598e141fccb53b02144e36a3c841209e7114572d1576fd5520c2094c",
+    "runtime/upstream/patch_spinwait.py": "09ec72e41d48181bb62b84c54d7a45956943271477bd6ca02c6ae221ba0d282c",
+    "runtime/upstream/patch_suppress_stops_in_reasoning.py": "14602ea4350bad1eb8a6e76de3e17e2d5ef1229340bcd199351e20334f5e15d7",
+    "runtime/upstream/patch_tool_choice_none.py": "769c9da4140667a8b21de382fe2a654b9474e6075b8c4428cfb2b059d2a412bf",
+    "runtime/upstream/patch_xgrammar_termination.py": "e6e5928eaf74dbb6bf0e9511105987c9f74848278c2cba7c28c506ca58ee90f5",
+    "runtime/upstream-files.json": "ac7bb95073af56930bb0c484f9265de77cbc80d5fd0ddb27c8d1e5f0eb03e0e5",
+    "runtime/verify_runtime.py": "c9869cb946596673c3748a35edfd93a6911022e7ace57f031f631bdaf2b3dd4c"
+  },
+  "preparation_sha256": {
+    "verify.py": "14f57106b1b11107f95c62a7ede56a02fc030da98f6819ba57ffc10a5f2b1fe8",
+    "download.py": "743aa257d9b85e3a53cb1fb82eccf8391f78d12439380d60f2553674a71b0ae7"
+  }
+}

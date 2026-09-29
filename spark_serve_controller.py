@@ -290,6 +290,7 @@ class Controller:
         self.state = read_state(self.directory)
         self.operation_generation = None
         self.operation_hosts = None
+        self.operation_target = None
 
     def _workers(self):
         """Lifecycle work is restricted to the current transition's hosts."""
@@ -548,8 +549,48 @@ raise SystemExit(p.returncode)
                 errors.append(str(exc))
         return errors
 
+    def _audit_ports(self, host: str) -> list[int]:
+        """Check the selected recipe and this host's existing allocation only.
+
+        Retain a departing NIM allocation's rendezvous/worker ports until idle
+        verification succeeds. An unused catalog entry must not make unrelated
+        single-Spark operations depend on those ports or the other host.
+        """
+        ports = {int(self.cfg["cluster"].get("port") or 8000), self.profile["port"]}
+        current = self.node_states().get(host, {})
+        names = [self.operation_target]
+        if current.get("mode") == "vllm":
+            names.append(current.get("model"))
+        for name in names:
+            _, model = self._model(name)
+            if model is None or model.get("wrapper") != "nim":
+                continue
+            nim = model.get("nim") or {}
+            if not isinstance(nim, dict):
+                raise ControllerError("NIM port configuration must be a table")
+            required = [("manager_port", 20000)]
+            if host == self.cfg["cluster"]["worker"]:
+                required.append(("worker_port", 8002))
+            for key, default in required:
+                port = nim.get(key, default)
+                if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+                    raise ControllerError(f"NIM {key} must be a port number in 1..65535")
+                ports.add(port)
+            # The pinned image runs its model backend on 8001 on each host;
+            # NIM_SERVER_PORT=8002 changes only the worker's nginx listener.
+            env = model.get("env") or {}
+            if not isinstance(env, dict):
+                raise ControllerError("NIM environment must be a table")
+            backend = env.get("NIM_BACKEND_PORT", 8001)
+            if isinstance(backend, str) and backend.isascii() and backend.isdecimal():
+                backend = int(backend)
+            if isinstance(backend, bool) or not isinstance(backend, int) or not 1 <= backend <= 65535:
+                raise ControllerError("NIM NIM_BACKEND_PORT must be a port number in 1..65535")
+            ports.add(backend)
+        return sorted(ports)
+
     def audit(self, host: str) -> dict:
-        script = inspect.getsource(classify_gpu_processes) + "\n" + """import json, socket, subprocess, sys
+        script = inspect.getsource(classify_gpu_processes) + "\n" + """import json, subprocess, sys
 def run(args):
     p = subprocess.run(args, text=True, capture_output=True, timeout=30)
     if p.returncode: raise RuntimeError(p.stderr.strip() or "command failed")
@@ -557,12 +598,19 @@ def run(args):
 ids = run(["docker", "ps", "-aq"]).split()
 containers = json.loads(run(["docker", "inspect", *ids])) if ids else []
 compute = run(["nvidia-smi", "--query-compute-apps=pid,process_name,used_gpu_memory", "--format=csv,noheader,nounits"])
-listening = []
-for port in json.loads(sys.argv[1]):
-    with socket.socket() as probe:
-        probe.settimeout(1)
-        if probe.connect_ex(("127.0.0.1", port)) == 0: listening.append(port)
-print(json.dumps({"listening_ports": listening, "containers": [{"id": c["Id"], "name": c["Name"].lstrip("/"), "running": c["State"]["Running"], "gpu": bool(c["HostConfig"].get("DeviceRequests")) or any("nvidia" in str(d) for d in c["HostConfig"].get("Devices") or []), "labels": c["Config"].get("Labels") or {}, "command": (c["Config"].get("Entrypoint") or []) + (c["Config"].get("Cmd") or [])} for c in containers], **classify_gpu_processes(compute) }))
+wanted = set(json.loads(sys.argv[1]))
+listening = set()
+# Inspect listeners on every IPv4/IPv6 interface. A loopback-only connection
+# probe misses NIM managers bound specifically to a fabric or LAN address.
+for line in run(["ss", "-H", "-ltn"]).splitlines():
+    fields = line.split()
+    if len(fields) < 5 or fields[0] != "LISTEN":
+        raise RuntimeError("unrecognized TCP listener inventory; ownership is unknown")
+    try: port = int(fields[3].rsplit(":", 1)[1])
+    except (ValueError, IndexError):
+        raise RuntimeError("invalid TCP listener address; ownership is unknown")
+    if port in wanted: listening.add(port)
+print(json.dumps({"listening_ports": sorted(listening), "containers": [{"id": c["Id"], "name": c["Name"].lstrip("/"), "running": c["State"]["Running"], "gpu": bool(c["HostConfig"].get("DeviceRequests")) or any("nvidia" in str(d) for d in c["HostConfig"].get("Devices") or []), "labels": c["Config"].get("Labels") or {}, "command": (c["Config"].get("Entrypoint") or []) + (c["Config"].get("Cmd") or [])} for c in containers], **classify_gpu_processes(compute) }))
 """
         return self.remote(
             host,
@@ -572,12 +620,7 @@ print(json.dumps({"listening_ports": listening, "containers": [{"id": c["Id"], "
                     "python3",
                     "-c",
                     script,
-                    json.dumps(
-                        [
-                            int(self.cfg["cluster"].get("port") or 8000),
-                            self.profile["port"],
-                        ]
-                    ),
+                    json.dumps(self._audit_ports(host)),
                 ]
             ),
             json_output=True,
@@ -829,6 +872,7 @@ print(json.dumps({"listening_ports": listening, "containers": [{"id": c["Id"], "
             from spark_serve_benchmarks import revoke_benchmarks
             revoke_benchmarks(self.directory, selected)
             self.operation_hosts = selected
+            self.operation_target = mid
             generation = str(uuid.uuid4())
             self.operation_generation = generation
             started = False
@@ -926,6 +970,7 @@ print(json.dumps({"listening_ports": listening, "containers": [{"id": c["Id"], "
             finally:
                 self.operation_generation = None
                 self.operation_hosts = None
+                self.operation_target = None
 
     def status(self) -> dict:
         state = read_state(self.directory)

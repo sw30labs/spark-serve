@@ -82,6 +82,31 @@ def test_worker_failure_also_prevents_switch(monkeypatch):
     controller.assert_not_called()
 
 
+def test_full_checkpoint_hashing_can_use_a_longer_bounded_preflight(monkeypatch):
+    cfg = config(2)
+    model = cfg["models"]["qwen38"]
+    model["preflight_timeout"] = 900
+    ssh = Mock(return_value=completed())
+    monkeypatch.setattr(cli, "ssh_cmd", ssh)
+    cli.model_preflight(cfg, "qwen38", model, Mock())
+    assert ssh.call_count == 2
+    for call in ssh.call_args_list:
+        assert "--kill-after=10s 900s " in call.args[2]
+        assert call.kwargs["timeout"] == 925
+
+
+@pytest.mark.parametrize("timeout", [0, -1, 3601, True, "900", 1.5])
+def test_invalid_preflight_timeout_fails_before_remote_operations(monkeypatch, timeout):
+    cfg = config()
+    model = cfg["models"]["qwen38"]
+    model["preflight_timeout"] = timeout
+    ssh = Mock()
+    monkeypatch.setattr(cli, "ssh_cmd", ssh)
+    with pytest.raises(cli.ControllerError, match="preflight_timeout"):
+        cli.model_preflight(cfg, "qwen38", model, Mock())
+    ssh.assert_not_called()
+
+
 def test_successful_preflight_precedes_controller_switch(monkeypatch):
     order = []
     monkeypatch.setattr(cli, "ssh_cmd", lambda *a, **k: order.append("preflight") or completed())

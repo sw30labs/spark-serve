@@ -1,0 +1,30 @@
+{
+  "repository": "https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark",
+  "revision": "b8439110eec0230facbe4ddf0dffe01b8f769be0",
+  "files": {
+    "patch_qsa_fp8_kv_v030.py": {
+      "source": "files/patch_qsa_fp8_kv_v030.py",
+      "sha256": "5cf2e4c16dae7aea92bd9846f158c3d75fcc041b9aecaa570e62403d1f0aa9d4"
+    },
+    "patch_ple_mmap_v030.py": {
+      "source": "files/patch_ple_mmap_v030.py",
+      "sha256": "b63bb3d86ececfe5d0dac7f4c072407c9745fab7b6ed856175bc8f668c107309"
+    },
+    "patch_mtp_draft_vocab_v030.py": {
+      "source": "files/patch_mtp_draft_vocab_v030.py",
+      "sha256": "0fdfe23b91de313eb175d4a9c9ccbf395c6e9bec977c473ae4434d90a0714087"
+    },
+    "patch_mtp_draft_vocab.py": {
+      "source": "files/patch_mtp_draft_vocab.py",
+      "sha256": "2c7d19b8021f2c439920ae7f7df6f7b008eb635256a8423ef03e168d3984911f"
+    },
+    "draft_vocab_en_code_47k.txt": {
+      "source": "files/draft_vocab_en_code_47k.txt",
+      "sha256": "ee819d2560b52ba1351acdd1c4a0244b77bb60694a7660c6363097a482b0afb5"
+    },
+    "LICENSE": {
+      "source": "LICENSE",
+      "sha256": "0d96a4ff68ad6d4b6f1f30f713b18d5184912ba8dd389f86aa7710db079abcb0"
+    }
+  }
+}
