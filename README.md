@@ -263,8 +263,8 @@ The window has three tabs:
   managed allocation, with reasoning settings, cancellation, saved history, and
   comparison of two runs. Warmup is separate; token counts come from the server.
 
-The app invokes this CLI (`list`, `status`, `watch`, `bench`, `up`, `stop`, and
-`reboot`) and does not speak SSH itself. Live monitoring starts with the app and
+The app invokes this CLI (`list`, `status`, `watch`, `bench`, `up`, `stop`,
+`reboot`, and `shutdown`) and does not speak SSH itself. Live monitoring starts with the app and
 stops when it quits. Benchmarks start only when requested. The same interfaces
 are available directly:
 
@@ -283,9 +283,11 @@ confirmed action. **Restart Sparks** drains, reboots both hosts
 (`systemctl reboot --no-block`), and waits for SSH. Passwordless
 `/usr/bin/systemctl` is used when sudoers already allows it; otherwise the
 confirmation sheet’s sudo password is passed on stdin for that reboot only
-and is not stored. This tool does not add or weaken sudoers rules. After reboot,
-press Start to launch a catalog model again. A running CLI transition completes
-before another one can begin.
+and is not stored. **Shutdown both Sparks** uses the same drain and the same
+sudo check, then runs `systemctl poweroff --no-block` and waits until SSH drops.
+The machines stay off until someone presses the power button. This tool does
+not add or weaken sudoers rules. After a reboot, press Start to launch a catalog
+model again. A running CLI transition completes before another one can begin.
 
 The CLI path is resolved from the app bundle (`repo/gui/SparkServeApp.app` →
 repo) or `SPARK_SERVE_HOME`. The app's `PATH` includes `~/miniconda3/bin` so the

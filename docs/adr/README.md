@@ -17,6 +17,7 @@ Dates below are record dates, not reconstructed approval dates. All are accepted
 | [0009](0009-yue-capacity-experiments.md) | Isolate YuE capacity experiments from production |
 | [0010](0010-nim-backend.md) | Run NIM through the existing fenced controller |
 | [0011](0011-tensorfold-recipe.md) | Add TensorFold as a separate managed recipe |
+| [0012](0012-host-poweroff.md) | Power off both Sparks through the fenced CLI |
 
 Keep ADRs short: context, decision, trade-off, evidence. Amend clarifications in
 place. For a changed decision, add a new numbered ADR and link the superseded

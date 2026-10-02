@@ -316,10 +316,11 @@ def drop_caches(cfg: dict, host: str) -> str:
     return (proc.stdout or "").strip() or "skip"
 
 
-# Probe/reboot must use this exact path: sparkone's sudoers grants NOPASSWD on
-# /usr/bin/systemctl, not a generic `reboot` or `shutdown` binary. Do not add
-# sudoers rules from this tool.
+# Probe, reboot, and power-off must use this exact path: sparkone's sudoers
+# grants NOPASSWD on /usr/bin/systemctl, not a generic `reboot` or `shutdown`
+# binary. Do not add sudoers rules from this tool.
 SYSTEMCTL = "/usr/bin/systemctl"
+_HOST_ACTIONS = {"reboot": "reboot", "poweroff": "power off"}
 
 # Remote helper: read the sudo password from stdin, feed it to a PTY so Ubuntu's
 # `Defaults use_pty` still authenticates, then exec sudo argv. Never put the
@@ -467,12 +468,17 @@ def _reboot_output_ok(proc: subprocess.CompletedProcess) -> bool:
     return False
 
 
-def issue_host_reboot(cfg: dict, host: str, method: str, password: str | None) -> None:
+def issue_host_systemctl(
+    cfg: dict, host: str, method: str, password: str | None, verb: str
+) -> None:
+    label = _HOST_ACTIONS.get(verb)
+    if label is None:
+        die(f"{host}: internal host action {verb!r} is invalid")
     if method == "nopasswd":
         proc = ssh_cmd(
             cfg,
             host,
-            f"sudo -n {SYSTEMCTL} reboot --no-block && echo issued",
+            f"sudo -n {SYSTEMCTL} {verb} --no-block && echo issued",
             check=False,
             timeout=30,
         )
@@ -481,12 +487,12 @@ def issue_host_reboot(cfg: dict, host: str, method: str, password: str | None) -
                 (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip(),
                 password,
             )
-            die(f"{host}: reboot via passwordless {SYSTEMCTL} failed: {err}")
+            die(f"{host}: {label} via passwordless {SYSTEMCTL} failed: {err}")
         return
     if method != "password" or not password:
-        die(f"{host}: internal reboot auth method {method!r} is invalid")
+        die(f"{host}: internal {label} auth method {method!r} is invalid")
     proc = ssh_sudo(
-        cfg, host, [SYSTEMCTL, "reboot", "--no-block"], password, timeout=30
+        cfg, host, [SYSTEMCTL, verb, "--no-block"], password, timeout=30
     )
     text = ((proc.stdout or "") + "\n" + (proc.stderr or "")).lower()
     if proc.returncode not in (0, 255) or "password is required" in text:
@@ -494,7 +500,15 @@ def issue_host_reboot(cfg: dict, host: str, method: str, password: str | None) -
             (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip(),
             password,
         )
-        die(f"{host}: reboot via sudo {SYSTEMCTL} failed: {err}")
+        die(f"{host}: {label} via sudo {SYSTEMCTL} failed: {err}")
+
+
+def issue_host_reboot(cfg: dict, host: str, method: str, password: str | None) -> None:
+    issue_host_systemctl(cfg, host, method, password, "reboot")
+
+
+def issue_host_poweroff(cfg: dict, host: str, method: str, password: str | None) -> None:
+    issue_host_systemctl(cfg, host, method, password, "poweroff")
 
 
 def wait_for_hosts(
@@ -508,6 +522,8 @@ def wait_for_hosts(
     down_timeout: float = 90,
     up_timeout: float = 600,
     interval: float = 3,
+    action: str = "reboot",
+    wait_until_up: bool = True,
 ) -> None:
     def _reachable(host: str) -> bool:
         if reachable is not None:
@@ -518,7 +534,7 @@ def wait_for_hosts(
     t0 = clock()
     pending_down = set(hosts)
     while pending_down and clock() - t0 < down_timeout:
-        sink.event("poll", elapsed=int(clock() - t0), detail="waiting for reboot to start")
+        sink.event("poll", elapsed=int(clock() - t0), detail=f"waiting for {action} to start")
         for host in list(pending_down):
             if not _reachable(host):
                 pending_down.discard(host)
@@ -527,10 +543,13 @@ def wait_for_hosts(
             sleep(interval)
     if pending_down:
         sink.fail(
-            "reboot did not take effect on "
+            action
+            + " did not take effect on "
             + ", ".join(sorted(pending_down))
             + " (SSH still up). No sudoers changes were made."
         )
+    if not wait_until_up:
+        return
 
     pending_up = set(hosts)
     up_deadline = clock() + up_timeout
@@ -544,7 +563,7 @@ def wait_for_hosts(
             sleep(interval)
     if pending_up:
         sink.fail(
-            "reboot issued but still unreachable: " + ", ".join(sorted(pending_up))
+            action + " issued but still unreachable: " + ", ".join(sorted(pending_up))
         )
 
 
@@ -582,6 +601,46 @@ def cmd_reboot(
         wait_for_hosts(cfg, [host for host, _ in plan], sink)
         controller.save(mode="none", phase="stopped")
         sink.event("rebooted")
+
+    try:
+        controller.switch("none", cancel_jobs=cancel_jobs, after_idle=after_idle)
+    except ControllerError as exc:
+        sink.fail(str(exc))
+
+
+def cmd_shutdown(
+    cfg: dict,
+    *,
+    cancel_jobs: bool = False,
+    json_mode: bool = False,
+    no_wait: bool = False,
+    password: str | None = None,
+) -> None:
+    """Drain managed workloads, then power off both hosts. They stay off."""
+    sink = _Sink(json_mode)
+    plan = reboot_auth_plan(cfg, password)
+    sink.event("start", model="shutdown", label="shut down both Sparks")
+    controller = Controller(cfg, ssh_cmd, sink.event)
+
+    def after_idle() -> None:
+        controller.save(phase="powering_off")
+        for host, method in plan:
+            issue_host_poweroff(cfg, host, method, password)
+            sink.event("poweroff", host=host, output="issued")
+        if no_wait:
+            sink.event("launched")
+            controller.save(mode="none", phase="stopped")
+            return
+        sink.event("waiting", ready_path="power")
+        wait_for_hosts(
+            cfg,
+            [host for host, _ in plan],
+            sink,
+            action="power off",
+            wait_until_up=False,
+        )
+        controller.save(mode="none", phase="stopped")
+        sink.event("powered_off")
 
     try:
         controller.switch("none", cancel_jobs=cancel_jobs, after_idle=after_idle)
@@ -757,7 +816,7 @@ def collect_status(cfg: dict) -> dict:
             # A matching model listing is necessary but does not establish
             # backend engine readiness.
             valid = probe_ready_path(scoped, model)
-        if assigned.get("phase") in ("draining", "stopping", "failed", "rebooting"):
+        if assigned.get("phase") in ("draining", "stopping", "failed", "rebooting", "powering_off"):
             valid = False
         if assignments and assigned.get("mode") in ("none", "yue", "unknown"):
             valid = False
@@ -790,7 +849,7 @@ def collect_status(cfg: dict) -> dict:
             and by_host[host]["model"] == item["model"]
             and by_host[host]["_allocation_id"] == item["_allocation_id"]
             and set(by_host[host]["allocation_hosts"]) == set(members)
-            and by_host[host]["phase"] not in ("failed", "stopping", "draining", "rebooting")
+            and by_host[host]["phase"] not in ("failed", "stopping", "draining", "rebooting", "powering_off")
             for host in members))
     for item in nodes:
         if len(item["allocation_hosts"]) > 1 and item["_model"]:
@@ -1327,6 +1386,9 @@ class _Sink:
             if fields.get("model") == "reboot":
                 print("reboot both Sparks")
                 return
+            if fields.get("model") == "shutdown":
+                print("shut down both Sparks")
+                return
             print(f"up {fields.get('model')} ({fields.get('label')})")
             print(f"  image  {fields.get('image')}")
             print(f"  served {fields.get('served')}  ctx {fields.get('ctx')}")
@@ -1335,12 +1397,16 @@ class _Sink:
             print(f"  stop {fields.get('host')}: {fields.get('output')}")
         elif name == "reboot":
             print(f"  reboot {fields.get('host')}: {fields.get('output')}")
+        elif name == "poweroff":
+            print(f"  power off {fields.get('host')}: {fields.get('output')}")
         elif name == "host_down":
             print(f"  {fields.get('host')} going down")
         elif name == "host_up":
             print(f"  {fields.get('host')} is up")
         elif name == "rebooted":
             print("both Sparks are back; start a catalog model if you want serving again")
+        elif name == "powered_off":
+            print("both Sparks are powered off; press the power button to turn them on")
         elif name == "drop_caches":
             print(f"  drop_caches {fields.get('host')}: {fields.get('output')}")
         elif name == "preflight":
@@ -1363,6 +1429,9 @@ class _Sink:
             path = fields.get("ready_path") or "/v1/models"
             if path == "ssh":
                 print("waiting for both Sparks to reboot and accept SSH …")
+                return
+            if path == "power":
+                print("waiting for both Sparks to power off …")
                 return
             print("boot takes ~10–25 min (Triton JIT on Qwen is the long one).")
             print("  spark-serve status")
@@ -1832,6 +1901,22 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="read the sudo password from stdin; not stored. Used only on hosts without passwordless systemctl",
     )
+    shutdown = sub.add_parser(
+        "shutdown",
+        help="drain managed workloads and power off both Spark hosts",
+    )
+    shutdown.add_argument(
+        "--cancel-jobs",
+        action="store_true",
+        help="explicitly cancel active YuE jobs before powering off",
+    )
+    shutdown.add_argument("--no-wait", action="store_true", help="do not wait for SSH to drop")
+    shutdown.add_argument("--json", action="store_true", help="emit JSON-line progress events")
+    shutdown.add_argument(
+        "--sudo-password-stdin",
+        action="store_true",
+        help="read the sudo password from stdin; not stored. Used only on hosts without passwordless systemctl",
+    )
     return p
 
 
@@ -1930,6 +2015,16 @@ def main(argv: list[str] | None = None) -> None:
         _JSON_MODE = bool(args.json)
         password = read_sudo_password_stdin() if args.sudo_password_stdin else None
         cmd_reboot(
+            cfg,
+            cancel_jobs=args.cancel_jobs,
+            json_mode=_JSON_MODE,
+            no_wait=args.no_wait,
+            password=password,
+        )
+    elif args.cmd == "shutdown":
+        _JSON_MODE = bool(args.json)
+        password = read_sudo_password_stdin() if args.sudo_password_stdin else None
+        cmd_shutdown(
             cfg,
             cancel_jobs=args.cancel_jobs,
             json_mode=_JSON_MODE,

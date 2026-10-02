@@ -11,6 +11,8 @@ through their side effects. Revoke overlapping benchmark leases and discovery,
 drain active work, stop exact owned container IDs, verify idle, then launch.
 Protect unrelated containers. Require identity and readiness evidence; save
 startup diagnostics before guarded cleanup. Retain failed state for explicit retry.
+Host reboot and power-off are the same kind of transition: drain and verify idle
+before `systemctl`, as recorded in [0012](0012-host-poweroff.md).
 
 **Trade-off.** Unknown ownership or an unreachable participating host blocks the
 transition. Active YuE jobs survive unless cancellation is explicit. Safety takes

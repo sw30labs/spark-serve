@@ -118,8 +118,8 @@ Admission uses the controller lock to verify physical scope and immutable
 allocation identity. The app also pins the allocation selected when Run was
 clicked (`--allocation-id` in the CLI), rejecting a replacement before sending
 any requests. A benchmark leases all participating hosts, so a TP2 run
-cannot overlap a second run aimed at its worker. Stop, switch, and reboot revoke
-overlapping benchmark leases before changing workloads. Cancellation closes
+cannot overlap a second run aimed at its worker. Stop, switch, reboot, and
+shutdown revoke overlapping benchmark leases before changing workloads. Cancellation closes
 client requests; it does not prove that the inference engine has already
 reclaimed every request's GPU work. Lifecycle idle checks remain authoritative.
 

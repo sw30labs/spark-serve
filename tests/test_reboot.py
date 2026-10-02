@@ -328,5 +328,75 @@ class RebootCommandTests(unittest.TestCase):
         self.assertIsNone(reboot.call_args.kwargs["password"])
 
 
+class ShutdownCommandTests(unittest.TestCase):
+    def test_issue_poweroff_uses_systemctl_poweroff(self):
+        with patch.object(
+            cli,
+            "ssh_cmd",
+            return_value=cli.subprocess.CompletedProcess([], 0, "issued\n", ""),
+        ) as ssh:
+            cli.issue_host_poweroff(config(), "worker", "nopasswd", None)
+        remote = ssh.call_args.args[2]
+        self.assertIn("sudo -n /usr/bin/systemctl poweroff --no-block", remote)
+        self.assertNotIn("reboot", remote)
+
+    def test_drain_then_poweroff_and_do_not_wait_for_return(self):
+        issued = []
+
+        def fake_switch(self, target, *args, after_idle=None, **kwargs):
+            after_idle()
+
+        with (
+            patch.object(
+                cli,
+                "reboot_auth_plan",
+                return_value=[("worker", "password"), ("head", "nopasswd")],
+            ),
+            patch.object(
+                cli,
+                "issue_host_poweroff",
+                side_effect=lambda cfg, host, method, password: issued.append((host, method)),
+            ),
+            patch.object(cli, "wait_for_hosts") as wait,
+            patch.object(cli.Controller, "switch", fake_switch),
+            patch.object(cli.Controller, "save") as save,
+        ):
+            cli.cmd_shutdown(config(), password="pw", json_mode=True)
+
+        self.assertEqual([("worker", "password"), ("head", "nopasswd")], issued)
+        self.assertEqual(["worker", "head"], wait.call_args.args[1])
+        self.assertEqual("power off", wait.call_args.kwargs["action"])
+        self.assertFalse(wait.call_args.kwargs["wait_until_up"])
+        self.assertIn("powering_off", [call.kwargs.get("phase") for call in save.call_args_list])
+        self.assertEqual("stopped", save.call_args_list[-1].kwargs["phase"])
+
+    def test_active_jobs_block_shutdown(self):
+        with (
+            patch.object(cli, "reboot_auth_plan", return_value=[("worker", "nopasswd"), ("head", "nopasswd")]),
+            patch.object(cli, "issue_host_poweroff") as issue,
+            patch.object(
+                cli.Controller,
+                "switch",
+                side_effect=ControllerError("YuE is draining active jobs"),
+            ),
+            self.assertRaises(SystemExit),
+        ):
+            cli.cmd_shutdown(config(), cancel_jobs=False)
+        issue.assert_not_called()
+
+    def test_parser_and_stdin_password(self):
+        args = cli.build_parser().parse_args(
+            ["shutdown", "--cancel-jobs", "--no-wait", "--json", "--sudo-password-stdin"]
+        )
+        self.assertEqual("shutdown", args.cmd)
+        with (
+            patch.object(cli, "load", return_value=config()),
+            patch.object(cli, "cmd_shutdown") as shutdown,
+            patch.object(cli.sys, "stdin", io.StringIO("pw-from-stdin\n")),
+        ):
+            cli.main(["shutdown", "--sudo-password-stdin"])
+        self.assertEqual("pw-from-stdin", shutdown.call_args.kwargs["password"])
+
+
 if __name__ == "__main__":
     unittest.main()
