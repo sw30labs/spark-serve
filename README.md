@@ -39,6 +39,7 @@ cp models.example.toml models.toml   # then edit [cluster]
 ./spark-serve up ds4
 ./spark-serve stop
 ./spark-serve reboot
+./spark-serve shutdown
 ./spark-serve logs -f
 ```
 
