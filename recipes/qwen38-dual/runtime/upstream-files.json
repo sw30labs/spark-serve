@@ -1,0 +1,22 @@
+{
+  "repository": "https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Dual-DGX-Sparks",
+  "revision": "cd839d0b62f6c737178a0c2037733420e0524ebf",
+  "files": {
+    "patch_mtp_draft_vocab.py": {
+      "upstream_path": "files/patch_mtp_draft_vocab.py",
+      "sha256": "d5a85baaab238917d70448feb57761e61826f4e515bbc098167515d601bb6ea5"
+    },
+    "patch_mtp_draft_vocab_v030.py": {
+      "upstream_path": "files/patch_mtp_draft_vocab_v030.py",
+      "sha256": "a04d69b2f33715e622d4af9244ad92a9f7dc11a59c891280e53a70f3759a7095"
+    },
+    "draft_vocab_en_code_47k.txt": {
+      "upstream_path": "files/draft_vocab_en_code_47k.txt",
+      "sha256": "20e36b6e8eae2598019298959a578ef8adc2948bbed7189e43a8da9b9d84a0b1"
+    },
+    "LICENSE": {
+      "upstream_path": "LICENSE",
+      "sha256": "0d96a4ff68ad6d4b6f1f30f713b18d5184912ba8dd389f86aa7710db079abcb0"
+    }
+  }
+}

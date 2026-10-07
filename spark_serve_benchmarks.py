@@ -29,7 +29,8 @@ POLL_SECONDS = 0.2
 IDENTITY_SECONDS = 5
 EVENT_SECONDS = 2
 TENSORFOLD_SETTINGS = ("model_revision", "parallel", "kv_dtype", "vision", "ple_on_ssd",
-                      "mtp_drafts", "mtp_confidence", "thinking", "temperature", "top_p", "top_k")
+                      "mtp_drafts", "mtp_confidence", "thinking", "temperature", "top_p", "top_k",
+                      "draft_revision", "dense", "drafter", "vision_urls", "max_tokens", "communication")
 
 
 class BenchmarkCancelled(RuntimeError):

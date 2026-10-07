@@ -108,6 +108,21 @@ def test_container_labels_capture_physical_allocation():
     assert "/second/cache:/cache/huggingface" in argv
 
 
+@pytest.mark.parametrize("worker_cache", ["/second/cache", None])
+def test_distributed_default_cache_mount_uses_each_hosts_configured_path(worker_cache):
+    cfg = launch_config(config(), "distributed", "both")
+    if worker_cache is None:
+        cfg["cluster"].pop("worker_hf_cache_host")
+    model = cfg["models"]["distributed"]
+    head = cli.docker_base(cfg, model, "vllm_cluster", rank=0)
+    worker = cli.docker_base(cfg, model, "vllm_cluster", rank=1)
+    assert "/first/cache:/cache/huggingface" in head
+    expected_worker = worker_cache or "/first/cache"
+    assert f"{expected_worker}:/cache/huggingface" in worker
+    if worker_cache:
+        assert "/first/cache:/cache/huggingface" not in worker
+
+
 def setup_status(monkeypatch, tmp_path, *, second_phase="ready", second_id="nemotron", distributed=False):
     cfg = config(); model_a = "distributed" if distributed else "qwen"; model_b = "distributed" if distributed else "nemotron"
     assignments = [{"host": host, "mode": "vllm", "model": model, "phase": "ready" if host == "first" else second_phase,

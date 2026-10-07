@@ -64,12 +64,11 @@ cp models.example.toml models.toml   # then edit [cluster]
 | Model | Sparks | Catalog context | Recipe |
 |---|---:|---:|---|
 | DeepSeek-V4-Flash | 2 | 1M | [Startup and recovery](docs/ds4-startup-recovery.md) |
-| Nemotron-3-Super-120B NVFP4 | 1 | 262K | [Independent Spark setup](docs/nemotron-super.md) |
-| Qwen3.8-Flash-Next NVFP4 | 1 | 262K | [Text, images and tools](docs/qwen38-nvfp4.md) |
-| Qwen3.8-Flash-Next NVFP4, vLLM 0.30 | 1 | 262K | [Separate runtime trial](docs/qwen38-v030.md) |
-| Qwen3.8-Flash-Next 4-bit, TensorFold | 1 | 262K | [Four-stream int8 trial](docs/qwen38-tensorfold.md) |
+| DeepSeek-v4.1-Flash EXL3 | 2 | 600K | [Pinned EXL3 2.9bpw trial](docs/dsv41-exl3.md) |
+| Qwen3.8-Flash-Next NVFP4, dual Spark | 2 | 262K | [TP2+EP+MTP3 vLLM trial](docs/qwen38-dual.md) |
 | GLM-5.3-Flash NVFP4 | 2 | 128K | [Locally corrected NIM; qualified pilot](docs/glm53-nvfp4.md) |
 | GLM-5.3-Flash EXL3 | 2 | 850K | [Pinned EXL3 and DFlash2 trial](docs/glm53-exl3.md) |
+| GLM-5.3-Flash EXL3, TensorFold | 2 | 1M | [Four-stream FP8 KV recipe](docs/glm53-tensorfold.md) |
 | MiMo-V2.6-Flash-RL | 2 | 300K | [TP2, DFlash, official MXFP4 checkpoint](docs/mimo-v26-flash.md) |
 
 Context values are catalog limits. Each recipe records the extent of its local
@@ -77,31 +76,32 @@ qualification; they are not guarantees for every workload at that size.
 
 ## Behaviour
 
+`ds41-exl3` adds MiaAI-Lab's DeepSeek-V4.1-Flash EXL3 recipe on both Sparks:
+2.9bpw weights, a separate Engram mount, DSpark, and a 600K context. Prepare
+it with `./spark-serve pull ds41-exl3`, then start with
+`./spark-serve up ds41-exl3 --no-hermes`. Pull downloads about 385 GiB.
+See the [recipe](docs/dsv41-exl3.md).
+
 `up ds4` drain YuE jobs, stop the previous workload, verify
 both GPUs are free, start the worker (rank 1, `--headless`) and head (rank 0),
-then retarget Hermes after readiness. Single-node recipes such as
-`nemotron-super` and `qwen38` preserve their `nnodes=1` and TP=1 settings.
-They default to the head, preserving any independent worker workload. Select
-`--node worker` to use the second Spark. For example, keep Qwen on the head while
-running `./spark-serve up nemotron-super --node worker`, then choose the client
-with `./spark-serve use --node head` or `--node worker`. The app has separate
+then retarget Hermes after readiness. The app has separate
 **Use in Hermes (Mac)** and **Use in Hermes (Spark)** buttons. Add
 `--hermes-target spark` to update Hermes on the configured head via SSH, even
 when selecting a model on the worker. The default remains this Mac. See
 [independent Spark control](docs/independent-sparks.md) for setup and recovery.
 
-Qwen3.8-Flash-Next uses NVIDIA NVFP4 weights, native 262K context, images and
-tools on one Spark. Run `./spark-serve pull qwen38` to prepare its pinned
-runtime and checkpoint, then `./spark-serve up qwen38`. It checks its assets
-before stopping the current model. See the [Qwen recipe](docs/qwen38-nvfp4.md)
-for setup, provenance and qualification details.
+`qwen38-dual` adds MiaAI-Lab's two-Spark vLLM 0.30 lane with TP2, expert
+parallelism and MTP3. Prepare it with `./spark-serve pull qwen38-dual --node both`,
+then start with `./spark-serve up qwen38-dual --node both --no-hermes`.
+It reuses the pinned NVIDIA checkpoint on both nodes; live qualification is
+pending. See the [dual-Spark recipe](docs/qwen38-dual.md).
 
-`qwen38-tensorfold` adds a separate TensorFold trial: four streams, int8 KV,
-native 262K context, and Vontra's MLX-format 4-bit checkpoint running on CUDA.
-Prepare it with `./spark-serve pull qwen38-tensorfold --node worker`, then use
-the same app controls and Hermes destinations. It needs a separate weight
-download. See the [TensorFold recipe](docs/qwen38-tensorfold.md) for setup,
-monitoring limits, and the outstanding live qualification.
+`glm53-tensorfold` adds MiaAI-Lab's two-Spark TensorFold recipe with a pinned
+EXL3 checkpoint, DFlash2 and copy drafts, four streams, FP8 KV, and a native
+1M-token context. Prepare it with `./spark-serve pull glm53-tensorfold`, then
+start with `./spark-serve up glm53-tensorfold --no-hermes`. See the
+[recipe](docs/glm53-tensorfold.md) for setup, licenses, and pending local
+qualification.
 
 GLM-5.3-Flash uses a locally corrected image derived from pinned NVIDIA NIM and
 the unchanged published NGC NVFP4 checkpoint across both Sparks. The correction
@@ -355,11 +355,26 @@ The vendored GLM EXL3 and Qwen v0.30 runtime sources retain their upstream
 [GLM MIT notice](recipes/glm53-exl3/runtime/upstream/LICENSE.MIT).
 Each recipe records its upstream source pins and file hashes.
 
+The Qwen dual-Spark recipe credits
+[MiaAI-Lab's TP2 integration](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Dual-DGX-Sparks)
+and retains its [AGPLv3 license](recipes/qwen38-dual/runtime/upstream/LICENSE),
+TP-aware MTP patch generators and draft vocabulary with source hashes.
+
 The TensorFold recipe credits [MiaAI-Lab's single-Spark integration](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold),
 [Ash Hart's TensorFold engine](https://github.com/ashhart/TensorFold), and
 [Vontra's checkpoint conversion](https://huggingface.co/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP).
 Pinned sources and retained notices are documented in the
 [recipe](docs/qwen38-tensorfold.md).
+
+The GLM TensorFold integration credits [MiaAI-Lab's dual-Spark recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold)
+and [Ash Hart's TensorFold engine](https://github.com/ashhart/TensorFold).
+Pinned patches and notices are retained under [recipes/glm53-tensorfold](recipes/glm53-tensorfold/).
+
+The DeepSeek-V4.1 EXL3 recipe uses MiaAI-Lab's
+[published image](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-EXL3-2x-DGX-Sparks)
+(AGPL-3.0). The Responses content-type patch and Engram index slimmer are
+vendored with their [license](recipes/dsv41-exl3/runtime/upstream/LICENSE) and
+[MIT notice](recipes/dsv41-exl3/runtime/upstream/LICENSE.MIT).
 
 ## Offline verification
 

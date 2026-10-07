@@ -18,6 +18,25 @@ struct ModelEntry: Identifiable, Codable {
     let topology: String?
 }
 
+enum ModelFamily: String, CaseIterable, Identifiable {
+    case deepSeek = "DeepSeek"
+    case glm = "GLM"
+    case qwen = "Qwen"
+    case mimo = "MiMo"
+
+    var id: String { rawValue }
+
+    static func of(_ model: ModelEntry) -> ModelFamily? {
+        let id = model.id.lowercased()
+        let label = model.label.lowercased()
+        if id.hasPrefix("glm") || label.hasPrefix("glm") { return .glm }
+        if id.hasPrefix("qwen") || label.hasPrefix("qwen") { return .qwen }
+        if id.hasPrefix("mimo") || label.hasPrefix("mimo") { return .mimo }
+        if id.hasPrefix("ds") || id.contains("deepseek") || label.hasPrefix("deepseek") { return .deepSeek }
+        return nil
+    }
+}
+
 struct YueWorker: Codable, Identifiable {
     var id: String { host }
     let host: String
@@ -1215,12 +1234,27 @@ struct MainView: View {
     }
 
     private var modelPicker: some View {
-        LazyVGrid(
-            columns: [GridItem(.adaptive(minimum: 190), spacing: 12, alignment: .top)],
-            alignment: .leading,
-            spacing: 12
-        ) {
-            ForEach(runner.models) { model in
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .top, spacing: 12) {
+                ForEach(ModelFamily.allCases) { family in
+                    modelColumn(family.rawValue, runner.models.filter { ModelFamily.of($0) == family })
+                }
+            }
+            let other = runner.models.filter { ModelFamily.of($0) == nil }
+            if !other.isEmpty {
+                modelColumn("Other", other)
+            }
+        }
+        .padding(2)
+    }
+
+    private func modelColumn(_ title: String, _ models: [ModelEntry]) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .accessibilityAddTraits(.isHeader)
+            ForEach(models) { model in
                 Button {
                     selectedModel = model.id
                 } label: {
@@ -1232,12 +1266,14 @@ struct MainView: View {
                     )
                 }
                 .buttonStyle(.plain)
+                .frame(maxWidth: .infinity, alignment: .leading)
                 .accessibilityLabel(model.label)
                 .accessibilityValue("\(selectedModel == model.id ? "Selected" : "Not selected")\(runner.servingModelIDs.contains(model.id) ? ", serving" : "")")
                 .accessibilityHint("Select this model, then choose where to start it.")
             }
         }
-        .padding(2)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+        .accessibilityElement(children: .contain)
     }
 
     @ViewBuilder
@@ -1522,6 +1558,117 @@ struct ShutdownSheet: View {
 
 // MARK: - Model Card
 
+enum ModelCardFacts {
+    static func runtimeTitle(wrapper: String) -> String {
+        switch wrapper {
+        case "nim": return "NVIDIA NIM"
+        case "tensorfold": return "TensorFold"
+        case "vllm": return "vLLM"
+        case "dsv4", "dsv4-vision": return "DwarfStar"
+        case "yue": return "YuE"
+        default: return wrapper
+        }
+    }
+
+    static func contextTitle(ctx: Int, backend: String?) -> String {
+        if backend == "yue" { return "2 workers" }
+        if ctx >= 1_048_576 && ctx % 1_048_576 == 0 { return "\(ctx / 1_048_576)M ctx" }
+        if ctx == 262_144 { return "262k ctx" }
+        if ctx % 1024 == 0 { return "\(ctx / 1024)k ctx" }
+        return "\(Int((Double(ctx) / 1000).rounded()))k ctx"
+    }
+
+    static func sparkTitle(topology: String?) -> String? {
+        switch topology {
+        case "single": return "1 Spark"
+        case "distributed": return "2 Sparks"
+        default: return nil
+        }
+    }
+
+    static func runtimeColor(wrapper: String) -> Color {
+        switch wrapper {
+        case "nim": return Color(red: 0.56, green: 0.84, blue: 0.24)
+        case "tensorfold": return Color(red: 0.73, green: 0.52, blue: 0.98)
+        case "vllm": return Color(red: 0.38, green: 0.66, blue: 0.98)
+        case "dsv4", "dsv4-vision": return Color(red: 0.98, green: 0.58, blue: 0.28)
+        case "yue": return Color(red: 0.96, green: 0.45, blue: 0.62)
+        default: return Color(red: 0.62, green: 0.66, blue: 0.72)
+        }
+    }
+
+    static let contextColor = Color(red: 0.96, green: 0.78, blue: 0.32)
+    static let sparkColor = Color(red: 0.45, green: 0.82, blue: 0.84)
+}
+
+struct InfoPill: View {
+    let text: String
+    let color: Color
+
+    var body: some View {
+        Text(text)
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(color)
+            .lineLimit(1)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(color.opacity(0.16), in: Capsule())
+            .overlay(Capsule().strokeBorder(color.opacity(0.45), lineWidth: 1))
+    }
+}
+
+struct PillFlow: Layout {
+    var spacing: CGFloat = 6
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let maxWidth = proposal.width ?? .greatestFiniteMagnitude
+        let rows = rows(maxWidth: maxWidth, subviews: subviews)
+        let height = rows.map(\.height).reduce(0, +) + spacing * CGFloat(max(rows.count - 1, 0))
+        let width = rows.map(\.width).max() ?? 0
+        return CGSize(width: min(width, maxWidth), height: height)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        var y = bounds.minY
+        for row in rows(maxWidth: bounds.width, subviews: subviews) {
+            var x = bounds.minX
+            for item in row.items {
+                item.view.place(at: CGPoint(x: x, y: y), proposal: ProposedViewSize(item.size))
+                x += item.size.width + spacing
+            }
+            y += row.height + spacing
+        }
+    }
+
+    private struct Item {
+        let view: LayoutSubview
+        let size: CGSize
+    }
+    private struct Row {
+        var items: [Item] = []
+        var width: CGFloat = 0
+        var height: CGFloat = 0
+    }
+
+    private func rows(maxWidth: CGFloat, subviews: Subviews) -> [Row] {
+        var rows: [Row] = []
+        var row = Row()
+        for view in subviews {
+            let size = view.sizeThatFits(.unspecified)
+            let next = row.items.isEmpty ? size.width : row.width + spacing + size.width
+            if !row.items.isEmpty && next > maxWidth {
+                rows.append(row)
+                row = Row()
+            }
+            row.items.append(Item(view: view, size: size))
+            row.width = row.items.count == 1 ? size.width : row.width + spacing + size.width
+            row.height = max(row.height, size.height)
+        }
+        if !row.items.isEmpty { rows.append(row) }
+        return rows
+    }
+}
+
 struct ModelCard: View {
     let model: ModelEntry
     let isSelected: Bool
@@ -1529,7 +1676,7 @@ struct ModelCard: View {
     let showNotes: Bool
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Text(model.label)
                     .font(.headline)
@@ -1545,18 +1692,14 @@ struct ModelCard: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(2)
-            HStack(spacing: 8) {
-                Label(ctxLabel, systemImage: "text.line.inherit")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                Label(model.wrapper, systemImage: "cube")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-            if model.backend != "yue", let topology = model.topology {
-                Label(topology == "single" ? "1 Spark" : "2 Sparks", systemImage: "desktopcomputer")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+            PillFlow(spacing: 6) {
+                InfoPill(text: ModelCardFacts.runtimeTitle(wrapper: model.wrapper),
+                         color: ModelCardFacts.runtimeColor(wrapper: model.wrapper))
+                InfoPill(text: ModelCardFacts.contextTitle(ctx: model.ctx, backend: model.backend),
+                         color: ModelCardFacts.contextColor)
+                if model.backend != "yue", let sparks = ModelCardFacts.sparkTitle(topology: model.topology) {
+                    InfoPill(text: sparks, color: ModelCardFacts.sparkColor)
+                }
             }
             if showNotes && !model.notes.isEmpty {
                 Text(model.notes)
@@ -1576,12 +1719,5 @@ struct ModelCard: View {
             RoundedRectangle(cornerRadius: 8)
                 .stroke(isSelected ? Color.accentColor : Color.gray.opacity(0.2), lineWidth: isSelected ? 1.5 : 1)
         )
-    }
-
-    private var ctxLabel: String {
-        if model.backend == "yue" { return "2 independent workers" }
-        if model.ctx >= 1_048_576 { return "1M ctx" }
-        if model.ctx >= 262_144 { return "262k ctx" }
-        return "\(model.ctx / 1024)k ctx"
     }
 }

@@ -161,7 +161,8 @@ def docker_base(cfg: dict, model: dict, name: str, rank: int = 0) -> list[str]:
         }.items():
             cmd.extend(["--label", f"{key}={value}"])
     if not model.get("skip_default_cache_mount"):
-        cache = cluster["hf_cache_host"]
+        cache = ((cluster.get("worker_hf_cache_host") or cluster["hf_cache_host"])
+                 if rank == 1 else cluster["hf_cache_host"])
         mount = model.get("hf_mount") or "/cache/huggingface"
         cmd.extend(["-v", f"{cache}:{mount}"])
     for mnt in model.get("mounts") or []:
@@ -233,13 +234,11 @@ def inner_argv(cfg: dict, model: dict, rank: int, headless: bool) -> list[str]:
 
 def docker_run_script(cfg: dict, model: dict, rank: int, headless: bool) -> str:
     if model.get("wrapper") == "tensorfold":
-        if rank != 0 or headless:
-            raise ControllerError("TensorFold supports a single rank on the selected Spark")
         assignment = cfg.get("_spark_serve_placement") or {}
         mid = assignment.get("model") or next(
             key for key, value in cfg["models"].items() if value is model or value == model
         )
-        plan = validate_tensorfold_plan(cfg, mid)
+        plan = validate_tensorfold_plan(cfg, mid, rank=rank)
         return docker_create_start_script(tensorfold_docker_argv(plan, assignment.get("generation", "")), rank)
     if model.get("wrapper") == "nim":
         assignment = cfg.get("_spark_serve_placement") or {}
@@ -1315,7 +1314,10 @@ def cmd_pull(cfg: dict, name: str, node: str | None = None) -> None:
         scripts = {"qwen38-nvfp4": "prepare_qwen38.py", "nemotron-super-nvfp4": "prepare_nemotron.py",
                    "glm53-nvfp4": "prepare_glm53.py", "mimo-v26-flash": "prepare_mimo26.py",
                    "glm53-exl3": "prepare_glm53_exl3.py", "qwen38-v030": "prepare_qwen38_v030.py",
-                   "qwen38-tensorfold": "prepare_qwen38_tensorfold.py"}
+                   "qwen38-tensorfold": "prepare_qwen38_tensorfold.py",
+                   "glm53-tensorfold": "prepare_glm53_tensorfold.py",
+                   "qwen38-dual": "prepare_qwen38_dual.py",
+                   "dsv41-exl3": "prepare_dsv41_exl3.py"}
         if recipe not in scripts:
             die(f"unknown preparation recipe {recipe!r} for {mid}")
         command = [
@@ -1664,11 +1666,6 @@ def model_preflight(cfg: dict, mid: str, model: dict, sink: _Sink) -> None:
     if (not isinstance(arguments, list) or not arguments
             or any(not isinstance(arg, str) or not arg for arg in arguments)):
         raise ControllerError(f"{mid}: preflight_args must be a nonempty list of strings")
-    if model.get("wrapper") == "tensorfold":
-        # The prepared image's own parser checks precisely the launch arguments
-        # without a GPU or network, before the controller may stop anything.
-        plan = validate_tensorfold_plan(cfg, mid)
-        arguments = [*arguments, "--serve-args-json", json.dumps(plan.argv, separators=(",", ":"))]
     preflight_timeout = model.get("preflight_timeout", 120)
     if (isinstance(preflight_timeout, bool) or not isinstance(preflight_timeout, int)
             or not 1 <= preflight_timeout <= 3600):
@@ -1681,6 +1678,12 @@ def model_preflight(cfg: dict, mid: str, model: dict, sink: _Sink) -> None:
     if nnodes > 1:
         hosts.append((1, c["worker"]))
     for rank, host in hosts:
+        rank_arguments = arguments
+        if model.get("wrapper") == "tensorfold":
+            # Parse the exact arguments for this rank without a GPU or network,
+            # before the controller may stop either allocation member.
+            plan = validate_tensorfold_plan(cfg, mid, rank=rank)
+            rank_arguments = [*arguments, "--serve-args-json", json.dumps(plan.argv, separators=(",", ":"))]
         # Do not inherit docker_base(): it grants GPUs, RDMA devices, host
         # networking, writable caches, and model-specific privileged options.
         command = [
@@ -1705,7 +1708,7 @@ def model_preflight(cfg: dict, mid: str, model: dict, sink: _Sink) -> None:
             "set -euo pipefail\n"
             f"image_id=$({inspect})\n"
             f"timeout --signal=TERM --kill-after=10s {preflight_timeout}s "
-            + shlex.join(command) + ' "$image_id" ' + shlex.join(arguments) + "\n"
+            + shlex.join(command) + ' "$image_id" ' + shlex.join(rank_arguments) + "\n"
         )
         sink.event("preflight", model=mid, host=host, detail="checking local image and prepared weights")
         proc = ssh_cmd(cfg, host, remote, check=False, timeout=preflight_timeout + 25)
@@ -1768,16 +1771,24 @@ def cmd_up(
                     raise ControllerError("NIM requires prepared-assets preflight before stopping a workload")
             if wrapper == "tensorfold":
                 validate_tensorfold_plan(scoped, mid)
-                # Resolve only on the selected Spark. Both preflight and create
-                # use this immutable image even if its local tag moves later.
-                proc = ssh_cmd(scoped, scoped["cluster"]["head"], shlex.join([
-                    "docker", "image", "inspect", "--format", "{{.Id}}", model["image"],
-                ]), check=False, timeout=30)
-                image_id = (proc.stdout or "").strip()
-                if proc.returncode or not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
+                # Pin the same immutable image on every required Spark. Both
+                # preflight and create keep that identity if a local tag moves.
+                image_ids = []
+                for host in hosts:
+                    proc = ssh_cmd(scoped, host, shlex.join([
+                        "docker", "image", "inspect", "--format", "{{.Id}}", model["image"],
+                    ]), check=False, timeout=30)
+                    image_id = (proc.stdout or "").strip()
+                    if proc.returncode or not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
+                        raise ControllerError(
+                            f"{mid}: prepared image unavailable on {host}; current workload was not changed. "
+                            f"Run spark-serve pull {mid} --node {selected} to prepare it."
+                        )
+                    image_ids.append(image_id)
+                if len(set(image_ids)) != 1:
                     raise ControllerError(
-                        f"{mid}: prepared image unavailable; current workload was not changed. "
-                        f"Run spark-serve pull {mid} --node {selected} to prepare it."
+                        f"{mid}: prepared image differs between Sparks; current workload was not changed. "
+                        f"Run spark-serve pull {mid} --node {selected} to prepare matching images."
                     )
                 model["image"] = image_id
             model_preflight(scoped, mid, model, sink)

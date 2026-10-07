@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "upstream_url": "https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Dual-DGX-Sparks",
+  "upstream_revision": "cd839d0b62f6c737178a0c2037733420e0524ebf",
+  "upstream_lane": "start-v030.sh",
+  "base_image": "docker.io/vllm/vllm-openai@sha256:4864d46625cbc3307623e29ac742030655e27249feba7b97ec925ce4cc4dfb56",
+  "local_image": "spark-serve-qwen38-dual:0.1.0",
+  "manifest_sha256": "a3ec3c29bb6f68217a1f109c5ee02b89cf4fdfa1158f4e1626acb2343334d8ad",
+  "checkpoint_revision": "fc694b54fb0174e0913e6adf86691ef85a4ead47",
+  "runtime_sha256": {
+    "runtime/Dockerfile": "b9828c7255f6f59e490bff5f6c7d68313ab97f4afd9269ec54ac32345fa2a90f",
+    "runtime/apply_patches.py": "a8b994a1d92fbcadc94530f86edf5437194b5ff0bf11c4dc2794b1ac2a0a8e30",
+    "runtime/check_compatibility.py": "cb48a5d2046a9007435e6241618e223115212690246b622dd0e82248cc8309c7",
+    "runtime/entrypoint.sh": "a3f79b155f8ef18acd50692da71172ea82325785ce62e6083496bbdb7b10b3ae",
+    "runtime/upstream/LICENSE": "0d96a4ff68ad6d4b6f1f30f713b18d5184912ba8dd389f86aa7710db079abcb0",
+    "runtime/upstream/draft_vocab_en_code_47k.txt": "20e36b6e8eae2598019298959a578ef8adc2948bbed7189e43a8da9b9d84a0b1",
+    "runtime/upstream/patch_mtp_draft_vocab.py": "d5a85baaab238917d70448feb57761e61826f4e515bbc098167515d601bb6ea5",
+    "runtime/upstream/patch_mtp_draft_vocab_v030.py": "a04d69b2f33715e622d4af9244ad92a9f7dc11a59c891280e53a70f3759a7095",
+    "runtime/upstream-files.json": "e0f71af8cab5cbe4f25e2bebea0ee1fac12be74ed42f8ec217deca11508293d9",
+    "runtime/verify_runtime.py": "316da1d5229222745208203ec42dea096ed6714f5aecca017826d03bb799529b"
+  },
+  "preparation_sha256": {
+    "verify.py": "e596cf15065b8b43cc82804480a4c0927df5cc6b6250b660084e2b072fb7ff25",
+    "prepare_transfer.py": "216b22b53bc96bf0650ee0d7e7a257db0c21f1cc9b6418997c153d4f3291e615"
+  },
+  "policy": {
+    "checkpoint": "Reuse authenticated NVIDIA snapshots on both nodes, preserving ordinary HF blob links.",
+    "runtime": "Documented vLLM 0.30 dual-Spark lane; TP-aware 47,149-id MTP vocabulary; BF16 KV baseline.",
+    "context": "Native 262,144 tokens; YaRN, NFS, gated and FP8-dense variants are excluded.",
+    "qualification": "Local Docker build, GPU startup, quality and performance qualification pending."
+  }
+}

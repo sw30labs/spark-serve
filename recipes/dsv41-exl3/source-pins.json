@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "upstream_url": "https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-EXL3-2x-DGX-Sparks",
+  "upstream_revision": "6f7d1590ad49a2b8995188e45d7b9db31e677452",
+  "base_image": "ghcr.io/miaai-lab/deepseek-v4.1-flash-exl3-2x-dgx-sparks@sha256:2f0cf3adc0f989c1d446be274df864eb799630175f604c3b22b71b7205971dce",
+  "base_digest": "sha256:2f0cf3adc0f989c1d446be274df864eb799630175f604c3b22b71b7205971dce",
+  "recipe_stamp": "8c01a8543ff7e7b222ae1cd46b8be5051838dc7a7b075b4e647f3785c0429584",
+  "local_image": "spark-serve-dsv41-exl3:0.1.0",
+  "manifest_sha256": "fa38940c6e221778a6f4140b84a6f526fde9cdac4898f3b02835793a31914a9a",
+  "checkpoint_revisions": {
+    "target": "64ba41b6c916a587db06eae2e19b7845f7be6e6b",
+    "engram": "2cba9e42aa026125f3ed06c6d98c1db82f7ca027"
+  },
+  "runtime_sha256": {
+    "runtime/Dockerfile": "662a9f9cf7f0795002f472969cf26406bb4c7a463c4feb12563c2c9ee39123cd",
+    "runtime/entrypoint.sh": "09eee65d9bab0a88011243d30ff2b8a577710bea2bffe7c7c6c21fc281bfc7ac",
+    "runtime/upstream/LICENSE": "8d56b405468aad11f87ab5763f901e276e08d9646ff5c8481b1762b6b789e9ed",
+    "runtime/upstream/LICENSE.MIT": "d48b01844af2aa68bc3fbea765069b94d70adb0c67dc4a62ca605c067aec9ab3",
+    "runtime/upstream/patch_responses_content_types.py": "a0dc681780990fb6cb4fda2fa79207542bf9d0d7675a7b6997a8788513c02b03"
+  },
+  "preparation_sha256": {
+    "verify.py": "c1b39b93a1f3867090f686d9060a9a34641991afaa9be8e98dc4f04ffa2ef7a9",
+    "download.py": "3af9adca43c25b8b62d4a47a7a04c9d99c2cae7f5362326623c054e0bc8b67f7",
+    "prepare_engram_src.py": "1d779057fec2ab5cfec943e4be24a7e6ec2310d405cedaf5159ebe534eac1ad0"
+  }
+}

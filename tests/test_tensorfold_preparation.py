@@ -47,9 +47,53 @@ def assets(tmp_path):
     return root, manifest
 
 
+# The single-Spark Qwen TensorFold trial is no longer in the shipped catalog.
+# Preparation tests still check this entry against the pinned recipe.
+_TENSORFOLD_ENTRY = """
+[models.qwen38-tensorfold]
+aliases = ["qwen-tensorfold", "qwen38-tf"]
+label = "Qwen3.8-Flash-Next 4-bit TensorFold"
+image = "spark-serve-qwen38-tensorfold:0.1.0"
+recipe = "qwen38-tensorfold"
+hf_id = "Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP"
+serve_path = "/cache/huggingface/hub/models--Vontra--Qwen3.8-Flash-Next-MLX-4bit-MTP/snapshots/dadefa8066e3be900a0d148d0f5a2f4eb1cf6534"
+served_name = "qwen3.8-flash-next-tensorfold"
+wrapper = "tensorfold"
+container = "tensorfold_qwen38"
+nnodes = 1
+tensor_parallel = 1
+drop_caches = false
+hf_mount = "/cache/huggingface"
+ready_path = "/health"
+ready_timeout = 1800
+preflight_timeout = 900
+max_model_len = 262144
+max_num_seqs = 4
+hermes_provider = "spark"
+hermes_context_length = 262144
+hermes_supports_vision = true
+preflight_args = ["/opt/spark-serve/qwen38-tensorfold/verify.py", "/cache/huggingface/hub/models--Vontra--Qwen3.8-Flash-Next-MLX-4bit-MTP/snapshots/dadefa8066e3be900a0d148d0f5a2f4eb1cf6534", "--expected-manifest-sha256", "583d1e6bd1992016e37d9c86c18bbd16a2f08ecca5da221f335e36a7e662f34a", "--verify-runtime"]
+notes = "Experimental TensorFold CUDA: 4 streams, int8 KV, native 262K per stream, MTP, vision. Separate Vontra 4-bit weights."
+
+[models.qwen38-tensorfold.tensorfold]
+model_revision = "dadefa8066e3be900a0d148d0f5a2f4eb1cf6534"
+parallel = 4
+kv_dtype = "int8"
+vision = true
+ple_on_ssd = true
+mtp_drafts = 6
+mtp_confidence = 0.60
+thinking = true
+temperature = 1.0
+top_p = 0.95
+top_k = 20
+"""
+
+
 def catalog():
     pins, source = prepare.load_pins()
     cfg = tomllib.loads((prepare.ROOT / "models.example.toml").read_text())
+    cfg["models"].update(tomllib.loads(_TENSORFOLD_ENTRY)["models"])
     cfg["cluster"].update(head="sparkone", worker="sparktwo", hf_cache_host="/head/cache",
                           worker_hf_cache_host="/worker/cache")
     return cfg, pins, source
