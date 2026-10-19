@@ -16,6 +16,30 @@ struct ModelEntry: Identifiable, Codable {
     let hermes_provider: String
     let backend: String?
     let topology: String?
+    var performance: ModelPerformance? = nil
+    var quant: String? = nil
+    var quant_bits: Double? = nil
+    var quant_scope: String? = nil
+    var quant_detail: String? = nil
+    var modalities: [String]? = nil
+    var ranking: ModelRanking? = nil
+}
+
+/// Catalog-relative score from spark_serve_ranking.py; `best` marks the starred card.
+struct ModelRanking: Codable {
+    let score: Double
+    let parts: [String: Double]
+    let weights: [String: Double]
+    let best: Bool
+}
+
+/// Fixed-protocol decode measurement from tools/catalog_tps_bench.py.
+struct ModelPerformance: Codable {
+    let measured_at: String
+    let single_stream_tokens_per_second: Double?
+    let single_stream_ttft_seconds: Double?
+    let concurrent_streams: Int
+    let concurrent_aggregate_tokens_per_second: Double?
 }
 
 enum ModelFamily: String, CaseIterable, Identifiable {
@@ -1245,7 +1269,8 @@ struct MainView: View {
                 modelColumn("Other", other)
             }
         }
-        .padding(2)
+        .padding(.horizontal, BestBadge.size / 2)
+        .padding(.vertical, 2)
     }
 
     private func modelColumn(_ title: String, _ models: [ModelEntry]) -> some View {
@@ -1597,7 +1622,89 @@ enum ModelCardFacts {
         }
     }
 
-    static let contextColor = Color(red: 0.96, green: 0.78, blue: 0.32)
+    static func speedTitle(_ tps: Double?) -> String? {
+        guard let tps, tps > 0 else { return nil }
+        return tps >= 100 ? "\(Int(tps.rounded())) tok/s" : String(format: "%.1f tok/s", tps)
+    }
+
+    static func speedDetail(_ p: ModelPerformance) -> String {
+        var parts = ["Measured \(p.measured_at), 512-token prompt, 256 output tokens, thinking off"]
+        if let ttft = p.single_stream_ttft_seconds { parts.append(String(format: "first token %.2fs", ttft)) }
+        if let agg = speedTitle(p.concurrent_aggregate_tokens_per_second) {
+            parts.append("\(p.concurrent_streams) streams: \(agg) total")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    enum QuantTier: Equatable { case aggressive, wholeModel, expertsOnly, unknown }
+
+    /// Below 4 bits is aggressive anywhere; 4-bit everywhere costs more quality
+    /// than 4-bit experts with higher-precision attention and dense layers.
+    static func quantTier(bits: Double?, scope: String?) -> QuantTier {
+        guard let bits else { return .unknown }
+        if bits < 4 { return .aggressive }
+        switch scope {
+        case "all": return .wholeModel
+        case "experts": return .expertsOnly
+        default: return .unknown
+        }
+    }
+
+    // First-row pills share one scale per attribute: green strongest, amber middle, red weakest.
+    static let strongColor = Color(red: 0.36, green: 0.86, blue: 0.56)
+    static let middleColor = Color(red: 0.98, green: 0.74, blue: 0.30)
+    static let weakColor = Color(red: 0.98, green: 0.42, blue: 0.40)
+    static let neutralColor = Color(red: 0.62, green: 0.66, blue: 0.72)
+
+    static func quantColor(_ tier: QuantTier) -> Color {
+        switch tier {
+        case .aggressive: return weakColor
+        case .wholeModel: return middleColor
+        case .expertsOnly: return strongColor
+        case .unknown: return neutralColor
+        }
+    }
+
+    static func contextColor(ctx: Int) -> Color {
+        if ctx >= 1_000_000 { return strongColor }
+        if ctx >= 256_000 { return middleColor }
+        return weakColor
+    }
+
+    static func modalityTitle(_ modalities: [String]) -> String {
+        let media = ["image", "video", "audio"].filter(modalities.contains)
+        if media.isEmpty { return "Text only" }
+        let names = ["image": "Images", "video": "video", "audio": "audio"]
+        return media.map { names[$0]! }.joined(separator: " + ")
+    }
+
+    static func modalityColor(_ modalities: [String]) -> Color {
+        if modalities.contains("video") || modalities.contains("audio") { return strongColor }
+        if modalities.contains("image") { return middleColor }
+        return weakColor
+    }
+
+    static func rankingHelp(_ ranking: ModelRanking) -> String {
+        let keys = ranking.weights.keys.sorted { (ranking.weights[$0]!, $1) > (ranking.weights[$1]!, $0) }
+        let parts = keys.map { key in
+            "\(key) \(Int(((ranking.parts[key] ?? 0) * 100).rounded()))% × weight \(Int((ranking.weights[key]! * 100).rounded()))%"
+        }
+        return "Best overall in this catalog, score \(String(format: "%.2f", ranking.score)): \(parts.joined(separator: ", ")). "
+            + "Recomputed whenever models are added, removed or re-measured."
+    }
+
+    static func quantHelp(_ tier: QuantTier, detail: String?) -> String {
+        let note: String
+        switch tier {
+        case .aggressive: note = "Below 4 bits per weight: expect the largest quality loss."
+        case .wholeModel: note = "4-bit across the whole model, not just the experts."
+        case .expertsOnly: note = "4-bit experts; attention and dense layers kept at higher precision."
+        case .unknown: note = "Quantization scope not recorded."
+        }
+        return [detail, note].compactMap { $0 }.joined(separator: " ")
+    }
+
+    static let speedColor = Color(red: 0.40, green: 0.78, blue: 0.98)
     static let sparkColor = Color(red: 0.45, green: 0.82, blue: 0.84)
 }
 
@@ -1614,6 +1721,72 @@ struct InfoPill: View {
             .padding(.vertical, 3)
             .background(color.opacity(0.16), in: Capsule())
             .overlay(Capsule().strokeBorder(color.opacity(0.45), lineWidth: 1))
+    }
+}
+
+/// Animated "best overall" star: a rotating gold halo and a slow pulse; still under Reduce Motion.
+struct BestBadge: View {
+    static let size: CGFloat = 34
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var spin = false
+    @State private var pulse = false
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .fill(AngularGradient(colors: [.yellow, .orange, Color(red: 1, green: 0.95, blue: 0.7), .yellow],
+                                      center: .center))
+                .rotationEffect(.degrees(spin ? 360 : 0))
+                .blur(radius: 3)
+                .opacity(pulse ? 0.95 : 0.6)
+            Circle()
+                .fill(Color(nsColor: .windowBackgroundColor))
+                .padding(4)
+            Image(systemName: "star.fill")
+                .font(.system(size: Self.size * 0.5, weight: .bold))
+                .foregroundStyle(LinearGradient(colors: [.yellow, .orange], startPoint: .top, endPoint: .bottom))
+                .shadow(color: .orange.opacity(0.7), radius: pulse ? 4 : 1)
+                .scaleEffect(pulse ? 1.08 : 0.94)
+        }
+        .frame(width: Self.size, height: Self.size)
+        .onAppear {
+            guard !reduceMotion else { return }
+            withAnimation(.linear(duration: 4).repeatForever(autoreverses: false)) { spin = true }
+            withAnimation(.easeInOut(duration: 1.4).repeatForever(autoreverses: true)) { pulse = true }
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Best overall model")
+    }
+}
+
+/// Input types as icons so the selection row fits narrow cards; words are in the tooltip.
+struct ModalityPill: View {
+    let modalities: [String]
+
+    private static let icons = [("image", "photo"), ("video", "film"), ("audio", "waveform")]
+
+    var body: some View {
+        let color = ModelCardFacts.modalityColor(modalities)
+        let media = Self.icons.filter { modalities.contains($0.0) }
+        Group {
+            if media.isEmpty {
+                Text("Text only")
+            } else {
+                HStack(spacing: 4) {
+                    ForEach(media, id: \.0) { Image(systemName: $0.1) }
+                }
+            }
+        }
+        .font(.caption2.weight(.semibold))
+        .foregroundStyle(color)
+        .lineLimit(1)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 3)
+        .background(color.opacity(0.16), in: Capsule())
+        .overlay(Capsule().strokeBorder(color.opacity(0.45), lineWidth: 1))
+        .help("Input: \(ModelCardFacts.modalityTitle(modalities))")
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Input: \(ModelCardFacts.modalityTitle(modalities))")
     }
 }
 
@@ -1692,14 +1865,37 @@ struct ModelCard: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(2)
+            // Selection row: context, quantization, input types.
+            PillFlow(spacing: 6) {
+                InfoPill(text: ModelCardFacts.contextTitle(ctx: model.ctx, backend: model.backend),
+                         color: model.backend == "yue" ? ModelCardFacts.neutralColor : ModelCardFacts.contextColor(ctx: model.ctx))
+                if let quant = model.quant {
+                    let tier = ModelCardFacts.quantTier(bits: model.quant_bits, scope: model.quant_scope)
+                    InfoPill(text: quant, color: ModelCardFacts.quantColor(tier))
+                        .help(ModelCardFacts.quantHelp(tier, detail: model.quant_detail))
+                }
+                if model.backend != "yue", let modalities = model.modalities {
+                    ModalityPill(modalities: modalities)
+                }
+            }
             PillFlow(spacing: 6) {
                 InfoPill(text: ModelCardFacts.runtimeTitle(wrapper: model.wrapper),
                          color: ModelCardFacts.runtimeColor(wrapper: model.wrapper))
-                InfoPill(text: ModelCardFacts.contextTitle(ctx: model.ctx, backend: model.backend),
-                         color: ModelCardFacts.contextColor)
                 if model.backend != "yue", let sparks = ModelCardFacts.sparkTitle(topology: model.topology) {
                     InfoPill(text: sparks, color: ModelCardFacts.sparkColor)
                 }
+                if let performance = model.performance,
+                   let speed = ModelCardFacts.speedTitle(performance.single_stream_tokens_per_second) {
+                    InfoPill(text: speed, color: ModelCardFacts.speedColor)
+                        .help(ModelCardFacts.speedDetail(performance))
+                }
+            }
+            if let performance = model.performance,
+               let total = ModelCardFacts.speedTitle(performance.concurrent_aggregate_tokens_per_second) {
+                Text("\(performance.concurrent_streams) streams: \(total) · measured \(performance.measured_at)")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
             }
             if showNotes && !model.notes.isEmpty {
                 Text(model.notes)
@@ -1719,5 +1915,13 @@ struct ModelCard: View {
             RoundedRectangle(cornerRadius: 8)
                 .stroke(isSelected ? Color.accentColor : Color.gray.opacity(0.2), lineWidth: isSelected ? 1.5 : 1)
         )
+        .overlay(alignment: .topTrailing) {
+            if let ranking = model.ranking, ranking.best {
+                // Centred on the card's top-right corner, straddling the border.
+                BestBadge()
+                    .offset(x: BestBadge.size / 2, y: -BestBadge.size / 2)
+                    .help(ModelCardFacts.rankingHelp(ranking))
+            }
+        }
     }
 }

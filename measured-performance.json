@@ -1,0 +1,137 @@
+{
+  "schema": 1,
+  "protocol": {
+    "prompt_tokens": 512,
+    "max_tokens": 256,
+    "thinking": false,
+    "warmup": {
+      "concurrency": 1,
+      "requests": 2
+    },
+    "single": {
+      "concurrency": 1,
+      "requests": 5
+    },
+    "concurrent": {
+      "concurrency": 2,
+      "requests": 6
+    },
+    "placement": "both Sparks, fresh start per model",
+    "settle_seconds": 30,
+    "headline": "p50 completion tokens/s per request, end to end (server usage tokens)"
+  },
+  "models": {
+    "ds4": {
+      "measured_at": "2026-10-19",
+      "engine": "vllm",
+      "single_stream_tokens_per_second": 39.672,
+      "single_stream_post_first_output_tokens_per_second": 43.138,
+      "single_stream_ttft_seconds": 0.5293,
+      "concurrent_streams": 2,
+      "concurrent_aggregate_tokens_per_second": 63.093,
+      "reasoning_observed": false,
+      "run_ids": [
+        "0191cd04ccf64c46b85c5fa316a65ac1",
+        "550a4bfdf1964d52b6f025352aa0b393"
+      ]
+    },
+    "ds41-exl3": {
+      "measured_at": "2026-10-19",
+      "engine": "vllm",
+      "single_stream_tokens_per_second": 30.027,
+      "single_stream_post_first_output_tokens_per_second": 32.852,
+      "single_stream_ttft_seconds": 0.7502,
+      "concurrent_streams": 2,
+      "concurrent_aggregate_tokens_per_second": 42.671,
+      "reasoning_observed": false,
+      "run_ids": [
+        "cfcb69df16084fe29301fa92a474849f",
+        "dfe316d6624b41c9a5a588f93a98e8db"
+      ]
+    },
+    "glm53": {
+      "measured_at": "2026-10-19",
+      "engine": "nim",
+      "single_stream_tokens_per_second": 15.408,
+      "single_stream_post_first_output_tokens_per_second": 16.102,
+      "single_stream_ttft_seconds": 0.7156,
+      "concurrent_streams": 2,
+      "concurrent_aggregate_tokens_per_second": 26.216,
+      "reasoning_observed": false,
+      "run_ids": [
+        "29dbf39b653c4e3e93045faa47ed3357",
+        "50daf44b2cf6432eb8579bff96a6e323"
+      ]
+    },
+    "glm53-exl3": {
+      "measured_at": "2026-10-19",
+      "engine": "vllm",
+      "single_stream_tokens_per_second": 24.502,
+      "single_stream_post_first_output_tokens_per_second": 26.231,
+      "single_stream_ttft_seconds": 0.6873,
+      "concurrent_streams": 2,
+      "concurrent_aggregate_tokens_per_second": 31.559,
+      "reasoning_observed": false,
+      "run_ids": [
+        "a8c34fbde3d04c779f6412f7690f33d8",
+        "21c69c49324b46b3a35c47f458cd6a01"
+      ]
+    },
+    "glm53-tensorfold": {
+      "measured_at": "2026-10-19",
+      "engine": "tensorfold",
+      "single_stream_tokens_per_second": 48.222,
+      "single_stream_post_first_output_tokens_per_second": 53.822,
+      "single_stream_ttft_seconds": 0.5546,
+      "concurrent_streams": 2,
+      "concurrent_aggregate_tokens_per_second": 65.388,
+      "reasoning_observed": false,
+      "run_ids": [
+        "3463ed37a2e940bba4ad3386c5a4681b",
+        "56f047d48d0e403aa7cda8311c9c7882"
+      ]
+    },
+    "mimo26": {
+      "measured_at": "2026-10-19",
+      "engine": "vllm",
+      "single_stream_tokens_per_second": 27.968,
+      "single_stream_post_first_output_tokens_per_second": 29.325,
+      "single_stream_ttft_seconds": 0.4235,
+      "concurrent_streams": 2,
+      "concurrent_aggregate_tokens_per_second": 41.688,
+      "reasoning_observed": false,
+      "run_ids": [
+        "b2dbdba1d1cb47f981147f8f36788fbf",
+        "a626e45a337e403d813813bc9a3f5e44"
+      ]
+    },
+    "qwen38-dual": {
+      "measured_at": "2026-10-19",
+      "engine": "vllm",
+      "single_stream_tokens_per_second": 45.3,
+      "single_stream_post_first_output_tokens_per_second": 47.743,
+      "single_stream_ttft_seconds": 0.2892,
+      "concurrent_streams": 2,
+      "concurrent_aggregate_tokens_per_second": 78.092,
+      "reasoning_observed": false,
+      "run_ids": [
+        "70aeda45d5944fd9b03fe6918a208d31",
+        "08fba8e018034046a733d0f6fe077787"
+      ]
+    },
+    "qwen38-dual-tensorfold": {
+      "measured_at": "2026-10-19",
+      "engine": "tensorfold",
+      "single_stream_tokens_per_second": 59.767,
+      "single_stream_post_first_output_tokens_per_second": 63.768,
+      "single_stream_ttft_seconds": 0.2688,
+      "concurrent_streams": 2,
+      "concurrent_aggregate_tokens_per_second": 86.392,
+      "reasoning_observed": false,
+      "run_ids": [
+        "6de5545634824d81acb0f86d946dccda",
+        "e2830568f25b47f7b5f1b9c77fbbaed0"
+      ]
+    }
+  }
+}

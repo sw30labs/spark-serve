@@ -303,6 +303,42 @@ The CLI path is resolved from the app bundle (`repo/gui/SparkServeApp.app` →
 repo) or `SPARK_SERVE_HOME`. The app's `PATH` includes `~/miniconda3/bin` so the
 `python3` shebang works under a GUI environment.
 
+### Model cards: measured speed, quantization and the best-model star
+
+<p align="center">
+  <a href="docs/screenshots/native-models-measured.jpg">
+    <img src="docs/screenshots/native-models-measured.jpg" alt="Spark Serve model catalog: each card shows context, quantization and input-type pills, then runtime, Spark count and measured tokens per second; the best overall model has an animated star on its corner" width="900">
+  </a><br>
+  <em>Model catalog with real measurements from this two-Spark cluster, October 19, 2026.</em>
+</p>
+
+Each card's first row is for choosing a model: **context → quantization → input
+types**, coloured green (strongest), amber (middle) or red (weakest) for that
+attribute. Quantization is read from each checkpoint's config and tensor
+headers: red is below 4 bits per weight, amber is 4-bit across the whole
+model, green is 4-bit experts with higher-precision attention and dense layers.
+Input icons are image, video and audio. The second row shows the runtime,
+Spark count and measured single-stream decode speed; hover a pill for detail.
+
+<p align="center">
+  <a href="docs/screenshots/native-best-model-card.jpg">
+    <img src="docs/screenshots/native-best-model-card.jpg" alt="Close-up of the starred best overall model card with its animated gold star badge on the top-right corner" width="420">
+  </a><br>
+  <em>The animated star marks the best overall model in the current catalog.</em>
+</p>
+
+Speeds come from `tools/catalog_tps_bench.py`, which gives every model the
+same protocol: a fresh start on both Sparks, a discarded warmup, then five
+sequential and six two-way-concurrent requests with 512-token prompts,
+256 output tokens, thinking off and temperature 0. The card shows the median
+per-request rate; results are in `measured-performance.json`. Measure a new
+model with `python3 tools/catalog_tps_bench.py run <id>`.
+
+The star comes from `spark_serve_ranking.py`, which scores measured models
+relative to the rest of the catalog: speed 40%, quantization 30%, context 20%,
+input types 10%. It moves as models are added, removed or re-measured. It does
+not account for differences in the base models' capability.
+
 ### Screenshots
 
 The Overview above and Benchmarks below were captured from the native app on

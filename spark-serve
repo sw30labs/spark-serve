@@ -47,6 +47,7 @@ def _ensure_python_311() -> None:
 _ensure_python_311()
 import tomllib
 
+from spark_serve_ranking import modalities, score_models
 from spark_serve_controller import (
     Controller,
     ControllerError,
@@ -915,8 +916,17 @@ def cmd_list(cfg: dict) -> None:
             print(f"           {m['notes']}")
 
 
+def measured_performance() -> dict:
+    """Card throughput from tools/catalog_tps_bench.py; absent or unreadable means none."""
+    try:
+        return json.loads((HERE / "measured-performance.json").read_text()).get("models", {})
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
 def cmd_list_json(cfg: dict) -> None:
     out = []
+    performance = measured_performance()
     for mid, m in cfg["models"].items():
         out.append({
             "id": mid,
@@ -930,7 +940,16 @@ def cmd_list_json(cfg: dict) -> None:
             "topology": "single" if int(m.get("nnodes") or cfg["cluster"]["nnodes"]) == 1 else "distributed",
             "wrapper": m.get("wrapper", "vllm"),
             "hermes_provider": m.get("hermes_provider", "spark"),
+            "performance": performance.get(mid),
+            "quant": m.get("quant"),
+            "quant_bits": m.get("quant_bits"),
+            "quant_scope": m.get("quant_scope"),
+            "quant_detail": m.get("quant_detail"),
+            "modalities": modalities(m),
         })
+    ranking = score_models(out)
+    for item in out:
+        item["ranking"] = ranking.get(item["id"])
     print(json.dumps(out, indent=2))
 
 
