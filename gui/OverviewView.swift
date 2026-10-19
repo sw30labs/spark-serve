@@ -99,14 +99,17 @@ struct MetricTile: View {
 
 struct OverviewView: View {
     @ObservedObject var telemetry: TelemetryStore
+    @ObservedObject var strix: StrixStore
     @EnvironmentObject var runner: CLIRunner
+
+    private var strixServing: Bool { strix.configured && (strix.status.map { $0.engine != "none" } ?? false) }
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 2)) { context in
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     HStack(alignment: .firstTextBaseline) {
-                        Text("Your Sparks").font(.title3.weight(.semibold))
+                        Text(strix.configured ? "Your machines" : "Your Sparks").font(.title3.weight(.semibold))
                         Spacer()
                         Text("Ten minutes of history while the app is open")
                             .font(.caption).foregroundStyle(.secondary)
@@ -123,6 +126,9 @@ struct OverviewView: View {
                                 telemetry: telemetry, now: context.date
                             )
                         }
+                        if strix.configured {
+                            StrixHostCard(store: strix, now: context.date)
+                        }
                     }
                     HStack {
                         Text("Serving workloads").font(.title3.weight(.semibold))
@@ -134,16 +140,21 @@ struct OverviewView: View {
                             Label(snapshot.status_error ?? "Workload status is stale. Waiting for a fresh snapshot…", systemImage: "exclamationmark.circle")
                                 .font(.caption).foregroundStyle(.orange)
                         }
-                        if snapshot.allocations.isEmpty && telemetry.topologyIsFresh(now: context.date) {
-                            Text("No managed workload is running. Open Models to start one.")
+                        if snapshot.allocations.isEmpty && !strixServing && telemetry.topologyIsFresh(now: context.date) {
+                            Text("No managed workload is running. Open Models or Strix Halo to start one.")
                                 .foregroundStyle(.secondary).padding(.vertical, 14)
-                        } else if !snapshot.allocations.isEmpty {
+                        } else if !snapshot.allocations.isEmpty || strixServing {
                             LazyVGrid(columns: [GridItem(.adaptive(minimum: 330), alignment: .top)], spacing: 12) {
                                 ForEach(snapshot.allocations) { allocation in
                                     AllocationCard(allocation: allocation, telemetry: telemetry, now: context.date)
                                 }
+                                if strixServing {
+                                    StrixWorkloadCard(store: strix, now: context.date)
+                                }
                             }
                         }
+                    } else if strixServing {
+                        StrixWorkloadCard(store: strix, now: context.date)
                     } else {
                         Text("Waiting for workload status…").foregroundStyle(.secondary).padding(.vertical, 14)
                     }
@@ -153,6 +164,8 @@ struct OverviewView: View {
                 .padding(2)
             }
         }
+        .onAppear { strix.attach() }
+        .onDisappear { strix.detach() }
     }
 }
 

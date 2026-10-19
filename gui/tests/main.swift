@@ -47,6 +47,11 @@ check(sampleModel("x", "X").performance == nil, "Catalog entries without measure
 check(ModelCardFacts.runtimeTitle(wrapper: "halogen") == "Halogen", "Halogen cards use a Halogen pill")
 check(ModelCardFacts.runtimeTitle(wrapper: "lemonade") == "Lemonade", "Lemonade cards use a Lemonade pill")
 check(ModelCardFacts.sparkTitle(topology: "strix") == "Strix Halo", "Strix cards name the box, not a Spark count")
+let strixJSON = #"{"host":"box","engine":"halogen","phase":"ready","model":"m","model_id":"halo-a","url":"http://box:8731/v1","engines":{"halogen":"ready"},"inference":"on","resources":{"ram_free_gib":30.8,"ram_total_gib":125.1,"gtt_used_gib":27.4,"gtt_total_gib":94.2,"busy_pct":0,"temp_c":32,"power_w":9.7,"last_gen_tps":null},"metrics":{"active":0,"queued":0,"kv_pct":3.5,"avg_gen_tps":71.6,"avg_prompt_tps":1134,"last_gen_tps":63.4,"draft_accept_pct":82}}"#
+let strixStatus = try decoder.decode(StrixStatus.self, from: Data(strixJSON.utf8))
+check(strixStatus.metrics?.avg_gen_tps == 71.6 && strixStatus.resources?.last_gen_tps == nil, "Strix status decodes live metrics and null readings")
+let olderStrix = try decoder.decode(StrixStatus.self, from: Data(#"{"host":"box","engine":"none","phase":"stopped","model":"","engines":{}}"#.utf8))
+check(olderStrix.metrics == nil && olderStrix.model_id == nil, "Strix status without metrics still decodes")
 check(StrixFacts.phaseColor("ready") == .green && StrixFacts.phaseColor(nil) == .gray, "Strix phase colours")
 check(StrixFacts.gib(nil) == "—" && StrixFacts.gib(29.66) == "29.7 GiB", "Strix memory formatting")
 check(ModelCardFacts.runtimeTitle(wrapper: "nim") == "NVIDIA NIM", "NIM cards use an NVIDIA NIM pill")

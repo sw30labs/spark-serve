@@ -1150,7 +1150,7 @@ struct MainView: View {
             .pickerStyle(.segmented)
             Divider()
             if selectedTab == "overview" {
-                OverviewView(telemetry: runner.telemetry)
+                OverviewView(telemetry: runner.telemetry, strix: strix)
             } else if selectedTab == "benchmarks" {
                 BenchmarkView(benchmarks: runner.benchmarks, telemetry: runner.telemetry)
             } else if selectedTab == "strix" {

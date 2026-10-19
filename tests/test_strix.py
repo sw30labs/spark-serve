@@ -39,6 +39,15 @@ def test_status_resolves_catalog_model_and_keeps_only_resource_fields(monkeypatc
     assert current["url"] == "http://box:13305/v1"
     assert current["resources"]["ram_free_gib"] == 60.0
     assert "secret_ignored" not in current["resources"]
+    assert current["metrics"]["avg_gen_tps"] is None  # Lemonade: Halogen-only metrics stay empty
+
+
+def test_halogen_status_carries_live_inference_metrics(monkeypatch):
+    stats = {**STATS, "up": True, "active": 1, "avg_gen_tps": 52.0, "kv_pct": 8.6}
+    monkeypatch.setattr(strix, "ssh", fake_ssh([], status={**STATUS, "engine": "halogen", "model": "a"}, stats=stats))
+    current = strix.status(CFG)
+    assert current["model_id"] == "halo-a"
+    assert (current["metrics"]["active"], current["metrics"]["avg_gen_tps"], current["metrics"]["kv_pct"]) == (1, 52.0, 8.6)
 
 
 def test_unknown_serving_model_has_no_catalog_id(monkeypatch):

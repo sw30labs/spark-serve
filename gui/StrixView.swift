@@ -17,6 +17,16 @@ struct StrixResources: Codable {
     let last_gen_tps: Double?
 }
 
+struct StrixMetrics: Codable {
+    let active: Double?
+    let queued: Double?
+    let kv_pct: Double?
+    let avg_gen_tps: Double?
+    let avg_prompt_tps: Double?
+    let last_gen_tps: Double?
+    let draft_accept_pct: Double?
+}
+
 struct StrixStatus: Codable {
     let host: String
     let engine: String
@@ -27,6 +37,7 @@ struct StrixStatus: Codable {
     let engines: [String: String]
     let inference: String?
     let resources: StrixResources?
+    var metrics: StrixMetrics? = nil
 }
 
 final class StrixStore: ObservableObject {
@@ -35,11 +46,16 @@ final class StrixStore: ObservableObject {
     @Published var busyAction: String?
     @Published var lastError: String?
     @Published var logLines: [String] = []
+    /// False when the catalog has no [strix] section; the Overview then hides the box.
+    @Published private(set) var configured = false
+    @Published private(set) var sampledAt: Date?
+    @Published private(set) var history: [String: [MetricPoint]] = [:]
 
     private let home: URL?
     private let cliPath: String
     private var timer: Timer?
     private var refreshing = false
+    private var viewers = 0
 
     init() {
         home = SparkServePaths.home()
@@ -48,15 +64,31 @@ final class StrixStore: ObservableObject {
 
     var isBusy: Bool { busyAction != nil }
 
-    func startPolling() {
+    /// Each visible view attaches; polling runs while at least one is on screen,
+    /// whatever order tab switches deliver onAppear and onDisappear in.
+    func attach() {
+        viewers += 1
         guard timer == nil else { return }
         refresh()
         timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in self?.refresh() }
     }
 
-    func stopPolling() {
+    func detach() {
+        viewers = max(0, viewers - 1)
+        guard viewers == 0 else { return }
         timer?.invalidate()
         timer = nil
+    }
+
+    private func record(_ status: StrixStatus, at date: Date) {
+        let now = date.timeIntervalSince1970
+        let values: [String: Double?] = ["gpu": status.resources?.busy_pct, "decode": status.metrics?.avg_gen_tps]
+        for (key, value) in values {
+            var points = history[key] ?? []
+            if let value { points.append(MetricPoint(timestamp: now, value: value)) }
+            points.removeAll { $0.timestamp < now - TelemetryStore.retentionSeconds }
+            history[key] = points
+        }
     }
 
     func refresh() {
@@ -69,7 +101,13 @@ final class StrixStore: ObservableObject {
             DispatchQueue.main.async {
                 self.refreshing = false
                 if let models { self.models = models }
+                self.configured = models != nil || self.configured
                 self.status = status
+                if let status {
+                    let now = Date()
+                    self.sampledAt = now
+                    self.record(status, at: now)
+                }
                 if status == nil && self.lastError == nil {
                     self.lastError = "The Strix box did not answer; check SSH to it."
                 } else if status != nil, !self.isBusy {
@@ -183,10 +221,10 @@ struct StrixView: View {
             .padding(2)
         }
         .onAppear {
-            store.startPolling()
+            store.attach()
             if selected == nil { selected = store.status?.model_id ?? store.models.first?.id }
         }
-        .onDisappear { store.stopPolling() }
+        .onDisappear { store.detach() }
         .onChange(of: store.models.map(\.id)) { ids in
             // Models arrive after the first SSH round trip; select the serving one then.
             if selected == nil || !ids.contains(selected!) { selected = store.status?.model_id ?? ids.first }
@@ -305,5 +343,127 @@ struct StrixView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color(nsColor: .textBackgroundColor))
         .clipShape(RoundedRectangle(cornerRadius: 6))
+    }
+}
+
+// MARK: - Overview cards
+
+extension StrixStore {
+    /// live, stale (no fresh sample for 20 s) or unavailable, as the Spark cards use.
+    func readingState(now: Date) -> String {
+        guard status != nil, let sampledAt else { return "unavailable" }
+        return now.timeIntervalSince(sampledAt) > 20 ? "stale" : "live"
+    }
+
+    var engineTitle: String {
+        guard let engine = status?.engine else { return "—" }
+        return StrixFacts.engines.first { $0.0 == engine }?.1 ?? engine
+    }
+
+    var servingLabel: String? {
+        guard let status, status.engine != "none" else { return nil }
+        return models.first { $0.id == status.model_id }?.label ?? status.model
+    }
+}
+
+struct StrixHostCard: View {
+    @ObservedObject var store: StrixStore
+    let now: Date
+    private var r: StrixResources? { store.status?.resources }
+    private var usedFraction: Double? {
+        guard let free = r?.ram_free_gib, let total = r?.ram_total_gib, total > 0 else { return nil }
+        return min(1, max(0, (total - free) / total))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Label(store.status?.host ?? "Strix Halo", systemImage: "cpu").font(.headline)
+                Spacer()
+                ReadingState(state: store.readingState(now: now))
+            }
+            Text("Strix Halo · \(store.sampledAt.map { MetricFormat.age($0.timeIntervalSince1970, now: now) } ?? "No sample yet")")
+                .font(.caption).foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 3) {
+                MetricTile(title: "GPU utilization", value: MetricFormat.number(r?.busy_pct, suffix: "%", digits: 0))
+                MetricTrend(points: store.history["gpu"] ?? [], color: .green, label: "GPU utilization", now: now)
+            }
+            Divider()
+            VStack(alignment: .leading, spacing: 5) {
+                HStack {
+                    Text("Unified RAM").font(.subheadline.weight(.medium))
+                    Spacer()
+                    Text(r.map { "\(StrixFacts.gib(($0.ram_total_gib ?? 0) - ($0.ram_free_gib ?? 0))) / \(StrixFacts.gib($0.ram_total_gib))" } ?? "—")
+                        .font(.caption).monospacedDigit()
+                        .help("Used = total minus real free memory; locked model weights count as used, unlike `free`.")
+                }
+                if let usedFraction {
+                    ProgressView(value: usedFraction).tint(usedFraction > 0.9 ? .orange : .accentColor)
+                } else {
+                    Capsule().fill(Color.secondary.opacity(0.1)).frame(height: 4)
+                }
+                HStack {
+                    Text("No swap")
+                    Spacer()
+                    Text("GPU (GTT) \(StrixFacts.gib(r?.gtt_used_gib)) / \(StrixFacts.gib(r?.gtt_total_gib))")
+                }
+                .font(.caption2).foregroundStyle(.secondary)
+            }
+            HStack {
+                MetricTile(title: "GPU temperature", value: MetricFormat.number(r?.temp_c, suffix: " °C", digits: 0))
+                MetricTile(title: "GPU power", value: MetricFormat.number(r?.power_w, suffix: " W"))
+            }
+            if let error = store.lastError {
+                Text(error).font(.caption).foregroundStyle(.orange).lineLimit(3).help(error)
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.secondary.opacity(0.15)))
+    }
+}
+
+struct StrixWorkloadCard: View {
+    @ObservedObject var store: StrixStore
+    let now: Date
+    private var m: StrixMetrics? { store.status?.metrics }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(store.servingLabel ?? "—").font(.headline).textSelection(.enabled)
+                    Text("\(store.status?.host ?? "Strix Halo") · \(store.engineTitle)")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                ReadingState(state: store.readingState(now: now) == "stale" ? "stale" : (store.status?.phase ?? "unavailable"))
+            }
+            if let url = store.status?.url {
+                Text(url).font(.system(.caption, design: .monospaced)).foregroundStyle(.secondary).textSelection(.enabled)
+            }
+            if store.status?.engine != "halogen" {
+                Text("Live inference metrics are read from Halogen only; this engine shows measured speed on its card.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            HStack(spacing: 18) {
+                VStack(alignment: .leading, spacing: 3) {
+                    MetricTile(title: "Decode (recent average)", value: MetricFormat.number(m?.avg_gen_tps, suffix: " tok/s"))
+                    MetricTrend(points: store.history["decode"] ?? [], color: .green, label: "Decode tokens per second", now: now)
+                }
+                MetricTile(title: "Prefill (recent average)", value: MetricFormat.number(m?.avg_prompt_tps, suffix: " tok/s", digits: 0))
+            }
+            Divider()
+            HStack {
+                MetricTile(title: "Running / waiting", value: "\(MetricFormat.number(m?.active, digits: 0)) / \(MetricFormat.number(m?.queued, digits: 0))")
+                MetricTile(title: "KV pool", value: MetricFormat.number(m?.kv_pct, suffix: "%"))
+                MetricTile(title: "Draft acceptance", value: MetricFormat.number(m?.draft_accept_pct, suffix: "%", digits: 0))
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.secondary.opacity(0.15)))
     }
 }

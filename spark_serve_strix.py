@@ -94,7 +94,11 @@ def status(cfg: dict) -> dict:
     return {"host": site(cfg)["host"], **state, "model_id": model_id, "url": url,
             "resources": {key: stats.get(key) for key in (
                 "ram_free_gib", "ram_total_gib", "gtt_used_gib", "gtt_total_gib",
-                "busy_pct", "temp_c", "power_w", "last_gen_tps")}}
+                "busy_pct", "temp_c", "power_w", "last_gen_tps")},
+            # Live inference numbers come from Halogen's metrics only; null for other engines.
+            "metrics": {key: stats.get(key) if state.get("engine") == "halogen" else None for key in (
+                "active", "queued", "kv_pct", "avg_gen_tps", "avg_prompt_tps", "last_gen_tps",
+                "draft_accept_pct")}}
 
 
 def up(cfg: dict, model_id: str) -> dict:
