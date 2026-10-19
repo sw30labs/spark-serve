@@ -83,6 +83,33 @@ class ControllerError(RuntimeError):
     pass
 
 
+def join_errors(errors) -> str:
+    """Join error messages, dropping repeated "; "-separated fragments.
+
+    Fencing and draining both report per-host SSH failures; without this an
+    unreachable host shows the same message once per stage.
+    """
+    seen = []
+    for error in errors:
+        for part in str(error).split("; "):
+            if part and part not in seen:
+                seen.append(part)
+    return "; ".join(seen)
+
+
+# Failures that happen before ssh reaches the host, so no remote command ran.
+_UNREACHABLE = re.compile(
+    r"ssh: (?:Could not resolve hostname"
+    r"|connect to host \S+ port \d+: (?:Connection timed out|Connection refused|No route to host"
+    r"|Network is unreachable|Host is down|Operation timed out))"
+)
+
+
+def unreachable_only(error) -> bool:
+    parts = [part for part in str(error or "").split("; ") if part.strip()]
+    return bool(parts) and all(_UNREACHABLE.search(part) for part in parts)
+
+
 def guarded_remote_script(generation: str, command: str = "", *, fence=False) -> str:
     """Fence delayed SSH commands under a persistent per-node generation lock.
 
@@ -663,21 +690,23 @@ print(json.dumps({"listening_ports": sorted(listening), "containers": [{"id": c[
 
     def verify_idle(self):
         for worker in self._workers():
-            host = worker["host"]
-            audit = self.audit(host)
-            if audit["listening_ports"]:
-                raise ControllerError(
-                    f"{host}: unmanaged listener remains on ports {audit['listening_ports']}; stop or reconcile it before switching"
-                )
-            gpu = [c["name"] for c in audit["containers"] if c["running"] and c["gpu"]]
-            desktop = audit.get("desktop_gpu_contexts", [])
-            if desktop:
-                self.emit("desktop_gpu_context", host=host, contexts=desktop,
-                          output="verified GNOME remote desktop contexts retained")
-            if gpu or audit.get("blocking_gpu_processes", audit["gpu_processes"]):
-                raise ControllerError(
-                    f"{host}: GPU still in use ({', '.join(gpu) or 'compute processes'}); stop or reconcile that workload before switching"
-                )
+            self._verify_host_idle(worker["host"])
+
+    def _verify_host_idle(self, host: str):
+        audit = self.audit(host)
+        if audit["listening_ports"]:
+            raise ControllerError(
+                f"{host}: unmanaged listener remains on ports {audit['listening_ports']}; stop or reconcile it before switching"
+            )
+        gpu = [c["name"] for c in audit["containers"] if c["running"] and c["gpu"]]
+        desktop = audit.get("desktop_gpu_contexts", [])
+        if desktop:
+            self.emit("desktop_gpu_context", host=host, contexts=desktop,
+                      output="verified GNOME remote desktop contexts retained")
+        if gpu or audit.get("blocking_gpu_processes", audit["gpu_processes"]):
+            raise ControllerError(
+                f"{host}: GPU still in use ({', '.join(gpu) or 'compute processes'}); stop or reconcile that workload before switching"
+            )
 
     def service(self, host: str, action: str):
         self.remote(
@@ -891,7 +920,7 @@ print(json.dumps({"listening_ports": sorted(listening), "containers": [{"id": c[
                 except ControllerError as exc:
                     errors.append(str(exc))
                 if errors:
-                    raise ControllerError("; ".join(errors))
+                    raise ControllerError(join_errors(errors))
                 self._save_selected(phase="stopping")
                 self.stop_vllm()
                 self.verify_idle()
@@ -972,7 +1001,53 @@ print(json.dumps({"listening_ports": sorted(listening), "containers": [{"id": c[
                 self.operation_hosts = None
                 self.operation_target = None
 
+    def reconcile_unreachable(self) -> list[str]:
+        """Clear a stale "failed" left by a transition that never reached a host.
+
+        Only idle records (mode none) whose errors are all pre-connection SSH
+        failures qualify, and only after the same live idle audit a stop uses
+        passes. Skipped silently while another transition holds the lock.
+        """
+        def candidates():
+            return [host for host, record in self.node_states().items()
+                    if record.get("phase") == "failed" and record.get("mode") == "none"
+                    and unreachable_only(record.get("error"))
+                    and all(unreachable_only(e) for e in record.get("cleanup_errors") or [])]
+
+        if not candidates():
+            return []
+        try:
+            with self.lock():
+                cleared = []
+                for host in candidates():
+                    try:
+                        self._verify_host_idle(host)
+                    except ControllerError:
+                        continue
+                    cleared.append(host)
+                if not cleared:
+                    return []
+                nodes = self.node_states()
+                for host in cleared:
+                    record = nodes[host]
+                    record.update(phase="stopped", model=None, error=None, cleanup_errors=[],
+                                  allocation_hosts=[], allocation_id=None, legacy=False)
+                    for key in ("containers", "served", "worker"):
+                        record.pop(key, None)
+                summary = {}
+                if self.state.get("phase") == "failed" and not any(
+                        record.get("phase") == "failed" for record in nodes.values()):
+                    summary = {"phase": "stopped", "error": None, "cleanup_errors": []}
+                self.save(nodes=nodes, **summary)
+                self.emit("reconciled", hosts=cleared, output="reachable again and verified idle")
+                return cleared
+        except ControllerError:
+            return []
+
     def status(self) -> dict:
+        # A status poll is the first moment a host that was unreachable is seen
+        # again; without this a transient outage pins the app on "failed".
+        self.reconcile_unreachable()
         state = read_state(self.directory)
         self.state = state
         nodes = self.node_states()

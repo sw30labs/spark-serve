@@ -19,7 +19,9 @@ from spark_serve_controller import (
     ControllerError,
     guarded_remote_script,
     health_ready,
+    join_errors,
     read_state,
+    unreachable_only,
     yue_profile,
 )
 
@@ -406,6 +408,107 @@ loader = importlib.machinery.SourceFileLoader(
 spec = importlib.util.spec_from_loader(loader.name, loader)
 cli = importlib.util.module_from_spec(spec)
 loader.exec_module(cli)
+
+
+RESOLVE = "ssh: Could not resolve hostname {}.local: nodename nor servname provided, or not known"
+
+
+class UnreachableRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.directory = Path(self.temp.name)
+        self.addCleanup(self.temp.cleanup)
+        self.c = FakeController(self.directory)
+        self.c.switch("none")
+
+    def fail_unreachable(self, c=None):
+        c = c or self.c
+        down = {host: f"{host}: " + RESOLVE.format(host) for host in ("head", "worker")}
+        c.fence_nodes = lambda generation: list(down.values())
+
+        def control(host, action, **options):
+            raise ControllerError(down[host])
+
+        c.control = control
+        with self.assertRaises(ControllerError) as caught:
+            c.switch("none")
+        return str(caught.exception), down
+
+    def recovered(self):
+        # A fresh process (CLI or app poll) with hosts reachable again.
+        return FakeController(self.directory)
+
+    def test_join_errors_drops_repeated_fragments_only(self):
+        self.assertEqual("a; b; c", join_errors(["a; b", "b; a", "c"]))
+        self.assertEqual("", join_errors([]))
+
+    def test_unreachable_host_is_reported_once_per_host(self):
+        message, down = self.fail_unreachable()
+        self.assertEqual(f"{down['head']}; {down['worker']}", message)
+        self.assertEqual(message, read_state(self.directory)["error"])
+
+    def test_unreachable_only_rejects_mixed_or_post_connection_errors(self):
+        self.assertTrue(unreachable_only("h: " + RESOLVE.format("h")))
+        self.assertTrue(unreachable_only("h: ssh: connect to host h port 22: Connection timed out"))
+        self.assertFalse(unreachable_only(""))
+        self.assertFalse(unreachable_only("h: " + RESOLVE.format("h") + "; w: GPU still in use"))
+        self.assertFalse(unreachable_only("h: Connection closed by 10.0.0.1 port 22"))
+
+    def test_status_clears_stale_failure_once_hosts_are_idle(self):
+        self.fail_unreachable()
+        c = self.recovered()
+        c.status()
+        state = read_state(self.directory)
+        self.assertEqual("stopped", state["phase"])
+        self.assertIsNone(state["error"])
+        for record in state["nodes"].values():
+            self.assertEqual(("none", "stopped", None), (record["mode"], record["phase"], record["error"]))
+        self.assertIn(("audit", "head"), c.calls)
+
+    def test_still_unreachable_or_busy_host_stays_failed(self):
+        self.fail_unreachable()
+        c = self.recovered()
+        c.offline.add("worker")
+        c.compute["head"] = [{"pid": 1, "name": "python"}]
+        c.status()
+        state = read_state(self.directory)
+        self.assertEqual("failed", state["phase"])
+        self.assertEqual({"failed"}, {r["phase"] for r in state["nodes"].values()})
+
+    def test_partial_recovery_keeps_summary_failed(self):
+        self.fail_unreachable()
+        c = self.recovered()
+        c.offline.add("worker")
+        c.status()
+        state = read_state(self.directory)
+        self.assertEqual("stopped", state["nodes"]["head"]["phase"])
+        self.assertEqual("failed", state["nodes"]["worker"]["phase"])
+        self.assertEqual("failed", state["phase"])
+
+    def test_non_connectivity_failure_is_not_auto_cleared(self):
+        def boom():
+            raise ControllerError("reboot failed")
+
+        with self.assertRaises(ControllerError):
+            self.c.switch("none", after_idle=boom)
+        c = self.recovered()
+        c.status()
+        self.assertEqual("failed", read_state(self.directory)["phase"])
+        self.assertNotIn(("audit", "head"), c.calls)
+
+    def test_active_allocation_is_never_auto_cleared(self):
+        self.c.switch("solo", start_vllm=lambda generation: None)
+        self.fail_unreachable(FakeController(self.directory))
+        c = self.recovered()
+        c.status()
+        self.assertEqual("failed", read_state(self.directory)["nodes"]["head"]["phase"])
+
+    def test_reconcile_skips_while_a_transition_holds_the_lock(self):
+        self.fail_unreachable()
+        c = self.recovered()
+        with FakeController(self.directory).lock():
+            self.assertEqual([], c.reconcile_unreachable())
+        self.assertEqual("failed", read_state(self.directory)["phase"])
 
 
 class CLITests(unittest.TestCase):
