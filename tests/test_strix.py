@@ -21,11 +21,12 @@ STATS = {"up": False, "ram_free_gib": 60.0, "ram_total_gib": 125.1, "busy_pct": 
          "power_w": 12.5, "secret_ignored": 1}
 
 
-def fake_ssh(calls, status=STATUS, stats=STATS):
+def fake_ssh(calls, status=STATUS, stats=STATS, served=131072, counters=None):
     def run(cfg, command, timeout=strix.SSH_SECONDS):
         calls.append(command)
-        if "status --json" in command:
-            return json.dumps(status) + "\n" + json.dumps(stats) + "\n"
+        if "SPARK_SERVE_PROBE" in command:
+            return json.dumps({"state": status, "stats": stats, "served_context": served,
+                               "counters": counters or {}}) + "\n"
         if "cat " in command:
             return "hal-secret\n"
         return ""
@@ -39,7 +40,8 @@ def test_status_resolves_catalog_model_and_keeps_only_resource_fields(monkeypatc
     assert current["url"] == "http://box:13305/v1"
     assert current["resources"]["ram_free_gib"] == 60.0
     assert "secret_ignored" not in current["resources"]
-    assert current["metrics"]["avg_gen_tps"] is None  # Lemonade: Halogen-only metrics stay empty
+    assert current["metrics"]["avg_gen_tps"] is None  # Halogen-only field
+    assert current["served_context"] == 131072
 
 
 def test_halogen_status_carries_live_inference_metrics(monkeypatch):
@@ -118,3 +120,27 @@ def test_bench_refuses_when_nothing_is_ready(monkeypatch):
     monkeypatch.setattr(strix, "ssh", fake_ssh([], status={**STATUS, "phase": "starting"}))
     with pytest.raises(strix.StrixError, match="no catalog model is ready"):
         strix.bench(CFG)
+
+
+@pytest.mark.parametrize("engine,model,counters,expected", [
+    ("lemonade", "b-Q4", {"llamacpp:requests_processing": 1.0, "llamacpp:requests_deferred": 2.0,
+                          "llamacpp:kv_cache_usage_ratio": 0.125, "llamacpp:n_decode_total": 900.0,
+                          "llamacpp:tokens_predicted_total": 0.0,
+                          "llamacpp:prompt_tokens_total": 4000.0}, (1.0, 2.0, 12.5, 900.0, 4000.0)),
+    ("vllm", "c", {"vllm:num_requests_running": 3.0, "vllm:num_requests_waiting": 0.0,
+                   "vllm:kv_cache_usage_perc": 0.5, "vllm:generation_tokens_total": 1500.0,
+                   "vllm:prompt_tokens_total": 6000.0}, (3.0, 0.0, 50.0, 1500.0, 6000.0)),
+])
+def test_engine_counters_are_normalized_for_the_app(monkeypatch, engine, model, counters, expected):
+    monkeypatch.setattr(strix, "ssh", fake_ssh([], status={**STATUS, "engine": engine, "model": model},
+                                                counters=counters))
+    m = strix.status(CFG)["metrics"]
+    assert (m["active"], m["queued"], m["kv_pct"], m["generation_tokens_total"], m["prompt_tokens_total"]) == expected
+    assert m["avg_gen_tps"] is None
+
+
+def test_probe_keeps_the_key_on_the_box(monkeypatch):
+    calls = []
+    monkeypatch.setattr(strix, "ssh", fake_ssh(calls))
+    strix.status(CFG)
+    assert "hal-secret" not in calls[0] and "~/.config/halogen/api-key" in calls[0]

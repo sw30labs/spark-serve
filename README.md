@@ -367,7 +367,12 @@ python3 tools/catalog_tps_bench.py run --site strix
 
 Add a `[strix]` section with the box's SSH alias (see `models.example.toml`).
 All three engines require the box's API key, which spark-serve reads over SSH
-for each benchmark and never stores. Strix models are ranked among themselves;
+for each benchmark and never stores. The Overview shows the box beside the
+Sparks with live decode speed for every engine: Halogen's recent average,
+and for Lemonade and vLLM a rate from their token counters (Lemonade's
+llama.cpp decode steps, which equal tokens with one slot and no drafts).
+Each workload card and benchmark records the context the engine actually
+serves; hover a card's context pill to see whether a benchmark confirmed it. Strix models are ranked among themselves;
 their speeds use the same benchmark protocol as the Sparks but different
 hardware. Design notes: [Strix Halo analysis](docs/strix-halo-analysis.md).
 

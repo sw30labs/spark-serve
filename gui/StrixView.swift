@@ -25,6 +25,8 @@ struct StrixMetrics: Codable {
     let avg_prompt_tps: Double?
     let last_gen_tps: Double?
     let draft_accept_pct: Double?
+    var generation_tokens_total: Double? = nil
+    var prompt_tokens_total: Double? = nil
 }
 
 struct StrixStatus: Codable {
@@ -38,6 +40,8 @@ struct StrixStatus: Codable {
     let inference: String?
     let resources: StrixResources?
     var metrics: StrixMetrics? = nil
+    /// Context the running engine reports serving (not the catalog's value).
+    var served_context: Int? = nil
 }
 
 final class StrixStore: ObservableObject {
@@ -50,6 +54,10 @@ final class StrixStore: ObservableObject {
     @Published private(set) var configured = false
     @Published private(set) var sampledAt: Date?
     @Published private(set) var history: [String: [MetricPoint]] = [:]
+    /// Rates from successive counter samples of the same engine and model (Lemonade, vLLM).
+    @Published private(set) var liveDecode: Double?
+    @Published private(set) var livePrefill: Double?
+    private var previousCounters: (key: String, at: Double, generation: Double, prompt: Double)?
 
     private let home: URL?
     private let cliPath: String
@@ -82,13 +90,32 @@ final class StrixStore: ObservableObject {
 
     private func record(_ status: StrixStatus, at date: Date) {
         let now = date.timeIntervalSince1970
-        let values: [String: Double?] = ["gpu": status.resources?.busy_pct, "decode": status.metrics?.avg_gen_tps]
+        updateRates(status, at: now)
+        let decode = status.engine == "halogen" ? status.metrics?.avg_gen_tps : liveDecode
+        let values: [String: Double?] = ["gpu": status.resources?.busy_pct, "decode": decode]
         for (key, value) in values {
             var points = history[key] ?? []
             if let value { points.append(MetricPoint(timestamp: now, value: value)) }
             points.removeAll { $0.timestamp < now - TelemetryStore.retentionSeconds }
             history[key] = points
         }
+    }
+
+    func updateRates(_ status: StrixStatus, at now: Double) {
+        let key = "\(status.engine)/\(status.model)"
+        guard let generation = status.metrics?.generation_tokens_total,
+              let prompt = status.metrics?.prompt_tokens_total else {
+            liveDecode = nil; livePrefill = nil; previousCounters = nil
+            return
+        }
+        if let previous = previousCounters, previous.key == key, now > previous.at,
+           now - previous.at <= 30, generation >= previous.generation, prompt >= previous.prompt {
+            liveDecode = (generation - previous.generation) / (now - previous.at)
+            livePrefill = (prompt - previous.prompt) / (now - previous.at)
+        } else {
+            liveDecode = nil; livePrefill = nil  // first sample, a restart, or a counter reset
+        }
+        previousCounters = (key, now, generation, prompt)
     }
 
     func refresh() {
@@ -252,6 +279,7 @@ struct StrixView: View {
                     Text(store.models.first { $0.id == status.model_id }?.label ?? status.model)
                         .font(.subheadline.weight(.semibold))
                     Text("\(StrixFacts.engines.first { $0.0 == status.engine }?.1 ?? status.engine) · \(status.phase)"
+                         + (status.served_context.map { " · \(ModelCardFacts.contextTitle(ctx: $0, backend: status.engine)) served" } ?? "")
                          + (status.url.map { " · \($0)" } ?? ""))
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -428,6 +456,7 @@ struct StrixWorkloadCard: View {
     @ObservedObject var store: StrixStore
     let now: Date
     private var m: StrixMetrics? { store.status?.metrics }
+    private var halogen: Bool { store.status?.engine == "halogen" }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -443,22 +472,26 @@ struct StrixWorkloadCard: View {
             if let url = store.status?.url {
                 Text(url).font(.system(.caption, design: .monospaced)).foregroundStyle(.secondary).textSelection(.enabled)
             }
-            if store.status?.engine != "halogen" {
-                Text("Live inference metrics are read from Halogen only; this engine shows measured speed on its card.")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
             HStack(spacing: 18) {
                 VStack(alignment: .leading, spacing: 3) {
-                    MetricTile(title: "Decode (recent average)", value: MetricFormat.number(m?.avg_gen_tps, suffix: " tok/s"))
+                    MetricTile(title: halogen ? "Decode (recent average)" : "Decode (live)",
+                               value: MetricFormat.number(halogen ? m?.avg_gen_tps : store.liveDecode, suffix: " tok/s"))
                     MetricTrend(points: store.history["decode"] ?? [], color: .green, label: "Decode tokens per second", now: now)
                 }
-                MetricTile(title: "Prefill (recent average)", value: MetricFormat.number(m?.avg_prompt_tps, suffix: " tok/s", digits: 0))
+                MetricTile(title: halogen ? "Prefill (recent average)" : "Prefill (finished requests)",
+                           value: MetricFormat.number(halogen ? m?.avg_prompt_tps : store.livePrefill, suffix: " tok/s", digits: 0))
+                    .help(halogen ? "Halogen's average over recent requests." : "Prompt tokens are counted when a request finishes, so this moves in steps.")
             }
             Divider()
             HStack {
+                MetricTile(title: "Context (served)", value: store.status?.served_context.map {
+                    ModelCardFacts.contextTitle(ctx: $0, backend: store.status?.engine) } ?? "—")
+                    .help("Reported by the running engine, not the catalog.")
                 MetricTile(title: "Running / waiting", value: "\(MetricFormat.number(m?.active, digits: 0)) / \(MetricFormat.number(m?.queued, digits: 0))")
-                MetricTile(title: "KV pool", value: MetricFormat.number(m?.kv_pct, suffix: "%"))
-                MetricTile(title: "Draft acceptance", value: MetricFormat.number(m?.draft_accept_pct, suffix: "%", digits: 0))
+                MetricTile(title: halogen ? "KV pool" : "KV cache", value: MetricFormat.number(m?.kv_pct, suffix: "%"))
+                if halogen {
+                    MetricTile(title: "Draft acceptance", value: MetricFormat.number(m?.draft_accept_pct, suffix: "%", digits: 0))
+                }
             }
         }
         .padding(14)

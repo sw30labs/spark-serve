@@ -40,6 +40,7 @@ struct ModelPerformance: Codable {
     let single_stream_ttft_seconds: Double?
     let concurrent_streams: Int
     let concurrent_aggregate_tokens_per_second: Double?
+    var served_context: Int? = nil
 }
 
 enum ModelFamily: String, CaseIterable, Identifiable {
@@ -1680,6 +1681,12 @@ enum ModelCardFacts {
         return weakColor
     }
 
+    static func contextHelp(ctx: Int, performance: ModelPerformance?) -> String {
+        guard let served = performance?.served_context else { return "Catalog context limit." }
+        if served == ctx { return "Catalog context limit; the engine confirmed it when measured on \(performance!.measured_at)." }
+        return "Catalog says \(ctx) tokens, but the engine served \(served) when measured on \(performance!.measured_at)."
+    }
+
     static func modalityTitle(_ modalities: [String]) -> String {
         let media = ["image", "video", "audio"].filter(modalities.contains)
         if media.isEmpty { return "Text only" }
@@ -1878,6 +1885,7 @@ struct ModelCard: View {
             PillFlow(spacing: 6) {
                 InfoPill(text: ModelCardFacts.contextTitle(ctx: model.ctx, backend: model.backend),
                          color: model.backend == "yue" ? ModelCardFacts.neutralColor : ModelCardFacts.contextColor(ctx: model.ctx))
+                    .help(ModelCardFacts.contextHelp(ctx: model.ctx, performance: model.performance))
                 if let quant = model.quant {
                     let tier = ModelCardFacts.quantTier(bits: model.quant_bits, scope: model.quant_scope)
                     InfoPill(text: quant, color: ModelCardFacts.quantColor(tier))

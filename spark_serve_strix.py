@@ -81,24 +81,102 @@ def _match(cfg: dict, engine: str, served: str) -> str | None:
     return None
 
 
-def status(cfg: dict) -> dict:
-    """halo-ctl status plus resource stats, with the serving catalog id resolved."""
-    raw = ssh(cfg, f"{_ctl(cfg)} status --json; {_ctl(cfg)} stats || echo '{{}}'").strip().splitlines()
-    state = json.loads(raw[0])
+# Runs on the box in one SSH round trip: halo-ctl state and stats, then the
+# serving engine's real context and token counters, read on localhost with the
+# box's key. The key never leaves the box. Read-only.
+_PROBE = r"""
+import json, os, re, subprocess, urllib.request
+CTL, KEY = os.path.expanduser(%(ctl)r), os.path.expanduser(%(key)r)
+WANTED = {"vllm:generation_tokens_total", "vllm:prompt_tokens_total", "vllm:num_requests_running",
+          "vllm:num_requests_waiting", "vllm:kv_cache_usage_perc", "llamacpp:tokens_predicted_total",
+          "llamacpp:prompt_tokens_total", "llamacpp:requests_processing", "llamacpp:requests_deferred",
+          "llamacpp:kv_cache_usage_ratio", "llamacpp:n_decode_total"}
+def sh(*args):
     try:
-        stats = json.loads(raw[1]) if len(raw) > 1 else {}
-    except ValueError:
-        stats = {}
-    model_id = _match(cfg, state.get("engine"), state.get("model")) if state.get("engine") in ENGINES else None
+        return subprocess.run(args, capture_output=True, text=True, timeout=20).stdout
+    except Exception:
+        return ""
+key = open(KEY).read().strip() if os.path.exists(KEY) else ""
+def get(url):
+    request = urllib.request.Request(url, headers={"Authorization": "Bearer " + key} if key else {})
+    try:
+        with urllib.request.urlopen(request, timeout=3) as response:
+            return response.read(4 << 20).decode("utf-8", "replace")
+    except Exception:
+        return ""
+state = json.loads(sh(CTL, "status", "--json"))
+try:
+    stats = json.loads(sh(CTL, "stats") or "{}")
+except ValueError:
+    stats = {}
+engine, port, served, text = state.get("engine"), state.get("port"), None, ""
+if engine in ("halogen", "vllm") and port:
+    try:
+        model = json.loads(get("http://127.0.0.1:%%s/v1/models" %% port))["data"][0]
+        served = model.get("max_model_len") or model.get("context_length")
+    except Exception:
+        pass
+    text = get("http://127.0.0.1:%%s/metrics" %% port)
+elif engine == "lemonade" and port:
+    try:
+        loaded = (json.loads(get("http://127.0.0.1:%%s/api/v1/health" %% port)).get("all_models_loaded") or [{}])[0]
+        served = loaded.get("max_context_window")
+        if loaded.get("backend_url"):
+            text = get(loaded["backend_url"].rsplit("/v1", 1)[0] + "/metrics")
+    except Exception:
+        pass
+counters = {}
+for line in text.splitlines():
+    match = re.match(r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{[^}]*\})?\s+([0-9.eE+-]+)$", line.strip())
+    if match and match.group(1) in WANTED:
+        name, value = match.group(1), float(match.group(2))
+        counters[name] = max(counters.get(name, 0.0), value) if "kv_cache" in name else counters.get(name, 0.0) + value
+print(json.dumps({"state": state, "stats": stats, "served_context": served, "counters": counters}))
+"""
+
+# Engine counters normalized to one shape; Halogen keeps halogen-stats' own fields.
+_COUNTERS = {
+    "vllm": {"active": "vllm:num_requests_running", "queued": "vllm:num_requests_waiting",
+             "kv": "vllm:kv_cache_usage_perc", "generation": "vllm:generation_tokens_total",
+             "prompt": "vllm:prompt_tokens_total"},
+    "lemonade": {"active": "llamacpp:requests_processing", "queued": "llamacpp:requests_deferred",
+                 # tokens_predicted_total moves only when a request finishes; decode steps
+                 # move live and equal tokens with one slot and no drafts, as Lemonade runs here.
+                 "kv": "llamacpp:kv_cache_usage_ratio", "generation": "llamacpp:n_decode_total",
+                 "prompt": "llamacpp:prompt_tokens_total"},
+}
+
+
+def _metrics(engine, stats, counters):
+    out = dict.fromkeys(("active", "queued", "kv_pct", "avg_gen_tps", "avg_prompt_tps", "last_gen_tps",
+                         "draft_accept_pct", "generation_tokens_total", "prompt_tokens_total"))
+    if engine == "halogen":
+        out.update({key: stats.get(key) for key in (
+            "active", "queued", "kv_pct", "avg_gen_tps", "avg_prompt_tps", "last_gen_tps", "draft_accept_pct")})
+    names = _COUNTERS.get(engine)
+    if names:
+        kv = counters.get(names["kv"])
+        out.update(active=counters.get(names["active"]), queued=counters.get(names["queued"]),
+                   kv_pct=round(kv * 100, 2) if kv is not None else None,
+                   generation_tokens_total=counters.get(names["generation"]),
+                   prompt_tokens_total=counters.get(names["prompt"]))
+    return out
+
+
+def status(cfg: dict) -> dict:
+    """halo-ctl status, resources and the engine's live context and counters, catalog id resolved."""
+    script = _PROBE % {"ctl": _ctl(cfg), "key": site(cfg).get("api_key_file") or DEFAULT_KEY}
+    raw = json.loads(ssh(cfg, "python3 - <<'SPARK_SERVE_PROBE'\n" + script + "\nSPARK_SERVE_PROBE").strip().splitlines()[-1])
+    state, stats = raw.get("state") or {}, raw.get("stats") or {}
+    engine = state.get("engine")
+    model_id = _match(cfg, engine, state.get("model")) if engine in ENGINES else None
     url = base_url(cfg, models(cfg)[model_id]) if model_id else None
     return {"host": site(cfg)["host"], **state, "model_id": model_id, "url": url,
+            "served_context": raw.get("served_context"),
             "resources": {key: stats.get(key) for key in (
                 "ram_free_gib", "ram_total_gib", "gtt_used_gib", "gtt_total_gib",
                 "busy_pct", "temp_c", "power_w", "last_gen_tps")},
-            # Live inference numbers come from Halogen's metrics only; null for other engines.
-            "metrics": {key: stats.get(key) if state.get("engine") == "halogen" else None for key in (
-                "active", "queued", "kv_pct", "avg_gen_tps", "avg_prompt_tps", "last_gen_tps",
-                "draft_accept_pct")}}
+            "metrics": _metrics(engine, stats, raw.get("counters") or {})}
 
 
 def up(cfg: dict, model_id: str) -> dict:
@@ -174,6 +252,7 @@ def bench(cfg: dict, *, concurrency=1, requests=3, max_tokens=128, prompt_tokens
     run = {"id": run_id, "site": "strix", "kind": "decode", "status": "running", "started_at": _now(),
            "model": mid, "served_name": model["served_name"], "node": "strix", "hosts": [before["host"]],
            "endpoint": before["url"], "runtime": {"engine": model["engine"]},
+           "served_context": before.get("served_context"),
            "config": {"concurrency": concurrency, "requests": requests, "max_tokens": max_tokens,
                       "prompt_tokens": prompt_tokens, "prompt_lengths": [prompt_tokens] * requests,
                       "thinking": thinking,

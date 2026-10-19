@@ -88,3 +88,12 @@ def test_modalities_default_from_hermes_vision():
     assert modalities({}) == ["text"]
     assert modalities({"hermes_supports_vision": True}) == ["text", "image"]
     assert modalities({"hermes_supports_vision": True, "modalities": ["text", "image", "video"]})[-1] == "video"
+
+
+def test_summary_keeps_engine_reported_context():
+    single = run("m", "s", 1, 5, "2026-10-19T02:00")
+    single["served_context"] = 131072
+    out = bench.summarize_runs([single, run("m", "c", 2, 6, "2026-10-19T01:00")])
+    assert out["m"]["served_context"] == 131072
+    assert "served_context" not in bench.summarize_runs(
+        [run("n", "s", 1, 5, "2026-10-19T02:00"), run("n", "c", 2, 6, "2026-10-19T01:00")])["n"]

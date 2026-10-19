@@ -114,6 +114,9 @@ def summarize_runs(runs):
             "reasoning_observed": any(r.get("reasoning_observed") for r in single["results"] + conc["results"]),
             "run_ids": [single["id"], conc["id"]],
         }
+        if single.get("served_context"):
+            # Context the running engine reported, not the catalog's claim.
+            out[model]["served_context"] = single["served_context"]
     return out
 
 
@@ -129,6 +132,18 @@ def write_summary():
     }
     OUT.write_text(json.dumps(doc, indent=2) + "\n")
     log(f"wrote {OUT} ({len(doc['models'])} models)")
+    _check_contexts(doc["models"])
+
+
+def _check_contexts(measured):
+    """Flag catalog contexts that differ from what the engine served."""
+    import tomllib
+    catalog = tomllib.loads((ROOT / "models.toml").read_text())
+    entries = {**catalog.get("models", {}), **(catalog.get("strix") or {}).get("models", {})}
+    for model, row in sorted(measured.items()):
+        served, listed = row.get("served_context"), (entries.get(model) or {}).get("max_model_len")
+        if served and listed and int(served) != int(listed):
+            log(f"WARNING {model}: catalog max_model_len {listed} but the engine served {served}")
 
 
 def main():

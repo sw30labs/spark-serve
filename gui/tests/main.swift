@@ -52,6 +52,21 @@ let strixStatus = try decoder.decode(StrixStatus.self, from: Data(strixJSON.utf8
 check(strixStatus.metrics?.avg_gen_tps == 71.6 && strixStatus.resources?.last_gen_tps == nil, "Strix status decodes live metrics and null readings")
 let olderStrix = try decoder.decode(StrixStatus.self, from: Data(#"{"host":"box","engine":"none","phase":"stopped","model":"","engines":{}}"#.utf8))
 check(olderStrix.metrics == nil && olderStrix.model_id == nil, "Strix status without metrics still decodes")
+let rates = StrixStore()
+func counterStatus(_ engine: String, _ gen: Double, _ prompt: Double) -> StrixStatus {
+    StrixStatus(host: "box", engine: engine, phase: "ready", model: "m", model_id: "x", url: nil, engines: [:],
+                inference: nil, resources: nil,
+                metrics: StrixMetrics(active: 1, queued: 0, kv_pct: nil, avg_gen_tps: nil, avg_prompt_tps: nil,
+                                      last_gen_tps: nil, draft_accept_pct: nil,
+                                      generation_tokens_total: gen, prompt_tokens_total: prompt))
+}
+rates.updateRates(counterStatus("vllm", 100, 500), at: 1000)
+check(rates.liveDecode == nil, "First counter sample has no rate")
+rates.updateRates(counterStatus("vllm", 160, 500), at: 1005)
+check(rates.liveDecode == 12 && rates.livePrefill == 0, "Live decode is the counter delta over time")
+rates.updateRates(counterStatus("lemonade", 10, 0), at: 1010)
+check(rates.liveDecode == nil, "Switching engines resets the baseline")
+check(ModelCardFacts.contextHelp(ctx: 131072, performance: nil) == "Catalog context limit.", "Unmeasured context says catalog")
 check(StrixFacts.phaseColor("ready") == .green && StrixFacts.phaseColor(nil) == .gray, "Strix phase colours")
 check(StrixFacts.gib(nil) == "—" && StrixFacts.gib(29.66) == "29.7 GiB", "Strix memory formatting")
 check(ModelCardFacts.runtimeTitle(wrapper: "nim") == "NVIDIA NIM", "NIM cards use an NVIDIA NIM pill")
