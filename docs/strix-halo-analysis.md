@@ -122,15 +122,17 @@ and the Mac app become two front ends of it.
 | Halogen context | `HALOGEN_CTX=262144`, 4 KV slots over one 524,288-position pool |
 | Halogen vision | Sidecar present but **not loaded** (needs `HALOGEN_VISION_TOWER`); currently text-only |
 | Halogen metrics | Prometheus `/metrics` with `halogen:*` and llama.cpp-style `llamacpp:*` families (tokens/s, requests processing, KV usage); needs a parser alongside vLLM's |
-| Lemonade | 11.8.1, `lemond.service` installed but **disabled and stopped**; model store `/var/lib/lemonade` not readable without sudo |
+| Lemonade | 11.8.1, `lemond.service` installed but **disabled and stopped**. Models (factory defaults, linked from the shared cache `/var/cache/models`): **gpt-oss-120b Q4_K_M** (unsloth GGUF, 59 GB) and **Qwen3-Coder-30B-A3B-Instruct Q4_K_M** (unsloth GGUF, 18 GB) |
+| Other cached models | `openai/gpt-oss-20b` safetensors (13 GB; vLLM-loadable, likely for `ryai-vllm`, unconfirmed); `Comfy-Org/z_image_turbo` (20 GB, ComfyUI) |
 | vLLM | Image `ryai-vllm:latest` ("Halo OS vLLM image", v0.27.1); no launcher script or unit found, so it is started by hand |
 | ComfyUI | `ryai-comfyui` image; listener on localhost :8188 |
 | Control tool | `~/.local/bin/halogen-ctl status --json` → `{"halogen":"running","lemonade":"stopped","inference":"on"}`. `~/.local/bin` is **not on PATH** for non-interactive SSH, so call it by full path |
 
 ## Open questions
 
-- Which models Lemonade serves (needs sudo to read `/var/lib/lemonade`, or
-  `lemonade` CLI while `lemond` runs).
+- Exact quantization of the two Lemonade GGUFs: "Q4_K_M" is the file label;
+  read the GGUF tensor types before tagging cards (gpt-oss ships MXFP4 experts
+  upstream).
 - The vLLM launch command you use (model, flags, ports) with the `ryai-vllm`
   image.
 - Whether Lemonade and vLLM report streamed `usage` (benchmarks need it) and
