@@ -65,12 +65,25 @@ vLLM inference metrics are fetched from the allocation endpoint's `/metrics`
 - TTFT and time per output token are histogram **means over that interval**,
   not lifetime averages or percentiles.
 
-TensorFold uses its patched `/health` JSON endpoint for reported in-flight
-requests and prompt/completion token rates. Prompt tokens are credited when
-the first output arrives, rather than continuously during prefill.
-Its pinned schema does not supply waiting
-requests, KV utilization, request rates or latency histograms; these stay
-unavailable. Native benchmarks can still measure client-observed latency.
+TensorFold builds publish metrics differently, so each catalog model uses a
+declared **metrics contract** (`metrics_contract`, defaulting to the runtime):
+
+- `tensorfold` (the pinned GLM build): its patched `/health` JSON supplies
+  in-flight requests and prompt/completion token rates. Prompt tokens are
+  credited when the first output arrives, rather than continuously during
+  prefill. Waiting requests, KV utilization, request rates and latency
+  histograms stay unavailable.
+- `tensorfold-prometheus` (the Qwen zig-flashnext build): Prometheus `/metrics`.
+  Only its vLLM-named mirrors are read (`tensorfold:num_requests_running`,
+  `…_waiting`, `kv_cache_usage_perc`, token totals, TTFT and TPOT histograms),
+  so the native duplicates are never counted twice. Its token totals count
+  finished requests only; decode adds `generation_tokens_running`, so the
+  rate moves while a request generates. Prefill is still credited when a
+  request finishes. There is no completed-request counter.
+
+A TensorFold `/health` that is not the GLM counter schema reports an error
+naming `tensorfold-prometheus`. Native benchmarks still measure
+client-observed latency for every contract.
 
 Allocation/container changes, counter resets, missing series, and gaps reset
 the rate baseline. The first observation therefore has no rate yet. The

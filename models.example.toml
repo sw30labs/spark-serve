@@ -618,6 +618,8 @@ tensor_parallel = 2
 drop_caches = true
 hf_mount = "/cache/huggingface"
 ready_path = "/health"
+# This build serves Prometheus /metrics (vLLM-named mirrors); its /health is not the GLM counter patch.
+metrics_contract = "tensorfold-prometheus"
 ready_timeout = 1800
 preflight_timeout = 1800
 max_model_len = 1048576

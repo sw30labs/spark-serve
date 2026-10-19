@@ -57,6 +57,11 @@ _SAMPLE = re.compile(r'^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{(.*)\})?\s+([^\s]+)(?:\s+
 _LABEL = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:[^"\\]|\\.)*)"(?:,|$)')
 MAX_BYTES = 2 * 1024 * 1024
 SUPPORTED_RUNTIMES = ("vllm", "nim", "tensorfold")
+# How an allocation publishes inference metrics. Defaults to its runtime; a
+# catalog model can declare another with `metrics_contract`. TensorFold builds
+# differ: the pinned GLM build patches /health counters, while the Qwen
+# zig-flashnext build serves Prometheus /metrics with vLLM-named families.
+METRICS_CONTRACTS = (*SUPPORTED_RUNTIMES, "tensorfold-prometheus")
 TENSORFOLD_GAUGES = {"requests_running": ("tensorfold:requests_running",)}
 TENSORFOLD_COUNTERS = {
     "prompt_tokens_per_second": "tensorfold:prompt_tokens_total",
@@ -114,6 +119,16 @@ def parse_prometheus(body, served_name=None, runtime="vllm"):
         family = match[1]
         if runtime == "nim" and not family.startswith("vllm:"):
             family = "vllm:" + family
+        elif runtime == "tensorfold-prometheus":
+            # Only its vLLM-named mirrors (num_requests_running, …) map onto FAMILIES;
+            # native duplicates such as tensorfold:requests_running are left out.
+            if not family.startswith("tensorfold:"):
+                continue
+            family = "vllm:" + family[len("tensorfold:"):]
+            if family == "vllm:generation_tokens_running":
+                # generation_tokens_total only counts finished requests; adding the
+                # tokens live streams hold gives a counter that grows while decoding.
+                family = "vllm:generation_tokens_total"
         if family not in FAMILIES:
             continue
         labels, offset = {}, 0
@@ -134,9 +149,11 @@ def parse_prometheus(body, served_name=None, runtime="vllm"):
             continue
         if value is not None:
             key = (family, tuple(sorted(labels.items())))
+            if runtime == "tensorfold-prometheus" and family == "vllm:generation_tokens_total":
+                values[key] = values.get(key, 0) + value  # finished + live, see above
             # NIM can expose both names during engine/version transitions.
             # Prefer the canonical family instead of adding aliases together.
-            if match[1].startswith("vllm:") or key not in values:
+            elif match[1].startswith("vllm:") or key not in values:
                 values[key] = value
     return values
 
@@ -155,7 +172,8 @@ def parse_tensorfold_health(body):
     except RecursionError as exc:
         raise ValueError("TensorFold health response is too deeply nested") from exc
     if not isinstance(health, dict) or health.get("backend") != "tensorfold" or health.get("ok") is not True:
-        raise ValueError("TensorFold health response is not ready or has an unsupported schema")
+        raise ValueError("TensorFold /health is not ready or is not the pinned GLM counter schema; "
+                         "builds with Prometheus /metrics need metrics_contract = \"tensorfold-prometheus\"")
     values = {}
     for field in ("requests_running", "prompt_tokens_total", "completion_tokens_total"):
         value = health.get(field)
@@ -217,7 +235,14 @@ class InferenceMetrics:
 
 def allocation_identity(allocation):
     return (allocation["id"], allocation["endpoint"], allocation["runtime"],
-            tuple(allocation.get("_containers", ())), allocation.get("served_name"))
+            tuple(allocation.get("_containers", ())), allocation.get("served_name"),
+            allocation.get("metrics_contract"))
+
+
+def metrics_contract(cfg, allocation):
+    """The catalog's declared contract for this model, else its runtime."""
+    model = ((cfg or {}).get("models") or {}).get(allocation.get("model")) or {}
+    return model.get("metrics_contract") or allocation["runtime"]
 
 
 def allocations_from_status(status):
@@ -475,7 +500,7 @@ def fetch_metrics(endpoint, runtime="vllm"):
     # NIM documents /v1/metrics and unprefixed metric names. A few vLLM-backed
     # images expose /metrics instead; only a 404 permits this fallback.
     paths = (("/v1/metrics", "/metrics") if runtime == "nim" else
-             ("/health",) if runtime == "tensorfold" else ("/metrics",))
+             ("/health",) if runtime == "tensorfold" else ("/metrics",))  # incl. tensorfold-prometheus
     deadline = time.monotonic() + 3
     for index, path in enumerate(paths):
         remaining = deadline - time.monotonic()
@@ -511,9 +536,10 @@ class AllocationCollector:
         while not self.done.is_set():
             started = time.monotonic()
             try:
-                body = self.fetch(self.allocation["endpoint"], self.allocation["runtime"])
+                contract = self.allocation.get("metrics_contract") or self.allocation["runtime"]
+                body = self.fetch(self.allocation["endpoint"], contract)
                 metrics, supported = accumulator.update(body, time.monotonic(), self.allocation.get("served_name"),
-                                                        self.allocation["runtime"])
+                                                        contract)
                 with self.lock:
                     self.metrics = metrics
                     self.sampled_at, self.received_at = time.time(), time.monotonic()
@@ -544,7 +570,7 @@ class Monitor:
                  allocation_factory=AllocationCollector):
         if not math.isfinite(interval) or interval < 0.25:
             raise ValueError("monitor interval must be finite and at least 0.25 seconds")
-        self.interval, self.status_fn = interval, status_fn or StatusCommand()
+        self.interval, self.status_fn, self.cfg = interval, status_fn or StatusCommand(), cfg
         self.hosts = [host_factory(cfg, node, interval) for node in ("head", "worker")]
         self.allocation_factory, self.allocations = allocation_factory, {}
         self.done, self.lock = threading.Event(), threading.Lock()
@@ -575,8 +601,11 @@ class Monitor:
                             or self.status_error is not None)
             status_error = self.status_error
         current = allocations_from_status(status)
+        for item in current:
+            item["metrics_contract"] = metrics_contract(self.cfg, item)
         wanted = {allocation_identity(item): item for item in current
-                  if item["ready"] and not status_stale and item["runtime"] in SUPPORTED_RUNTIMES}
+                  if item["ready"] and not status_stale and item["runtime"] in SUPPORTED_RUNTIMES
+                  and item["metrics_contract"] in METRICS_CONTRACTS}
         for identity in list(self.allocations):
             if identity not in wanted:
                 self.allocations.pop(identity).stop()
@@ -590,10 +619,13 @@ class Monitor:
             if collector:
                 allocation.update(collector.snapshot(now))
             else:
-                supported = allocation["runtime"] in SUPPORTED_RUNTIMES
+                supported = (allocation["runtime"] in SUPPORTED_RUNTIMES
+                             and allocation["metrics_contract"] in METRICS_CONTRACTS)
                 allocation.update(metrics_state="unavailable" if supported else "unsupported",
                                   sampled_at=None, error=status_error or ("Allocation status is stale" if status_stale
                                                                        else "Allocation is not ready" if supported
+                                                                       else f"Metrics contract {allocation['metrics_contract']!r} is not supported"
+                                                                       if allocation["runtime"] in SUPPORTED_RUNTIMES
                                                                        else "Runtime metrics are not supported"),
                                   metrics=dict.fromkeys(METRIC_KEYS))
             if status_stale:

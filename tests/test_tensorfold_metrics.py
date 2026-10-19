@@ -202,3 +202,96 @@ def test_benchmark_identity_records_tensorfold_settings_and_fallback(explicit_ru
         "engine": "tensorfold", "image": "image@sha256:pinned", "max_model_len": 262144, "settings_source": "catalog",
         "settings": {"parallel": 4, "kv_dtype": "int8", "vision": True, "model_revision": "a" * 40}}
     assert identity["allocation"]["containers"][0]["image"] == "immutable-image"
+
+
+# Qwen zig-flashnext build: Prometheus /metrics with native families and vLLM-named mirrors.
+QWEN_TF_METRICS = """\
+# TYPE tensorfold:requests_running gauge
+tensorfold:requests_running {running}
+tensorfold:num_requests_running {running}
+tensorfold:requests_waiting 1
+tensorfold:num_requests_waiting 1
+tensorfold:kv_cache_usage_ratio{{pool="0"}} 0.25
+tensorfold:kv_cache_usage_perc{{pool="0"}} 0.25
+tensorfold:prompt_tokens_total {prompt}
+tensorfold:generation_tokens_total {generated}
+tensorfold:generation_tokens_running {live}
+tensorfold:time_to_first_token_seconds_sum {ttft_sum}
+tensorfold:time_to_first_token_seconds_count {count}
+tensorfold:request_time_per_output_token_seconds_sum {tpot_sum}
+tensorfold:request_time_per_output_token_seconds_count {count}
+tensorfold:mtp_accepted_total 7
+vllm:num_requests_running 99
+"""
+
+
+def qwen_body(**values):
+    base = dict(running=2, prompt=1000, generated=500, live=0, ttft_sum=1.0, tpot_sum=0.04, count=2)
+    return QWEN_TF_METRICS.format(**{**base, **values})
+
+
+def test_tensorfold_prometheus_contract_maps_vllm_named_mirrors_once():
+    from spark_serve_monitor import InferenceMetrics
+    metrics = InferenceMetrics(max_gap=10)
+    first, supported = metrics.update(qwen_body(), 100.0, runtime="tensorfold-prometheus")
+    assert supported
+    # Mirrors counted once (not 2 + 2), foreign vllm: lines ignored, ratio shown as percent.
+    assert (first["requests_running"], first["requests_waiting"], first["kv_cache_percent"]) == (2, 1, 25.0)
+    assert first["generation_tokens_per_second"] is None  # rates need a second sample
+    second, _ = metrics.update(qwen_body(prompt=1400, generated=700, ttft_sum=1.6, tpot_sum=0.07, count=4),
+                               102.0, runtime="tensorfold-prometheus")
+    assert second["prompt_tokens_per_second"] == 200.0
+    assert second["generation_tokens_per_second"] == 100.0
+    assert round(second["ttft_seconds"], 6) == 0.3
+    assert round(second["tpot_seconds"], 6) == 0.015
+    assert second["requests_per_second"] is None  # no completed-request counter in this build
+
+
+def test_tensorfold_prometheus_contract_fetches_metrics_path(monkeypatch):
+    import spark_serve_monitor as monitor
+    seen = []
+    monkeypatch.setattr(monitor, "_fetch_metrics_path", lambda endpoint, path, timeout: seen.append(path) or "")
+    monitor.fetch_metrics("http://head:8000", "tensorfold-prometheus")
+    monitor.fetch_metrics("http://head:8000", "tensorfold")
+    assert seen == ["/metrics", "/health"]
+
+
+def test_qwen_health_shape_on_glm_contract_names_the_fix():
+    from spark_serve_monitor import parse_tensorfold_health
+    import pytest
+    with pytest.raises(ValueError, match="tensorfold-prometheus"):
+        parse_tensorfold_health('{"status": "ok", "live": {"waiting": 0}}')
+
+
+def test_catalog_contract_overrides_runtime_and_unknown_contract_is_unsupported():
+    from spark_serve_monitor import Monitor, metrics_contract
+    cfg = {"models": {"qwen-tf": {"metrics_contract": "tensorfold-prometheus"}, "odd": {"metrics_contract": "mystery"}}}
+    assert metrics_contract(cfg, {"model": "qwen-tf", "runtime": "tensorfold"}) == "tensorfold-prometheus"
+    assert metrics_contract(cfg, {"model": "glm-tf", "runtime": "tensorfold"}) == "tensorfold"
+
+    node = {"host": "h", "node": "head", "model": "odd", "ready": True, "runtime": "tensorfold",
+            "url": "http://h:8000", "allocation_id": "a", "allocation_hosts": ["h"], "phase": "ready"}
+
+    class Host:
+        def __init__(self, *a): pass
+        def snapshot(self, now): return {}
+
+    started = []
+    monitor = Monitor(cfg, status_fn=lambda: {"nodes": [node]}, host_factory=Host,
+                      allocation_factory=lambda allocation, interval: started.append(allocation))
+    monitor.status, monitor.status_at = {"nodes": [node]}, __import__("time").monotonic()
+    allocation = monitor.snapshot()["allocations"][0]
+    assert started == []
+    assert allocation["metrics_state"] == "unsupported" and "mystery" in allocation["error"]
+
+
+def test_tensorfold_prometheus_decode_rate_moves_while_requests_run():
+    from spark_serve_monitor import InferenceMetrics
+    metrics = InferenceMetrics(max_gap=10)
+    metrics.update(qwen_body(generated=500, live=0), 100.0, runtime="tensorfold-prometheus")
+    # Mid-request: nothing finished, but 120 tokens are held by a live stream.
+    during, _ = metrics.update(qwen_body(generated=500, live=120), 102.0, runtime="tensorfold-prometheus")
+    assert during["generation_tokens_per_second"] == 60.0
+    # The request finishes: its 200 tokens move into the total; the sum stays continuous.
+    after, _ = metrics.update(qwen_body(generated=700, live=0), 104.0, runtime="tensorfold-prometheus")
+    assert after["generation_tokens_per_second"] == 40.0
