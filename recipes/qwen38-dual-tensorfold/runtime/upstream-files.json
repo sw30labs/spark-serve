@@ -1,0 +1,14 @@
+{
+  "repository": "https://github.com/MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold",
+  "revision": "be3ed857ab1055ca47b36134d22691f00f2bb94a",
+  "tensorfold_repository": "https://github.com/ashhart/TensorFold",
+  "tensorfold_revision": "db281878ddb836fd0df510d8771ecb7e0fe47d26",
+  "files": {
+    "CREDITS.md": "b8ebb033aac973358ac4565daf9d82d164e1b327825ed31f7db160fd307ec277",
+    "LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    "NOTICE": "af31508392aec270f2bf1f322fc9eb3b00005584afc782051172907a43332f1a",
+    "TENSORFOLD-LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    "TENSORFOLD-NOTICE": "74b59811a5ebc3c28e7fc89f8f189854b6ca6d44392a98394950b24ba3c1b8e7",
+    "TENSORFOLD-THIRD_PARTY_NOTICES.md": "05016d9737ce407073594e986c96441df63ac501df82b1ccfb8de8c4f8d0c33e"
+  }
+}

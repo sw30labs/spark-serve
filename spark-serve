@@ -58,7 +58,7 @@ from spark_serve_controller import (
 from spark_serve_nodes import launch_config, node_url, placement
 from spark_serve_nim import validate_nim_plan, nim_docker_argv, parse_nim_primary_node
 from spark_serve_tensorfold import (
-    validate_tensorfold_plan, tensorfold_docker_argv, tensorfold_health_ready,
+    validate_tensorfold_plan, tensorfold_docker_argv, tensorfold_model_ready,
 )
 
 HERE = Path(__file__).resolve().parent
@@ -694,7 +694,7 @@ def probe_ready_path(cfg: dict, model: dict, timeout: int = 4) -> bool:
     )
     return proc.returncode == 0 and (
         model.get("wrapper") != "tensorfold"
-        or tensorfold_health_ready(proc.stdout, model.get("max_model_len"))
+        or tensorfold_model_ready(proc.stdout, model)
     )
 
 
@@ -1144,7 +1144,7 @@ def wait_ready(
             timeout=14,
         )
         health_ok = (health_model is None or health_model.get("wrapper") != "tensorfold"
-                     or tensorfold_health_ready(proc.stdout, health_model.get("max_model_len")))
+                     or tensorfold_model_ready(proc.stdout, health_model))
         if proc.returncode == 0 and health_ok:
             body = probe_v1(cfg, timeout=4)
             ids = parse_v1_ids(body)
@@ -1317,6 +1317,7 @@ def cmd_pull(cfg: dict, name: str, node: str | None = None) -> None:
                    "qwen38-tensorfold": "prepare_qwen38_tensorfold.py",
                    "glm53-tensorfold": "prepare_glm53_tensorfold.py",
                    "qwen38-dual": "prepare_qwen38_dual.py",
+                   "qwen38-dual-tensorfold": "prepare_qwen38_dual_tensorfold.py",
                    "dsv41-exl3": "prepare_dsv41_exl3.py"}
         if recipe not in scripts:
             die(f"unknown preparation recipe {recipe!r} for {mid}")

@@ -27,6 +27,13 @@ _GLM_MANIFEST_SHA256 = "2967c429558c6dfbf69374db14591e07c754f7b32f69b2d4b1e02cf3
 _GLM_SETTINGS = {"model_revision", "draft_revision", "parallel", "kv_dtype", "dense", "drafter",
                  "vision", "vision_urls", "thinking", "temperature", "top_p", "top_k", "max_tokens",
                  "communication", "master_port"}
+_QWEN_DUAL_RUNTIME = "/opt/spark-serve/qwen38-dual-tensorfold"
+_QWEN_DUAL_REPOSITORY = "nvidia/Qwen3.8-Flash-Next-NVFP4"
+_QWEN_DUAL_REVISION = "fc694b54fb0174e0913e6adf86691ef85a4ead47"
+_QWEN_DUAL_MANIFEST_SHA256 = "a3ec3c29bb6f68217a1f109c5ee02b89cf4fdfa1158f4e1626acb2343334d8ad"
+_QWEN_DUAL_SETTINGS = {"model_revision", "parallel", "kv_dtype", "drafts", "vision", "vision_urls", "max_images",
+                       "max_videos", "thinking", "max_tokens", "roce", "master_port"}
+_NATIVE_YARN_CONTEXT = 262144
 
 
 @dataclass(frozen=True)
@@ -74,6 +81,8 @@ def _number(value, name, low, high):
 def validate_tensorfold_plan(cfg: dict, mid: str, rank: int = 0) -> TensorFoldPlan:
     if cfg["models"][mid].get("recipe") == "glm53-tensorfold":
         return _validate_glm_plan(cfg, mid, rank)
+    if cfg["models"][mid].get("recipe") == "qwen38-dual-tensorfold":
+        return _validate_qwen_dual_plan(cfg, mid, rank)
     _integer(rank, "rank", 0, 0)
     return _validate_qwen_plan(cfg, mid)
 
@@ -144,18 +153,19 @@ def _validate_qwen_plan(cfg: dict, mid: str) -> TensorFoldPlan:
                           str(PurePosixPath(cache) / "spark-serve/qwen38-tensorfold/runtime-cache"), tuple(argv))
 
 
-def _validate_glm_plan(cfg: dict, mid: str, rank: int) -> TensorFoldPlan:
+def _two_rank_model(cfg: dict, mid: str, rank: int, name: str, allowed: set[str]):
+    """Common TP2 identity: image, container, two hosts and this rank's cache."""
     cluster, model = cfg["cluster"], cfg["models"][mid]
     if model.get("wrapper") != "tensorfold":
-        raise ControllerError("GLM TensorFold requires wrapper=tensorfold")
+        raise ControllerError(f"{name} requires wrapper=tensorfold")
     _integer(rank, "rank", 0, 1)
     _integer(model.get("nnodes"), "nnodes", 2, 2)
     _integer(model.get("tensor_parallel"), "tensor_parallel", 2, 2)
     if model.get("ready_path") != "/health":
         raise ControllerError("TensorFold ready_path must be /health")
     settings = model.get("tensorfold")
-    if not isinstance(settings, dict) or set(settings) - _GLM_SETTINGS:
-        raise ControllerError("GLM TensorFold requires a table containing only supported settings")
+    if not isinstance(settings, dict) or set(settings) - allowed:
+        raise ControllerError(f"{name} requires a table containing only supported settings")
     if (model.get("docker_extra") or model.get("mounts") or model.get("env") or model.get("vllm")
             or model.get("skip_default_cache_mount")):
         raise ControllerError("TensorFold uses its validated plan; Docker/mount/environment/vLLM overrides are unsupported")
@@ -167,12 +177,49 @@ def _validate_glm_plan(cfg: dict, mid: str, rank: int) -> TensorFoldPlan:
         raise ControllerError("TensorFold container must be a Docker container name")
     hosts = tuple(_text(cluster.get(role), role) for role in ("head", "worker"))
     if hosts[0] == hosts[1] or any(h.startswith("-") or any(c.isspace() for c in h) for h in hosts):
-        raise ControllerError("GLM TensorFold requires two distinct valid SSH hosts")
+        raise ControllerError(f"{name} requires two distinct valid SSH hosts")
     cache = _path((cluster.get("worker_hf_cache_host") or cluster.get("hf_cache_host"))
                   if rank else cluster.get("hf_cache_host"), "hf_cache_host")
     mount = _path(model.get("hf_mount", "/cache/huggingface"), "hf_mount")
     if mount != "/cache/huggingface":
         raise ControllerError("TensorFold hf_mount must be /cache/huggingface")
+    return model, settings, image, container, hosts, cache, mount
+
+
+def _fabric(cluster: dict, settings: dict, name: str) -> tuple[str, int, dict[str, str]]:
+    """The head's rendezvous address and port, and the RoCE NCCL environment."""
+    master = _text(cluster.get("master_addr"), "master_addr")
+    try:
+        address = ipaddress.IPv4Address(master)
+        if address.is_loopback or address.is_unspecified or address.is_multicast:
+            raise ValueError("unreachable rendezvous")
+    except ValueError as exc:
+        raise ControllerError(f"{name} master_addr must be the head's reachable fabric IPv4 address") from exc
+    nccl = cluster.get("nccl") or {}
+    interface = _text(nccl.get("NCCL_SOCKET_IFNAME"), "NCCL_SOCKET_IFNAME")
+    hcas = _text(nccl.get("NCCL_IB_HCA"), "NCCL_IB_HCA").removeprefix("=")
+    gid = _text(nccl.get("NCCL_IB_GID_INDEX"), "NCCL_IB_GID_INDEX")
+    if (not re.fullmatch(r"[A-Za-z0-9_.:-]+", interface)
+            or not re.fullmatch(r"[A-Za-z0-9_.:-]+(?:,[A-Za-z0-9_.:-]+)*", hcas)
+            or not gid.isdigit() or not 0 <= int(gid) <= 255):
+        raise ControllerError(f"{name} requires explicit fabric interface, HCAs and RoCE GID index")
+    master_port = _integer(settings.get("master_port", 29551), "master_port")
+    if master_port == _integer(cluster.get("port", 8000), "port"):
+        raise ControllerError("TensorFold master_port must differ from the API port")
+    environment = {"NCCL_SOCKET_IFNAME": interface, "NCCL_IB_HCA": hcas, "NCCL_IB_GID_INDEX": gid,
+                   "NCCL_MIN_NCHANNELS": "4", "NCCL_MAX_NCHANNELS": "4"}
+    if "NCCL_DEBUG" in nccl:
+        debug = _text(nccl["NCCL_DEBUG"], "NCCL_DEBUG")
+        if debug not in ("VERSION", "WARN", "INFO", "TRACE"):
+            raise ControllerError("unsupported TensorFold NCCL_DEBUG")
+        environment["NCCL_DEBUG"] = debug
+    return master, master_port, environment
+
+
+def _validate_glm_plan(cfg: dict, mid: str, rank: int) -> TensorFoldPlan:
+    cluster = cfg["cluster"]
+    model, settings, image, container, hosts, cache, mount = _two_rank_model(
+        cfg, mid, rank, "GLM TensorFold", _GLM_SETTINGS)
     if (model.get("hf_id") != _GLM_REPOSITORY or settings.get("model_revision") != _GLM_REVISION
             or settings.get("draft_revision") != _GLM_DRAFT_REVISION):
         raise ControllerError("GLM TensorFold requires its pinned target and draft checkpoints")
@@ -200,25 +247,8 @@ def _validate_glm_plan(cfg: dict, mid: str, rank: int) -> TensorFoldPlan:
             raise ControllerError(f"TensorFold {key} must be a boolean")
     if settings.get("vision_urls", False) and not settings.get("vision", True):
         raise ControllerError("TensorFold vision_urls requires vision")
-    master = _text(cluster.get("master_addr"), "master_addr")
-    try:
-        address = ipaddress.IPv4Address(master)
-        if address.is_loopback or address.is_unspecified or address.is_multicast:
-            raise ValueError("unreachable rendezvous")
-    except ValueError as exc:
-        raise ControllerError("GLM TensorFold master_addr must be the head's reachable fabric IPv4 address") from exc
-    nccl = cluster.get("nccl") or {}
-    interface = _text(nccl.get("NCCL_SOCKET_IFNAME"), "NCCL_SOCKET_IFNAME")
-    hcas = _text(nccl.get("NCCL_IB_HCA"), "NCCL_IB_HCA").removeprefix("=")
-    gid = _text(nccl.get("NCCL_IB_GID_INDEX"), "NCCL_IB_GID_INDEX")
-    if (not re.fullmatch(r"[A-Za-z0-9_.:-]+", interface)
-            or not re.fullmatch(r"[A-Za-z0-9_.:-]+(?:,[A-Za-z0-9_.:-]+)*", hcas)
-            or not gid.isdigit() or not 0 <= int(gid) <= 255):
-        raise ControllerError("GLM TensorFold requires explicit fabric interface, HCAs and RoCE GID index")
-    master_port = _integer(settings.get("master_port", 29551), "master_port")
+    master, master_port, fabric = _fabric(cluster, settings, "GLM TensorFold")
     api_port = _integer(cluster.get("port", 8000), "port")
-    if master_port == api_port:
-        raise ControllerError("TensorFold master_port must differ from the API port")
     argv = [serve, "--backend", "cuda", "--tp", "2", "--rank", str(rank),
             "--master", master, "--master-port", str(master_port),
             "--drafter", root + "/models/draft/" + _GLM_DRAFT_REVISION if drafter == "dflash2" else "none",
@@ -237,8 +267,8 @@ def _validate_glm_plan(cfg: dict, mid: str, rank: int) -> TensorFoldPlan:
             argv.append("--vision-urls")
     window = 64 if parallel > 4 else 32
     environment = {
-        "NCCL_SOCKET_IFNAME": interface, "NCCL_IB_HCA": hcas, "NCCL_IB_GID_INDEX": gid,
-        "NCCL_MIN_NCHANNELS": "4", "NCCL_MAX_NCHANNELS": "4",
+        **{key: fabric[key] for key in ("NCCL_SOCKET_IFNAME", "NCCL_IB_HCA", "NCCL_IB_GID_INDEX",
+                                        "NCCL_MIN_NCHANNELS", "NCCL_MAX_NCHANNELS")},
         "TF_GLM_KV": "fp8", "TF_GLM_DENSE": "q4", "TF_GLM_COMM": communication,
         "TF_GLM_MTP": "auto", "TF_ROCE_MAX_KB": str(window * 16), "TF_ROCE_WAIT_S": "300",
         "TF_GLM_COPY_DRAFTS": "1", "TF_GLM_COPY_MAX": "15", "TF_GLM_DFLASH_POLICY": "fnc7:0.3",
@@ -251,14 +281,85 @@ def _validate_glm_plan(cfg: dict, mid: str, rank: int) -> TensorFoldPlan:
         "TF_GLM_DISPLAY_KV_MIB": "0",
         "TENSORFOLD_MEMORY_RESERVE_GIB": str(round(14.5 + max(0, parallel - 4) * 0.95 + (window - 32) * 0.04, 1)),
     }
-    if "NCCL_DEBUG" in nccl:
-        debug = _text(nccl["NCCL_DEBUG"], "NCCL_DEBUG")
-        if debug not in ("VERSION", "WARN", "INFO", "TRACE"):
-            raise ControllerError("unsupported TensorFold NCCL_DEBUG")
-        environment["NCCL_DEBUG"] = debug
+    if "NCCL_DEBUG" in fabric:
+        environment["NCCL_DEBUG"] = fabric["NCCL_DEBUG"]
     return TensorFoldPlan(mid, image, container, hosts[rank], cache, mount,
                           str(PurePosixPath(cache) / "spark-serve/glm53-tensorfold/runtime-cache"),
                           tuple(argv), _GLM_RUNTIME, hosts, tuple(environment.items()), rank)
+
+
+def native_memory_need_gib(context: int, kv_dtype: str, vision: bool) -> int:
+    """Upstream's measured MemAvailable floor for one native rank at start.
+
+    Measured on two Sparks with NVFP4 (2026-10-07): ~48 GiB fixed, KV held from
+    the start (9 GiB per million tokens in FP8, 17 in BF16), ~31 GiB per million
+    prompt tokens during prefill, 2 GiB vision workspace, the 10 GiB engine
+    reserve and 2 GiB of slack.
+    """
+    kv = 9 if kv_dtype == "fp8" else 17
+    return 48 + (2 if vision else 0) + ((kv + 31) * context + 1048575) // 1048576 + 10 + 2
+
+
+def _validate_qwen_dual_plan(cfg: dict, mid: str, rank: int) -> TensorFoldPlan:
+    cluster = cfg["cluster"]
+    model, settings, image, container, hosts, cache, mount = _two_rank_model(
+        cfg, mid, rank, "Qwen dual TensorFold", _QWEN_DUAL_SETTINGS)
+    if model.get("hf_id") != _QWEN_DUAL_REPOSITORY or settings.get("model_revision") != _QWEN_DUAL_REVISION:
+        raise ControllerError("Qwen dual TensorFold requires the pinned NVIDIA NVFP4 checkpoint")
+    serve = str(PurePosixPath(mount) / "hub" / ("models--" + _QWEN_DUAL_REPOSITORY.replace("/", "--"))
+                / "snapshots" / _QWEN_DUAL_REVISION)
+    if model.get("serve_path") != serve:
+        raise ControllerError("Qwen dual TensorFold serve_path must identify the pinned HF snapshot")
+    if model.get("preflight_args") != [_QWEN_DUAL_RUNTIME + "/verify.py", serve, "--expected-manifest-sha256",
+                                      _QWEN_DUAL_MANIFEST_SHA256, "--verify-runtime"]:
+        raise ControllerError("Qwen dual TensorFold preflight must authenticate its checkpoint and runtime")
+    parallel = _integer(settings.get("parallel", 16), "parallel", 1, 16)
+    if _integer(model.get("max_num_seqs", parallel), "max_num_seqs", 1, 16) != parallel:
+        raise ControllerError("TensorFold max_num_seqs must match parallel")
+    context = _integer(model.get("max_model_len"), "max_model_len", 1, 1048576)
+    kv = settings.get("kv_dtype", "fp8")
+    if kv not in ("fp8", "bf16"):
+        raise ControllerError("Qwen dual TensorFold kv_dtype must be fp8 or bf16")
+    for key in ("drafts", "vision", "vision_urls", "thinking", "roce"):
+        if key in settings and not isinstance(settings[key], bool):
+            raise ControllerError(f"TensorFold {key} must be a boolean")
+    vision = settings.get("vision", True)
+    if settings.get("vision_urls", False) and not vision:
+        raise ControllerError("TensorFold vision_urls requires vision")
+    master, master_port, fabric = _fabric(cluster, settings, "Qwen dual TensorFold")
+    # Both ranks take the same command, as upstream's start.sh runs them; only
+    # rank 0 serves HTTP.
+    argv = [serve, "--name", _text(model.get("served_name"), "served_name"), "--host", "0.0.0.0",
+            "--port", str(_integer(cluster.get("port", 8000), "port")),
+            "--context", str(context), "--parallel", str(parallel),
+            "--max-tokens", str(_integer(settings.get("max_tokens", 32768), "max_tokens", 1, 1048576)),
+            "--thinking" if settings.get("thinking", True) else "--no-thinking"]
+    if not settings.get("drafts", True):
+        argv.append("--no-drafts")
+    argv += ["--kv-dtype", kv]
+    images = _integer(settings.get("max_images", 50), "max_images", 1, 50)
+    if vision:
+        argv += ["--vision", "--vision-max-images", str(images),
+                 "--vision-max-videos", str(_integer(settings.get("max_videos", 4), "max_videos", 0, 16)),
+                 "--vision-image-tokens", "16384"]
+        if settings.get("vision_urls", False):
+            argv.append("--vision-urls")
+    argv += ["--tp", "2", "--rank", str(rank), "--master", master, "--master-port", str(master_port)]
+    environment = {
+        **fabric,
+        "TENSORFOLD_CUDA_KERNELS": "/opt/tensorfold/share/tensorfold/cuda/sm121",
+        # Qwen's documented YaRN (factor 4) past the native 262,144 window.
+        "TF_FLASHNEXT_YARN": "4" if context > _NATIVE_YARN_CONTEXT else "0",
+        "TF_FLASHNEXT_ROCE": "1" if settings.get("roce", True) else "0",
+        "TF_FLASHNEXT_L2PF": "1", "TF_FLASHNEXT_DEPTH": "15",
+        "TENSORFOLD_MAX_IMAGES": str(images), "TENSORFOLD_IMAGE_TOKENS": "16384",
+        "TENSORFOLD_VIDEO_TOKENS": "16384", "TENSORFOLD_VISION_WORKSPACE_MIB": "2048",
+        "TENSORFOLD_MEMORY_RESERVE_GIB": "10",
+        "SPARK_SERVE_MIN_AVAILABLE_GIB": str(native_memory_need_gib(context, kv, vision)),
+    }
+    return TensorFoldPlan(mid, image, container, hosts[rank], cache, mount,
+                          str(PurePosixPath(cache) / "spark-serve/qwen38-dual-tensorfold/runtime-cache"),
+                          tuple(argv), _QWEN_DUAL_RUNTIME, hosts, tuple(environment.items()), rank)
 
 
 def tensorfold_docker_argv(plan: TensorFoldPlan, generation: str = "") -> list[str]:
@@ -282,7 +383,7 @@ def tensorfold_docker_argv(plan: TensorFoldPlan, generation: str = "") -> list[s
         "TENSORFOLD_VISION_WORKSPACE_MIB": "0", "TENSORFOLD_MAX_IMAGES": "50", "TENSORFOLD_IMAGE_TOKENS": "16384",
         "TENSORFOLD_VIDEO_TOKENS": "16384", "TENSORFOLD_MTP_COPY": "1",
     }
-    if plan.runtime == _GLM_RUNTIME:
+    if plan.runtime in (_GLM_RUNTIME, _QWEN_DUAL_RUNTIME):
         command += ["--shm-size", "16g", "--device", "/dev/infiniband", "--cap-add", "IPC_LOCK"]
         environment = {key: value for key, value in environment.items()
                        if not key.startswith("TENSORFOLD_") or key == "TENSORFOLD_NO_UPDATE_CHECK"}
@@ -318,3 +419,28 @@ def tensorfold_health_ready(body: str, context: int | None = None) -> bool:
         return health["busy"] == (health["requests_running"] > 0)
     except (ValueError, TypeError, OverflowError, RecursionError):
         return False
+
+
+def tensorfold_native_health_ready(body: str, served_name: str) -> bool:
+    """The Zig server's /health: it listens only after both ranks load.
+
+    Ready means the configured model is served and graph warming has ended.
+    The schema has no context or counters; /metrics carries those.
+    """
+    try:
+        if not isinstance(body, str) or len(body) > 65536:
+            return False
+        health = json.loads(body)
+        if not isinstance(health, dict) or health.get("status") != "ok" or health.get("model") != served_name:
+            return False
+        lanes = health.get("max_batch_size")
+        return health.get("warming") is False and type(lanes) is int and lanes > 0
+    except (ValueError, TypeError, OverflowError, RecursionError):
+        return False
+
+
+def tensorfold_model_ready(body: str, model: dict) -> bool:
+    """Dispatch on the catalog recipe: the native engine has its own schema."""
+    if model.get("recipe") == "qwen38-dual-tensorfold":
+        return tensorfold_native_health_ready(body, model.get("served_name"))
+    return tensorfold_health_ready(body, model.get("max_model_len"))

@@ -66,6 +66,7 @@ cp models.example.toml models.toml   # then edit [cluster]
 | DeepSeek-V4-Flash | 2 | 1M | [Startup and recovery](docs/ds4-startup-recovery.md) |
 | DeepSeek-v4.1-Flash EXL3 | 2 | 600K | [Pinned EXL3 2.9bpw trial](docs/dsv41-exl3.md) |
 | Qwen3.8-Flash-Next NVFP4, dual Spark | 2 | 262K | [TP2+EP+MTP3 vLLM trial](docs/qwen38-dual.md) |
+| Qwen3.8-Flash-Next NVFP4, TensorFold | 2 | 1M | [Native Zig engine, 16 streams, FP8 KV](docs/qwen38-dual-tensorfold.md) |
 | GLM-5.3-Flash NVFP4 | 2 | 128K | [Locally corrected NIM; qualified pilot](docs/glm53-nvfp4.md) |
 | GLM-5.3-Flash EXL3 | 2 | 850K | [Pinned EXL3 and DFlash2 trial](docs/glm53-exl3.md) |
 | GLM-5.3-Flash EXL3, TensorFold | 2 | 1M | [Four-stream FP8 KV recipe](docs/glm53-tensorfold.md) |
@@ -95,6 +96,14 @@ parallelism and MTP3. Prepare it with `./spark-serve pull qwen38-dual --node bot
 then start with `./spark-serve up qwen38-dual --node both --no-hermes`.
 It reuses the pinned NVIDIA checkpoint on both nodes; live qualification is
 pending. See the [dual-Spark recipe](docs/qwen38-dual.md).
+
+`qwen38-dual-tensorfold` serves the same NVIDIA weights through MiaAI-Lab's
+two-Spark recipe for TensorFold's native Zig engine: 16 streams, FP8 KV, MTP
+drafts and a 1M-token context with YaRN. Prepare it with
+`./spark-serve pull qwen38-dual-tensorfold --node both`, then start with
+`./spark-serve up qwen38-dual-tensorfold --node both --no-hermes`. Each rank
+needs about 102 GiB free at start. See the
+[recipe](docs/qwen38-dual-tensorfold.md); live qualification is pending.
 
 `glm53-tensorfold` adds MiaAI-Lab's two-Spark TensorFold recipe with a pinned
 EXL3 checkpoint, DFlash2 and copy drafts, four streams, FP8 KV, and a native
@@ -369,6 +378,11 @@ Pinned sources and retained notices are documented in the
 The GLM TensorFold integration credits [MiaAI-Lab's dual-Spark recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold)
 and [Ash Hart's TensorFold engine](https://github.com/ashhart/TensorFold).
 Pinned patches and notices are retained under [recipes/glm53-tensorfold](recipes/glm53-tensorfold/).
+
+The native Qwen TensorFold integration credits [MiaAI-Lab's dual-Spark recipe](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold)
+and [Ash Hart's TensorFold engine](https://github.com/ashhart/TensorFold), whose
+Zig CUDA serving path was authored by Jürgen Schmied. Patch hashes and notices are
+retained under [recipes/qwen38-dual-tensorfold](recipes/qwen38-dual-tensorfold/).
 
 The DeepSeek-V4.1 EXL3 recipe uses MiaAI-Lab's
 [published image](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-EXL3-2x-DGX-Sparks)

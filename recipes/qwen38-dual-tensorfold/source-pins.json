@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "recipe_url": "https://mia-ai.net/models/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold",
+  "upstream_url": "https://github.com/MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold",
+  "upstream_revision": "be3ed857ab1055ca47b36134d22691f00f2bb94a",
+  "tensorfold_url": "https://github.com/ashhart/TensorFold",
+  "tensorfold_revision": "db281878ddb836fd0df510d8771ecb7e0fe47d26",
+  "tensorfold_engine": "tensorfold-native (Zig, branch zig-flashnext)",
+  "base_image": "ghcr.io/miaai-lab/qwen3.8-flash-dual-dgx-sparks-tensorfold@sha256:e188128ddabdc67ac02c05781f5c0c6b348db5f050cac297861d82b7f086e18c",
+  "base_platform": "linux/arm64",
+  "base_config_digest": "sha256:5eb5d4d384773543109baa26783fc6ea38ad619dff330f01672e05c01721cfb0",
+  "base_compressed_bytes": 11383284872,
+  "upstream_image_tag": "zig-db28187-f3e1300f4f62",
+  "patches_hash": "f3e1300f4f62",
+  "local_image": "spark-serve-qwen38-dual-tensorfold:zig-db28187-f3e1300",
+  "manifest_sha256": "a3ec3c29bb6f68217a1f109c5ee02b89cf4fdfa1158f4e1626acb2343334d8ad",
+  "checkpoint_revision": "fc694b54fb0174e0913e6adf86691ef85a4ead47",
+  "runtime_sha256": {
+    "runtime/Dockerfile": "1afa93016558877a020e01df0d118180532466b8fd539c9df2aeb8f92f03edfe",
+    "runtime/check_compatibility.py": "a0b2c7b95d54e5190db7e2b4ecf72f5cc293b3830df1652b732dd2b3b4bfec1a",
+    "runtime/entrypoint.sh": "e6ed946a4cb24285e4d0bd7ddc6fd644cc42d804a1e690835b42cb4abe4869b4",
+    "runtime/installed-runtime.json": "f2840aa1bf35855f408b11a194da58456c7c7d6749ce138973208e965cffb6f6",
+    "runtime/upstream/CREDITS.md": "b8ebb033aac973358ac4565daf9d82d164e1b327825ed31f7db160fd307ec277",
+    "runtime/upstream/LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    "runtime/upstream/NOTICE": "af31508392aec270f2bf1f322fc9eb3b00005584afc782051172907a43332f1a",
+    "runtime/upstream/TENSORFOLD-LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    "runtime/upstream/TENSORFOLD-NOTICE": "74b59811a5ebc3c28e7fc89f8f189854b6ca6d44392a98394950b24ba3c1b8e7",
+    "runtime/upstream/TENSORFOLD-THIRD_PARTY_NOTICES.md": "05016d9737ce407073594e986c96441df63ac501df82b1ccfb8de8c4f8d0c33e",
+    "runtime/upstream-files.json": "7671b25d774851c2cc97e56bb709da2acebdea3452a71e7d772a41108ed7cd60",
+    "runtime/verify_runtime.py": "b73163687ddfb93073c14dea71ca0526c9517b5917fed5a70f3d2ffcb9949285"
+  },
+  "preparation_sha256": {
+    "verify.py": "19cabbec32659e96e606d9590f57791d427b5ec35a87b58ef8c6bff5d6fe50f6",
+    "prepare_transfer.py": "216b22b53bc96bf0650ee0d7e7a257db0c21f1cc9b6418997c153d4f3291e615"
+  },
+  "policy": {
+    "checkpoint": "Reuse the authenticated NVIDIA NVFP4 snapshot shared with qwen38-dual, preserving ordinary HF blob links.",
+    "runtime": "Upstream's published native image by digest; 933 installed files authenticated at build, preflight and launch.",
+    "context": "Upstream defaults: 1,048,576 tokens with Qwen YaRN x4 past 262,144, 16 streams, FP8 KV.",
+    "memory": "Each rank refuses to start below upstream's measured MemAvailable floor for the configured window.",
+    "qualification": "Local Docker build, GPU startup, quality and performance qualification pending."
+  }
+}

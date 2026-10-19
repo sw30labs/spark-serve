@@ -563,3 +563,45 @@ args = [
   "--speculative-config", '{"method":"mtp","num_speculative_tokens":3,"use_local_argmax_reduction":true,"disable_eagle_block_drop":true,"index_share_for_mtp_iteration":true}',
   "--compilation-config", '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}',
 ]
+
+# MiaAI-Lab native TensorFold (Zig) TP2 recipe on the same NVIDIA NVFP4 weights as qwen38-dual.
+# Prepare: ./spark-serve pull qwen38-dual-tensorfold --node both
+# Start: ./spark-serve up qwen38-dual-tensorfold --node both --no-hermes
+[models.qwen38-dual-tensorfold]
+aliases = ["qwen-dual-tf", "qwen38-tf2"]
+label = "Qwen3.8-Flash-Next NVFP4 TensorFold dual Spark"
+image = "spark-serve-qwen38-dual-tensorfold:zig-db28187-f3e1300"
+recipe = "qwen38-dual-tensorfold"
+hf_id = "nvidia/Qwen3.8-Flash-Next-NVFP4"
+serve_path = "/cache/huggingface/hub/models--nvidia--Qwen3.8-Flash-Next-NVFP4/snapshots/fc694b54fb0174e0913e6adf86691ef85a4ead47"
+served_name = "qwen3.8-flash-next-dual-tf"
+wrapper = "tensorfold"
+container = "tensorfold_qwen38_dual"
+nnodes = 2
+tensor_parallel = 2
+drop_caches = true
+hf_mount = "/cache/huggingface"
+ready_path = "/health"
+ready_timeout = 1800
+preflight_timeout = 1800
+max_model_len = 1048576
+max_num_seqs = 16
+hermes_provider = "spark"
+hermes_context_length = 1048576
+hermes_supports_vision = true
+preflight_args = ["/opt/spark-serve/qwen38-dual-tensorfold/verify.py", "/cache/huggingface/hub/models--nvidia--Qwen3.8-Flash-Next-NVFP4/snapshots/fc694b54fb0174e0913e6adf86691ef85a4ead47", "--expected-manifest-sha256", "a3ec3c29bb6f68217a1f109c5ee02b89cf4fdfa1158f4e1626acb2343334d8ad", "--verify-runtime"]
+notes = "Native TensorFold zig-flashnext TP2 with 9 Mia patches, NVIDIA NVFP4 (all 10 experts), 16 streams, 1M context via YaRN x4, FP8 KV (lossy; bf16 exact), MTP drafts, RoCE all-gather, image/video/tools. Each rank needs ~102 GiB MemAvailable at start. Reuses qwen38-dual weights; local hardware qualification pending."
+
+[models.qwen38-dual-tensorfold.tensorfold]
+model_revision = "fc694b54fb0174e0913e6adf86691ef85a4ead47"
+parallel = 16
+kv_dtype = "fp8"
+drafts = true
+vision = true
+vision_urls = false
+max_images = 50
+max_videos = 4
+thinking = true
+max_tokens = 32768
+roce = true
+master_port = 29551

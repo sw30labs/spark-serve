@@ -194,7 +194,8 @@ def test_catalog_exposes_tensorfold_as_distributed(monkeypatch, capsys):
 
 
 @pytest.mark.parametrize("recipe,script", [("glm53-tensorfold", "prepare_glm53_tensorfold.py"),
-                                           ("qwen38-dual", "prepare_qwen38_dual.py")])
+                                           ("qwen38-dual", "prepare_qwen38_dual.py"),
+                                           ("qwen38-dual-tensorfold", "prepare_qwen38_dual_tensorfold.py")])
 def test_new_two_node_recipe_pull_dispatch(monkeypatch, recipe, script):
     cfg = {"cluster": {"head": "first", "worker": "second", "nnodes": 2},
            "models": {recipe: {"recipe": recipe, "nnodes": 2}}}
