@@ -187,6 +187,10 @@ struct StrixView: View {
             if selected == nil { selected = store.status?.model_id ?? store.models.first?.id }
         }
         .onDisappear { store.stopPolling() }
+        .onChange(of: store.models.map(\.id)) { ids in
+            // Models arrive after the first SSH round trip; select the serving one then.
+            if selected == nil || !ids.contains(selected!) { selected = store.status?.model_id ?? ids.first }
+        }
     }
 
     private var statusPanel: some View {
@@ -273,14 +277,19 @@ struct StrixView: View {
     private var controls: some View {
         HStack(spacing: 12) {
             if let model = selectedModel {
-                Button("Start \(model.label)") { store.start(model) }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(store.isBusy || (store.status?.model_id == model.id && store.status?.phase == "ready"))
+                if store.status?.model_id == model.id && store.status?.phase == "ready" {
+                    Label("Serving \(model.label)", systemImage: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                } else {
+                    Button("Start \(model.label)") { store.start(model) }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(store.isBusy)
+                }
             }
             Button("Stop engine") { store.stop() }
                 .disabled(store.isBusy || store.status?.engine == "none")
             Button("Refresh") { store.refresh() }
-            Text("Lemonade and Halogen answer with the box's API key; vLLM takes about 2 minutes to start.")
+            Text("All three engines require the box's API key; vLLM takes about 2 minutes to start.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }

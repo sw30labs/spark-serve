@@ -1624,7 +1624,7 @@ enum ModelCardFacts {
         case "tensorfold": return Color(red: 0.73, green: 0.52, blue: 0.98)
         case "vllm": return Color(red: 0.38, green: 0.66, blue: 0.98)
         case "dsv4", "dsv4-vision": return Color(red: 0.98, green: 0.58, blue: 0.28)
-        case "halogen": return Color(red: 0.93, green: 0.36, blue: 0.30)
+        case "halogen": return Color(red: 0.98, green: 0.50, blue: 0.72)
         case "lemonade": return Color(red: 0.98, green: 0.86, blue: 0.30)
         case "yue": return Color(red: 0.96, green: 0.45, blue: 0.62)
         default: return Color(red: 0.62, green: 0.66, blue: 0.72)

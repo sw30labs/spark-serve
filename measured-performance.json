@@ -16,7 +16,7 @@
       "concurrency": 2,
       "requests": 6
     },
-    "placement": "both Sparks, fresh start per model",
+    "placement": "Sparks: both, fresh start per model; Strix: halo-ctl switch per model",
     "settle_seconds": 30,
     "headline": "p50 completion tokens/s per request, end to end (server usage tokens)"
   },
@@ -89,6 +89,62 @@
       "run_ids": [
         "3463ed37a2e940bba4ad3386c5a4681b",
         "56f047d48d0e403aa7cda8311c9c7882"
+      ]
+    },
+    "halo-gpt-oss-120b": {
+      "measured_at": "2026-10-19",
+      "engine": "lemonade",
+      "single_stream_tokens_per_second": 43.353,
+      "single_stream_post_first_output_tokens_per_second": 54.283,
+      "single_stream_ttft_seconds": 1.1933,
+      "concurrent_streams": 2,
+      "concurrent_aggregate_tokens_per_second": 43.58,
+      "reasoning_observed": true,
+      "run_ids": [
+        "22f9bc74ecc1418a915dd66fbc4e75f4",
+        "cefa631cc08c42acbad925131fe87486"
+      ]
+    },
+    "halo-gpt-oss-20b": {
+      "measured_at": "2026-10-19",
+      "engine": "vllm",
+      "single_stream_tokens_per_second": 12.098,
+      "single_stream_post_first_output_tokens_per_second": 12.382,
+      "single_stream_ttft_seconds": 0.4822,
+      "concurrent_streams": 2,
+      "concurrent_aggregate_tokens_per_second": 15.646,
+      "reasoning_observed": true,
+      "run_ids": [
+        "864c78883be743f6acd6d2b51adca0a4",
+        "c083b168109a40ca9efd0e51b8b63a80"
+      ]
+    },
+    "halo-qwen3-coder-30b": {
+      "measured_at": "2026-10-19",
+      "engine": "lemonade",
+      "single_stream_tokens_per_second": 56.475,
+      "single_stream_post_first_output_tokens_per_second": 65.264,
+      "single_stream_ttft_seconds": 0.6072,
+      "concurrent_streams": 2,
+      "concurrent_aggregate_tokens_per_second": 56.694,
+      "reasoning_observed": false,
+      "run_ids": [
+        "5103fd9276ed443ebe33e7eff90068ab",
+        "aba26ed296f94d93965f328beccfde35"
+      ]
+    },
+    "halo-qwen38": {
+      "measured_at": "2026-10-19",
+      "engine": "halogen",
+      "single_stream_tokens_per_second": 52.179,
+      "single_stream_post_first_output_tokens_per_second": 57.596,
+      "single_stream_ttft_seconds": 0.4614,
+      "concurrent_streams": 2,
+      "concurrent_aggregate_tokens_per_second": 67.903,
+      "reasoning_observed": false,
+      "run_ids": [
+        "c73d2f5be536468283f6e34f9857faba",
+        "4c23c916ba384febbdf2ce64bf730cf6"
       ]
     },
     "mimo26": {

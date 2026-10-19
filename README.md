@@ -358,6 +358,13 @@ Spark controller.
 python3 tools/catalog_tps_bench.py run --site strix
 ```
 
+<p align="center">
+  <a href="docs/screenshots/native-strix-models.jpg">
+    <img src="docs/screenshots/native-strix-models.jpg" alt="Strix Halo tab: Halogen, Lemonade and vLLM model cards with context, quantization, input type, engine and measured tokens per second; the best Strix model carries the animated star" width="900">
+  </a><br>
+  <em>Strix Halo models, measured October 19, 2026 under the Spark benchmark protocol.</em>
+</p>
+
 Add a `[strix]` section with the box's SSH alias (see `models.example.toml`).
 All three engines require the box's API key, which spark-serve reads over SSH
 for each benchmark and never stores. Strix models are ranked among themselves;
