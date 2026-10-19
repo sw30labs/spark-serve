@@ -339,6 +339,31 @@ relative to the rest of the catalog: speed 40%, quantization 30%, context 20%,
 input types 10%. It moves as models are added, removed or re-measured. It does
 not account for differences in the base models' capability.
 
+### Strix Halo tab
+
+The **Strix Halo** tab manages an AMD Ryzen AI Max+ box (128 GB unified
+memory) with the same model cards, measured speeds and best-model star. The box
+runs one engine at a time — Halogen, Lemonade or vLLM — through `halo-ctl` from
+the separate, private
+[halo-inference-control](https://github.com/sw30labs/halo-inference-control)
+repo, which holds the lock and stops the other engines first; its GNOME widget
+uses the same tool. spark-serve only asks it over SSH and never touches the
+Spark controller.
+
+```sh
+./spark-serve strix list
+./spark-serve strix status
+./spark-serve strix up halo-gpt-oss-120b     # stops Halogen/vLLM, loads it in Lemonade
+./spark-serve strix stop
+python3 tools/catalog_tps_bench.py run --site strix
+```
+
+Add a `[strix]` section with the box's SSH alias (see `models.example.toml`).
+All three engines require the box's API key, which spark-serve reads over SSH
+for each benchmark and never stores. Strix models are ranked among themselves;
+their speeds use the same benchmark protocol as the Sparks but different
+hardware. Design notes: [Strix Halo analysis](docs/strix-halo-analysis.md).
+
 ### Screenshots
 
 The Overview above and Benchmarks below were captured from the native app on

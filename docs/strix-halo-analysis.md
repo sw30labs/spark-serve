@@ -1,6 +1,7 @@
 # Strix Halo: new tab or separate app?
 
-Analysis, 2026-10-19. Branch `analysis/strix-halo`. Nothing here is implemented.
+Analysis, 2026-10-19. **Implemented** on branch `strix-halo` (spark-serve) and
+`halo-ctl-engines` (halo-inference-control): phases 1–5 below.
 
 ## Recommendation
 

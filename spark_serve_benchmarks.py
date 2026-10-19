@@ -238,7 +238,7 @@ def _owner_identity(root, identity):
     return True
 
 
-def _stream_request(url, payload, timeout, check):
+def _stream_request(url, payload, timeout, check, api_key=None):
     """Strict SSE accounting with a watcher that can interrupt blocked reads."""
     endpoint = urlsplit(url.rstrip("/") + "/chat/completions")
     cls = http.client.HTTPSConnection if endpoint.scheme == "https" else http.client.HTTPConnection
@@ -276,8 +276,9 @@ def _stream_request(url, payload, timeout, check):
         transport.settimeout(max(0.1, timeout - (time.monotonic() - started)))
         check()
         headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
-        if os.environ.get("SPARK_API_KEY"):
-            headers["Authorization"] = "Bearer " + os.environ["SPARK_API_KEY"]
+        key = api_key or os.environ.get("SPARK_API_KEY")
+        if key:
+            headers["Authorization"] = "Bearer " + key
         if interrupted:
             raise interrupted[0]
         if time.monotonic() - started >= timeout:

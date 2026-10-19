@@ -641,3 +641,67 @@ thinking = true
 max_tokens = 32768
 roce = true
 master_port = 29551
+
+# AMD Strix Halo: one engine at a time through halo-ctl on the box
+# (halo-inference-control). `./spark-serve strix up <id>` stops the others.
+[strix]
+host = "strix-halo"                    # SSH alias; also the LAN hostname clients use
+ctl = "~/.local/bin/halo-ctl"
+api_key_file = "~/.config/halogen/api-key"   # read over SSH when needed, never stored here
+
+[strix.models.halo-qwen38]
+label = "Qwen3.8-Flash-Next Halogen"
+engine = "halogen"
+served_name = "halogen-qwen3.8-flash-next"
+port = 8731
+max_model_len = 262144
+max_num_seqs = 4
+quant = "Halogen 4-bit"
+quant_bits = 4
+quant_scope = "all"
+quant_detail = "Halogen v2 checkpoint, 4.16 bits a weight on average: experts and trunk 4-bit, mixing layers 6-bit, draft-head projections 8-bit."
+modalities = ["text"]
+notes = "halogen-flash-server 0.18.11 on gfx1151. 4 KV slots, prompt cache, n-gram + MTP drafts. Vision sidecar present but not loaded."
+
+[strix.models.halo-gpt-oss-120b]
+label = "gpt-oss-120b Lemonade"
+engine = "lemonade"
+served_name = "gpt-oss-120b-Q4_K_M"
+port = 13305
+max_model_len = 131072
+max_num_seqs = 1
+quant = "MXFP4 experts + Q4/Q5 attn"
+quant_bits = 4
+quant_scope = "all"
+quant_detail = "unsloth GGUF labelled Q4_K_M: experts MXFP4 as published by OpenAI; attention Q4_K/Q5_0, small Q8_0 layers."
+modalities = ["text"]
+notes = "Lemonade 11.8.1, system llama.cpp (ROCm), one request at a time (--parallel 1). Factory model."
+
+[strix.models.halo-qwen3-coder-30b]
+label = "Qwen3-Coder-30B-A3B Lemonade"
+engine = "lemonade"
+served_name = "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M"
+port = 13305
+max_model_len = 262144
+max_num_seqs = 1
+quant = "Q4_K_M"
+quant_bits = 4
+quant_scope = "all"
+quant_detail = "unsloth GGUF: Q4_K experts and attention, about 16% of expert weights Q6_K."
+modalities = ["text"]
+notes = "Lemonade 11.8.1, system llama.cpp (ROCm), one request at a time. Factory model."
+
+[strix.models.halo-gpt-oss-20b]
+label = "gpt-oss-20b vLLM"
+engine = "vllm"
+engine_model = "openai/gpt-oss-20b"
+served_name = "gpt-oss-20b"
+port = 8000
+max_model_len = 131072
+max_num_seqs = 22
+quant = "MXFP4 experts"
+quant_bits = 4
+quant_scope = "experts"
+quant_detail = "Official checkpoint: MXFP4 experts; attention, router and embeddings BF16."
+modalities = ["text"]
+notes = "Halo OS vLLM 0.27.1 (ryai-vllm), Triton MXFP4 MoE and Triton attention on gfx1151. About 2 minutes to start."

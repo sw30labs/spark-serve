@@ -14,11 +14,19 @@ template. Then run it once now as a test and show me that first report.
 
 ## What the bot is for
 
-I run a two-node NVIDIA DGX Spark cluster (2× GB10, about 121 GiB usable
-unified memory per node, ConnectX-7 RoCE between them, tensor parallel 2).
-A local app, spark-serve, holds a catalog of LLMs I can start on it, through
-vLLM, NVIDIA NIM, TensorFold (a native Zig engine) or DwarfStar (a vLLM fork
-for DeepSeek V4). The bot finds new models, new quantizations and new
+I run two inference sites:
+
+- A two-node NVIDIA DGX Spark cluster (2× GB10, about 121 GiB usable
+  unified memory per node, ConnectX-7 RoCE between them, tensor parallel 2).
+- An AMD Strix Halo box (Ryzen AI Max+ 395, gfx1151, 128 GB unified memory,
+  ROCm, no swap) running one engine at a time: Halogen (a dedicated
+  Qwen3.8-Flash-Next engine using `.hgn` weights), Lemonade (llama.cpp GGUF)
+  or vLLM (ROCm build).
+
+A local app, spark-serve, holds a catalog of LLMs I can start on them:
+on the Sparks through vLLM, NVIDIA NIM, TensorFold (a native Zig engine) or
+DwarfStar (a vLLM fork for DeepSeek V4); on the Strix through Halogen,
+Lemonade or vLLM. The bot finds new models, new quantizations and new
 serving recipes worth adding, plus meaningful updates to the ones I already
 run, and reports them with verified facts I can paste into the catalog.
 
@@ -36,6 +44,10 @@ run, and reports them with verified facts I can paste into the catalog.
 4. X: posts from the labs above and from people publishing DGX Spark benchmarks
    or recipes. Treat X as a lead only, never as evidence; confirm on HF or GitHub.
 5. NVIDIA forums (DGX Spark / GB10 category).
+6. For the Strix: `peonist-ai` (Halogen releases and `.hgn` weights on GitHub
+   and Hugging Face), Lemonade Server releases, GGUF uploads tagged for
+   Strix Halo / gfx1151 / ROCm (unsloth, bartowski, ggml-org), and vLLM ROCm
+   notes for gfx1151.
 
 ## Already in the catalog (as of 2026-10-19)
 
@@ -50,6 +62,15 @@ run, and reports them with verified facts I can paste into the catalog.
 | qwen38-dual | Qwen3.8-Flash-Next, nvidia NVFP4 | vLLM | NVFP4 experts | 262K |
 | qwen38-dual-tensorfold | Qwen3.8-Flash-Next, nvidia NVFP4 | TensorFold | NVFP4 experts | 1M |
 
+Strix Halo (as of 2026-10-19):
+
+| id | model | engine | quant | context |
+|---|---|---|---|---:|
+| halo-qwen38 | Qwen3.8-Flash-Next (Halogen v2 `.hgn`) | Halogen | Halogen 4-bit (4.16 bpw) | 262K |
+| halo-gpt-oss-120b | gpt-oss-120b, unsloth GGUF | Lemonade | MXFP4 experts + Q4/Q5 attention | 131K |
+| halo-qwen3-coder-30b | Qwen3-Coder-30B-A3B, unsloth GGUF | Lemonade | Q4_K_M | 262K |
+| halo-gpt-oss-20b | gpt-oss-20b (official) | vLLM | MXFP4 experts | 131K |
+
 Report a new revision or recipe change for these as an **update**, not a new model.
 
 ## Hard rules for the bot
@@ -62,9 +83,14 @@ Report a new revision or recipe change for these as an **update**, not a new mod
   ignore/exclude lists) and, when needed, a safetensors header via the HF
   file API. State which layers are quantized: experts only, or the whole
   model. A repo named "4bit" with BF16 attention is "4-bit experts".
-- **Fit check:** weights size (sum of safetensors files) must leave room for
-  KV cache across 2 × ~121 GiB. Flag anything above ~200 GiB of weights as
-  "tight" and above ~230 GiB as "does not fit".
+- **Fit check:** weights size (sum of safetensors/GGUF files) must leave room
+  for KV cache. Sparks: across 2 × ~121 GiB; flag above ~200 GiB of weights as
+  "tight" and above ~230 GiB as "does not fit". Strix: one box, ~120 GiB and
+  no swap; flag above ~90 GiB as "tight" and above ~105 GiB as "does not fit".
+  Say which site each candidate is for.
+- **Quantization from GGUF headers too:** for GGUF, read the tensor types
+  (e.g. via the HF GGUF viewer or file metadata), not the file name: a file
+  labelled Q4_K_M can hold MXFP4 experts.
 - **Licence:** record it, and flag non-commercial components (for example a
   draft model with a non-commercial licence).
 - No hype. Benchmarks from others are context, labelled with who measured
@@ -85,7 +111,7 @@ label = "<display name>"
 hf_id = "<org/repo>"
 # revision = "<commit sha of the HF repo at time of report>"
 served_name = "<proposed served name>"
-wrapper = "<vllm | nim | tensorfold | dsv4>"
+wrapper = "<vllm | nim | tensorfold | dsv4>"   # Strix: use [strix.models.<id>] with engine = "<halogen | lemonade | vllm>"
 max_model_len = <tokens, from config or recipe; say which>
 quant = "<short tag, e.g. 'NVFP4 experts', 'EXL3 4bpw + q4 dense'>"
 quant_bits = <lowest weight bits, e.g. 4 or 2.9>
@@ -114,6 +140,6 @@ Follow it with:
 ## What happens after (for context; the bot does not do this)
 
 I add the TOML to the catalog, run `./spark-serve pull <id>`, then
-`python3 tools/catalog_tps_bench.py run <id>`, which benchmarks it under
-the same protocol as every other model. The cards and the best-model star
+`python3 tools/catalog_tps_bench.py run <id>` (with `--site strix` for the
+Strix box), which benchmarks it under the same protocol as every other model. The cards and the best-model star
 update from that measurement.

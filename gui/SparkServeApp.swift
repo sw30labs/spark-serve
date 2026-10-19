@@ -1136,6 +1136,7 @@ struct MainView: View {
     @State private var showNotes = true
     @State private var confirmCancelJobs = false
     @State private var selectedTab = "overview"
+    @StateObject private var strix = StrixStore()
 
     var body: some View {
         VStack(spacing: 12) {
@@ -1144,6 +1145,7 @@ struct MainView: View {
                 Text("Overview").tag("overview")
                 Text("Models").tag("models")
                 Text("Benchmarks").tag("benchmarks")
+                Text("Strix Halo").tag("strix")
             }
             .pickerStyle(.segmented)
             Divider()
@@ -1151,6 +1153,8 @@ struct MainView: View {
                 OverviewView(telemetry: runner.telemetry)
             } else if selectedTab == "benchmarks" {
                 BenchmarkView(benchmarks: runner.benchmarks, telemetry: runner.telemetry)
+            } else if selectedTab == "strix" {
+                StrixView(store: strix)
             } else {
               ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
@@ -1590,6 +1594,8 @@ enum ModelCardFacts {
         case "tensorfold": return "TensorFold"
         case "vllm": return "vLLM"
         case "dsv4", "dsv4-vision": return "DwarfStar"
+        case "halogen": return "Halogen"
+        case "lemonade": return "Lemonade"
         case "yue": return "YuE"
         default: return wrapper
         }
@@ -1607,6 +1613,7 @@ enum ModelCardFacts {
         switch topology {
         case "single": return "1 Spark"
         case "distributed": return "2 Sparks"
+        case "strix": return "Strix Halo"
         default: return nil
         }
     }
@@ -1617,6 +1624,8 @@ enum ModelCardFacts {
         case "tensorfold": return Color(red: 0.73, green: 0.52, blue: 0.98)
         case "vllm": return Color(red: 0.38, green: 0.66, blue: 0.98)
         case "dsv4", "dsv4-vision": return Color(red: 0.98, green: 0.58, blue: 0.28)
+        case "halogen": return Color(red: 0.93, green: 0.36, blue: 0.30)
+        case "lemonade": return Color(red: 0.98, green: 0.86, blue: 0.30)
         case "yue": return Color(red: 0.96, green: 0.45, blue: 0.62)
         default: return Color(red: 0.62, green: 0.66, blue: 0.72)
         }

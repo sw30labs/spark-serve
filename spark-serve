@@ -48,6 +48,7 @@ _ensure_python_311()
 import tomllib
 
 from spark_serve_ranking import modalities, score_models
+from spark_serve_strix import add_parser as strix_add_parser, main as strix_main
 from spark_serve_controller import (
     Controller,
     ControllerError,
@@ -1948,6 +1949,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="read the sudo password from stdin; not stored. Used only on hosts without passwordless systemctl",
     )
+    strix_add_parser(sub)
     return p
 
 
@@ -1957,6 +1959,8 @@ def main(argv: list[str] | None = None) -> None:
     if args.cmd in ("watch", "bench"):
         _JSON_MODE = args.cmd == "watch" or args.bench_cmd == "run" or bool(args.json)
     cfg = load()
+    if args.cmd == "strix":
+        sys.exit(strix_main(cfg, args, measured_performance()))
     if args.cmd == "list":
         if args.json:
             cmd_list_json(cfg)
