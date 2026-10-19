@@ -111,19 +111,34 @@ and the Mac app become two front ends of it.
    Halogen formats.
 5. Point the Grok model scout at Strix-compatible releases too.
 
-## Open questions (need you or the box)
+## Verified on amd-halo (2026-10-19, read-only)
 
-- **The box was unreachable** on 2026-10-19 (SSH to its old
-  address timed out). After the 10-18 SSD reinstall, what is its hostname?
-  Nothing about the running system was verified for this analysis.
-- How vLLM runs there today (container image, ROCm version, launch command)
-  and which models Lemonade serves.
-- Whether Lemonade and vLLM expose usage in streamed responses (needed for
-  benchmarks) and Prometheus metrics.
-- Quantization of Halogen's `.hgn` weights: not documented in the files read
-  here; must be verified before tagging cards.
-- Hermes: should "Use in Hermes" target the Strix endpoint too (it needs an
-  API key; Halogen already has one)?
+| Item | Finding |
+|---|---|
+| OS | AMD Ryzen AI Developer Platform 1, kernel 7.2.7; ROCm 10.0.0 (amd-smi 27.0.0); 125 GiB RAM, no swap |
+| Containers | Podman; `docker` is Podman's emulation |
+| Halogen | Running: `halogen-flash-server:0.18.11`, systemd user service, API on :8731 with a key, `/health` open |
+| Halogen model | `halogen-qwen3.8-flash-next`, v2 checkpoint: 4.16 bits/weight average; experts **and** trunk 4-bit, mixing layers 6-bit, draft-head projections 8-bit. Card tier: whole-model 4-bit |
+| Halogen context | `HALOGEN_CTX=262144`, 4 KV slots over one 524,288-position pool |
+| Halogen vision | Sidecar present but **not loaded** (needs `HALOGEN_VISION_TOWER`); currently text-only |
+| Halogen metrics | Prometheus `/metrics` with `halogen:*` and llama.cpp-style `llamacpp:*` families (tokens/s, requests processing, KV usage); needs a parser alongside vLLM's |
+| Lemonade | 11.8.1, `lemond.service` installed but **disabled and stopped**; model store `/var/lib/lemonade` not readable without sudo |
+| vLLM | Image `ryai-vllm:latest` ("Halo OS vLLM image", v0.27.1); no launcher script or unit found, so it is started by hand |
+| ComfyUI | `ryai-comfyui` image; listener on localhost :8188 |
+| Control tool | `~/.local/bin/halogen-ctl status --json` → `{"halogen":"running","lemonade":"stopped","inference":"on"}`. `~/.local/bin` is **not on PATH** for non-interactive SSH, so call it by full path |
+
+## Open questions
+
+- Which models Lemonade serves (needs sudo to read `/var/lib/lemonade`, or
+  `lemonade` CLI while `lemond` runs).
+- The vLLM launch command you use (model, flags, ports) with the `ryai-vllm`
+  image.
+- Whether Lemonade and vLLM report streamed `usage` (benchmarks need it) and
+  which metrics they expose.
+- Whether to load Halogen's vision sidecar by default (it changes memory use
+  and the card's input pill).
+- Hermes: should "Use in Hermes" target `amd-halo` too (Halogen needs its API
+  key)?
 - Name: "spark-serve" will no longer describe the app; renaming is optional
   and can wait.
 
