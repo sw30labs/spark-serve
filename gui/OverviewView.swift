@@ -102,7 +102,7 @@ struct OverviewView: View {
     @ObservedObject var strix: StrixStore
     @EnvironmentObject var runner: CLIRunner
 
-    private var strixServing: Bool { strix.configured && (strix.status.map { $0.engine != "none" } ?? false) }
+    private var strixServing: Bool { strix.configured && !strix.servingHosts.isEmpty }
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 2)) { context in
@@ -118,7 +118,9 @@ struct OverviewView: View {
                         Label(error, systemImage: "antenna.radiowaves.left.and.right.slash")
                             .font(.caption).foregroundStyle(.orange)
                     }
-                    HStack(alignment: .top, spacing: 12) {
+                    // Two Sparks and the Strix boxes wrap on narrow windows.
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 250), spacing: 12, alignment: .top)],
+                              alignment: .leading, spacing: 12) {
                         ForEach(["head", "worker"], id: \.self) { node in
                             HostResourceCard(
                                 node: node, host: runner.hostName(node),
@@ -127,7 +129,9 @@ struct OverviewView: View {
                             )
                         }
                         if strix.configured {
-                            StrixHostCard(store: strix, now: context.date)
+                            ForEach(strix.boxes, id: \.host) { box in
+                                StrixHostCard(store: strix, host: box.host, now: context.date)
+                            }
                         }
                     }
                     HStack {
@@ -149,12 +153,16 @@ struct OverviewView: View {
                                     AllocationCard(allocation: allocation, telemetry: telemetry, now: context.date)
                                 }
                                 if strixServing {
-                                    StrixWorkloadCard(store: strix, now: context.date)
+                                    ForEach(strix.servingHosts, id: \.self) { host in
+                                        StrixWorkloadCard(store: strix, host: host, now: context.date)
+                                    }
                                 }
                             }
                         }
                     } else if strixServing {
-                        StrixWorkloadCard(store: strix, now: context.date)
+                        ForEach(strix.servingHosts, id: \.self) { host in
+                            StrixWorkloadCard(store: strix, host: host, now: context.date)
+                        }
                     } else {
                         Text("Waiting for workload status…").foregroundStyle(.secondary).padding(.vertical, 14)
                     }

@@ -23,6 +23,8 @@ struct ModelEntry: Identifiable, Codable {
     var quant_detail: String? = nil
     var modalities: [String]? = nil
     var ranking: ModelRanking? = nil
+    /// Strix entries only: the name halo-ctl takes and lists for this model.
+    var ctl_id: String? = nil
 }
 
 /// Catalog-relative score from spark_serve_ranking.py; `best` marks the starred card.
@@ -970,12 +972,15 @@ final class CLIRunner: ObservableObject {
 
 struct SparkServeApp: App {
     @StateObject private var runner = CLIRunner()
+    // One Strix store for the window and the menu bar, read even with no window open.
+    @StateObject private var strix = StrixStore(poll: true)
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 
     var body: some Scene {
         Window("spark-serve", id: "main") {
             MainView()
                 .environmentObject(runner)
+                .environmentObject(strix)
                 .frame(minWidth: 760, minHeight: 660)
         }
         .windowStyle(.titleBar)
@@ -984,6 +989,7 @@ struct SparkServeApp: App {
         MenuBarExtra {
             MenuBarView()
                 .environmentObject(runner)
+                .environmentObject(strix)
         } label: {
             MenuBarLabel()
                 .environmentObject(runner)
@@ -1024,6 +1030,7 @@ struct MenuBarLabel: View {
 
 struct MenuBarView: View {
     @EnvironmentObject var runner: CLIRunner
+    @EnvironmentObject var strix: StrixStore
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -1103,6 +1110,8 @@ struct MenuBarView: View {
             .padding(.horizontal, 8)
             .disabled(runner.isBusy)
 
+            StrixMenuSection(store: strix)
+
             Divider()
 
             Button("Open spark-serve window") {
@@ -1137,7 +1146,7 @@ struct MainView: View {
     @State private var showNotes = true
     @State private var confirmCancelJobs = false
     @State private var selectedTab = "overview"
-    @StateObject private var strix = StrixStore()
+    @EnvironmentObject var strix: StrixStore
 
     var body: some View {
         VStack(spacing: 12) {
@@ -1596,6 +1605,7 @@ enum ModelCardFacts {
         case "vllm": return "vLLM"
         case "dsv4", "dsv4-vision": return "DwarfStar"
         case "halogen": return "Halogen"
+        case "cluster": return "llama.cpp RPC"
         case "lemonade": return "Lemonade"
         case "yue": return "YuE"
         default: return wrapper
@@ -1615,6 +1625,7 @@ enum ModelCardFacts {
         case "single": return "1 Spark"
         case "distributed": return "2 Sparks"
         case "strix": return "Strix Halo"
+        case "strix-cluster": return "2 Strix Halos"
         default: return nil
         }
     }
@@ -1626,6 +1637,7 @@ enum ModelCardFacts {
         case "vllm": return Color(red: 0.38, green: 0.66, blue: 0.98)
         case "dsv4", "dsv4-vision": return Color(red: 0.98, green: 0.58, blue: 0.28)
         case "halogen": return Color(red: 0.98, green: 0.50, blue: 0.72)
+        case "cluster": return Color(red: 0.42, green: 0.84, blue: 0.70)
         case "lemonade": return Color(red: 0.98, green: 0.86, blue: 0.30)
         case "yue": return Color(red: 0.96, green: 0.45, blue: 0.62)
         default: return Color(red: 0.62, green: 0.66, blue: 0.72)
@@ -1646,13 +1658,15 @@ enum ModelCardFacts {
         return parts.joined(separator: " · ")
     }
 
-    enum QuantTier: Equatable { case aggressive, wholeModel, expertsOnly, unknown }
+    enum QuantTier: Equatable { case aggressive, wholeModel, expertsOnly, eightBit, unknown }
 
     /// Below 4 bits is aggressive anywhere; 4-bit everywhere costs more quality
     /// than 4-bit experts with higher-precision attention and dense layers.
+    /// 8 bits or more is close to the original weights.
     static func quantTier(bits: Double?, scope: String?) -> QuantTier {
         guard let bits else { return .unknown }
         if bits < 4 { return .aggressive }
+        if bits >= 8 { return .eightBit }
         switch scope {
         case "all": return .wholeModel
         case "experts": return .expertsOnly
@@ -1670,7 +1684,7 @@ enum ModelCardFacts {
         switch tier {
         case .aggressive: return weakColor
         case .wholeModel: return middleColor
-        case .expertsOnly: return strongColor
+        case .expertsOnly, .eightBit: return strongColor
         case .unknown: return neutralColor
         }
     }
@@ -1715,6 +1729,7 @@ enum ModelCardFacts {
         case .aggressive: note = "Below 4 bits per weight: expect the largest quality loss."
         case .wholeModel: note = "4-bit across the whole model, not just the experts."
         case .expertsOnly: note = "4-bit experts; attention and dense layers kept at higher precision."
+        case .eightBit: note = "8 bits or more per weight: close to the original weights."
         case .unknown: note = "Quantization scope not recorded."
         }
         return [detail, note].compactMap { $0 }.joined(separator: " ")

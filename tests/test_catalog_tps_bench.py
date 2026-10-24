@@ -75,6 +75,14 @@ def test_ranking_stars_one_measured_model_and_ignores_unmeasured():
     assert scores["fast-lossy"]["parts"]["quant"] == 0.3
 
 
+def test_eight_bit_weights_rank_with_the_mildest_four_bit_tier():
+    from spark_serve_ranking import quant_tier, score_models
+    assert quant_tier(8, "all") == quant_tier(8, "experts") == "eight_bit"
+    assert quant_tier(4, "all") == "whole_model" and quant_tier(4, "experts") == "experts_only"
+    scores = score_models([item("q8", 30, bits=8, scope="all"), item("q4", 30, bits=4, scope="all")])
+    assert scores["q8"]["parts"]["quant"] == 1.0 and scores["q4"]["parts"]["quant"] == 0.6
+
+
 def test_ranking_moves_when_catalog_changes_and_breaks_ties_on_speed():
     from spark_serve_ranking import score_models
     a, b = item("a", 40), item("b", 40)

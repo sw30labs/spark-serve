@@ -2,7 +2,8 @@
 """Measure every catalog LLM with one fixed decode protocol for the model cards.
 
   python3 tools/catalog_tps_bench.py run [model ...]   # starts each model, benchmarks it
-  python3 tools/catalog_tps_bench.py run --site strix  # the same on the Strix Halo box
+  python3 tools/catalog_tps_bench.py run --site strix --box amd-halo-2  # on one Strix Halo
+                                                      # (the cluster's master, for the cluster)
   python3 tools/catalog_tps_bench.py summarize          # rewrites measured-performance.json
 
 `run` takes over both Sparks: each model gets a fresh `up --node both --no-hermes`,
@@ -39,8 +40,9 @@ def log(msg):
     print(f"[{datetime.datetime.now():%H:%M:%S}] {msg}", flush=True)
 
 
-def bench(concurrency, requests, site="spark"):
-    prefix = [CLI, "strix", "bench"] if site == "strix" else [CLI, "bench", "run", "--node", "head", "--kind", "decode"]
+def bench(concurrency, requests, site="spark", box=None):
+    prefix = ([CLI, "strix", "bench", *(["--box", box] if box else [])] if site == "strix"
+              else [CLI, "bench", "run", "--node", "head", "--kind", "decode"])
     cmd = [*prefix, "--concurrency", str(concurrency), "--requests", str(requests),
            "--max-tokens", str(PROTOCOL["max_tokens"]),
            "--prompt-tokens", str(PROTOCOL["prompt_tokens"]), "--no-thinking", "--json"]
@@ -61,9 +63,10 @@ def bench(concurrency, requests, site="spark"):
     return run
 
 
-def run_model(model, site="spark"):
+def run_model(model, site="spark", box=None):
     log(f"{model}: starting")
-    start = [CLI, "strix", "up", model] if site == "strix" else [CLI, "up", model, "--node", "both", "--no-hermes"]
+    start = ([CLI, "strix", "up", model, *(["--box", box] if box else [])] if site == "strix"
+             else [CLI, "up", model, "--node", "both", "--no-hermes"])
     up = subprocess.run(start, capture_output=True, text=True)
     if up.returncode:
         log(f"{model}: up failed ({up.returncode}): {(up.stdout + up.stderr)[-800:]}")
@@ -71,9 +74,9 @@ def run_model(model, site="spark"):
     log(f"{model}: ready; settling {SETTLE_SECONDS}s")
     time.sleep(SETTLE_SECONDS)
     try:
-        bench(**PROTOCOL["warmup"], site=site)  # discarded
-        ok = bench(**PROTOCOL["single"], site=site)["status"] == "completed"
-        ok = bench(**PROTOCOL["concurrent"], site=site)["status"] == "completed" and ok
+        bench(**PROTOCOL["warmup"], site=site, box=box)  # discarded
+        ok = bench(**PROTOCOL["single"], site=site, box=box)["status"] == "completed"
+        ok = bench(**PROTOCOL["concurrent"], site=site, box=box)["status"] == "completed" and ok
     except RuntimeError as exc:
         log(f"{model}: {exc}")
         return False
@@ -125,7 +128,8 @@ def write_summary():
     runs = list_benchmarks({})
     doc = {
         "schema": 1,
-        "protocol": {**PROTOCOL, "placement": "Sparks: both, fresh start per model; Strix: halo-ctl switch per model",
+        "protocol": {**PROTOCOL, "placement": "Sparks: both, fresh start per model; "
+                                              "Strix: halo-ctl switch per model on the chosen box",
                      "settle_seconds": SETTLE_SECONDS,
                      "headline": "p50 completion tokens/s per request, end to end (server usage tokens)"},
         "models": summarize_runs(runs),
@@ -153,6 +157,7 @@ def main():
     r.add_argument("models", nargs="*")
     r.add_argument("--site", choices=["spark", "strix"], default="spark",
                    help="strix: models from [strix.models], switched with `spark-serve strix up`")
+    r.add_argument("--box", help="strix: the box to serve on (the master, for the cluster)")
     sub.add_parser("summarize")
     args = p.parse_args()
     if args.cmd == "summarize":
@@ -161,7 +166,7 @@ def main():
     listing = [CLI, "strix", "list", "--json"] if args.site == "strix" else [CLI, "list", "--json"]
     models = args.models or json.loads(subprocess.check_output(listing))
     models = [m if isinstance(m, str) else m["id"] for m in models]
-    failed = [m for m in models if not run_model(m, args.site)]
+    failed = [m for m in models if not run_model(m, args.site, args.box)]
     write_summary()
     log(f"done; failed: {failed or 'none'}")
     return 1 if failed else 0

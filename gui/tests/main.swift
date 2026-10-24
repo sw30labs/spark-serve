@@ -61,11 +61,40 @@ func counterStatus(_ engine: String, _ gen: Double, _ prompt: Double) -> StrixSt
                                       generation_tokens_total: gen, prompt_tokens_total: prompt))
 }
 rates.updateRates(counterStatus("vllm", 100, 500), at: 1000)
-check(rates.liveDecode == nil, "First counter sample has no rate")
+check(rates.liveDecode["box"] == nil, "First counter sample has no rate")
 rates.updateRates(counterStatus("vllm", 160, 500), at: 1005)
-check(rates.liveDecode == 12 && rates.livePrefill == 0, "Live decode is the counter delta over time")
+check(rates.liveDecode["box"] == 12 && rates.livePrefill["box"] == 0, "Live decode is the counter delta over time")
 rates.updateRates(counterStatus("lemonade", 10, 0), at: 1010)
-check(rates.liveDecode == nil, "Switching engines resets the baseline")
+check(rates.liveDecode["box"] == nil, "Switching engines resets the baseline")
+// Two boxes: the master out of reach, the worker seen through its RPC connection.
+let siteJSON = #"{"boxes":[{"host":"one","engine":"unknown","phase":"unreachable","model":"","port":null,"engines":{},"inference":null,"model_id":null,"url":null,"served_context":null,"resources":null,"metrics":null,"available":null,"rpc_worker":null,"rpc_clients":null,"role":null,"peer":"two","error":"one: Permission denied (publickey,password)."},{"host":"two","engine":"none","phase":"stopped","model":"","port":null,"engines":{"cluster":"stopped"},"inference":"off","model_id":null,"url":null,"served_context":null,"resources":{"ram_free_gib":60,"ram_total_gib":125,"gtt_used_gib":63,"gtt_total_gib":113,"busy_pct":0,"temp_c":30,"power_w":10,"last_gen_tps":null},"metrics":{"active":null,"queued":null,"kv_pct":null,"avg_gen_tps":null,"avg_prompt_tps":null,"last_gen_tps":null,"draft_accept_pct":null,"generation_tokens_total":null,"prompt_tokens_total":null},"available":{"halogen":[{"id":"a","label":"A"}],"cluster":[{"id":"q8","label":"Q8"}],"lemonade":[{"id":"new-Q4","label":"New Q4"}],"vllm":[]},"rpc_worker":"active","rpc_clients":1,"role":"worker","peer":"one","error":null}],"cluster":null}"#
+let site = try decoder.decode(StrixSite.self, from: Data(siteJSON.utf8))
+check(site.boxes.count == 2 && site.boxes[0].error != nil && site.boxes[1].isWorker, "Strix site decodes boxes, errors and roles")
+let pair = StrixStore()
+pair.models = [ModelEntry(id: "halo-a", label: "A", aliases: [], served_name: "a", ctx: 262144, image: "halogen",
+                          notes: "", wrapper: "halogen", hermes_provider: "", backend: "halogen", topology: "strix", ctl_id: "a"),
+               ModelEntry(id: "halo-q", label: "Q cluster", aliases: [], served_name: "q8", ctx: 65536, image: "cluster",
+                          notes: "", wrapper: "cluster", hermes_provider: "", backend: "cluster", topology: "strix-cluster", ctl_id: "q8")]
+pair.apply(site, at: Date())
+let lemonade = pair.choices(engine: "lemonade")
+check(lemonade.map(\.id) == ["lemonade:new-Q4"] && !lemonade[0].catalogued, "Models on disk without a catalog entry can still be chosen")
+check(pair.menuChoices(engine: "lemonade", on: "two").count == 1 && pair.onDisk(lemonade[0], "one") == nil, "Unknown disks neither offer nor hide a model")
+let halogen = pair.choices(engine: "halogen")[0]
+check(pair.blocker(halogen, on: "two") == "Busy as a cluster worker; its master is out of reach", "A worker whose master is out of reach is left alone")
+check(pair.blocker(pair.choices(engine: "cluster")[0], on: "two") == "one, its worker, did not answer", "The cluster needs its worker answering")
+check(pair.blocker(halogen, on: "one") == "one did not answer", "An unreachable box offers nothing")
+check(pair.summary(site.boxes[1]) == "Cluster worker for one" && pair.servingHosts.isEmpty, "A worker has no workload card of its own")
+check(StrixFacts.hint(site.boxes[0].error, host: "one") == "Set up key login once from Terminal: ssh-copy-id one", "Key failures say how to fix them")
+check(StrixFacts.errorText(site.boxes[0].error!, host: "one") == "Permission denied (publickey,password).", "Errors drop the box name the view already shows")
+let served = #"{"boxes":[{"host":"one","engine":"cluster","phase":"ready","model":"q8","model_id":"halo-q","url":"http://one:8081/v1","engines":{},"inference":"on","resources":null,"available":{"cluster":[{"id":"q8","label":"Q8"}],"halogen":[{"id":"a","label":"A"}]},"rpc_worker":"active","rpc_clients":0,"role":"master","peer":"two","error":null},{"host":"two","engine":"halogen","phase":"ready","model":"a","model_id":"halo-a","url":"http://two:8731/v1","engines":{},"inference":"on","resources":null,"available":{"cluster":[{"id":"q8","label":"Q8"}],"halogen":[{"id":"a","label":"A"}]},"rpc_worker":"active","rpc_clients":1,"role":"worker","peer":"one","error":null}],"cluster":{"master":"one","worker":"two","phase":"ready","model_id":"halo-q","url":"http://one:8081/v1","conflict":false}}"#
+pair.apply(try decoder.decode(StrixSite.self, from: Data(served.utf8)), at: Date())
+let cluster = pair.choices(engine: "cluster")[0]
+check(pair.serves(cluster, "one") && pair.blocker(cluster, on: "one") == "Serving on one", "The serving master is marked, not offered")
+check(pair.consequence(cluster, on: "two") == "Stops the cluster on one and Halogen on two", "Moving the master says what stops")
+check(pair.consequence(halogen, on: "one") == "Stops the cluster", "A model on the master says it stops the cluster")
+check(pair.servingHosts == ["one", "two"] && pair.servingLabel(pair.box("one")!) == "Q cluster", "Workload cards come from boxes serving themselves")
+check(ModelCardFacts.runtimeTitle(wrapper: "cluster") == "llama.cpp RPC" && ModelCardFacts.sparkTitle(topology: "strix-cluster") == "2 Strix Halos", "Cluster cards name the runtime and both boxes")
+check(ModelCardFacts.quantTier(bits: 8, scope: "all") == .eightBit && ModelCardFacts.quantColor(.eightBit) == ModelCardFacts.strongColor, "8-bit weights take the strongest quantization colour")
 check(ModelCardFacts.contextHelp(ctx: 131072, performance: nil) == "Catalog context limit.", "Unmeasured context says catalog")
 check(StrixFacts.phaseColor("ready") == .green && StrixFacts.phaseColor(nil) == .gray, "Strix phase colours")
 check(StrixFacts.gib(nil) == "—" && StrixFacts.gib(29.66) == "29.7 GiB", "Strix memory formatting")

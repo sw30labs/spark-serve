@@ -644,10 +644,11 @@ max_tokens = 32768
 roce = true
 master_port = 29551
 
-# AMD Strix Halo: one engine at a time through halo-ctl on the box
-# (halo-inference-control). `./spark-serve strix up <id>` stops the others.
+# AMD Strix Halo boxes: one engine at a time on each through its halo-ctl
+# (halo-inference-control); `./spark-serve strix up <id> --box <host>` stops
+# the others there. The cluster engine spans both boxes: --box is its master.
 [strix]
-host = "strix-halo"                    # SSH alias; also the LAN hostname clients use
+hosts = ["strix-halo", "strix-halo-2"]   # SSH aliases; also the LAN hostnames clients use
 ctl = "~/.local/bin/halo-ctl"
 api_key_file = "~/.config/halogen/api-key"   # read over SSH when needed, never stored here
 
@@ -664,6 +665,20 @@ quant_scope = "all"
 quant_detail = "Halogen v2 checkpoint, 4.16 bits a weight on average: experts and trunk 4-bit, mixing layers 6-bit, draft-head projections 8-bit."
 modalities = ["text"]
 notes = "halogen-flash-server 0.18.11 on gfx1151. 4 KV slots, prompt cache, n-gram + MTP drafts. Vision sidecar present but not loaded."
+
+[strix.models.halo-qwen38-cluster]
+label = "Qwen3.8-Flash-Next Q8 cluster"
+aliases = ["halo-cluster"]
+engine = "cluster"                   # llama.cpp across both boxes; --box picks the master
+served_name = "qwen3.8-flash-next"
+port = 8081
+max_model_len = 65536                # serve-qwen38.sh's CTX; the model's native context is 262144
+quant = "Q8_0"
+quant_bits = 8
+quant_scope = "all"
+quant_detail = "unsloth GGUF Q8_0 (175 GiB, 6 shards): experts, attention and the 51B per-layer token embedding all Q8_0; routers and norms F32, a few small projections BF16. The MTP draft head is Q8_0 too."
+modalities = ["text"]
+notes = "llama.cpp b11849 (ROCm) over RPC: the master loads it and the other box's always-on ggml-rpc-server holds its share. 3 MTP drafts on the master. About 2 minutes to load once the worker has cached its share."
 
 [strix.models.halo-gpt-oss-120b]
 label = "gpt-oss-120b Lemonade"

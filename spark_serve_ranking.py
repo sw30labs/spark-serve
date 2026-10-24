@@ -12,8 +12,8 @@ import math
 WEIGHTS = {"speed": 0.40, "quant": 0.30, "context": 0.20, "modality": 0.10}
 
 # Below 4 bits loses the most quality; 4-bit everywhere loses more than 4-bit experts
-# with higher-precision attention and dense layers.
-QUANT_QUALITY = {"aggressive": 0.3, "whole_model": 0.6, "experts_only": 1.0, "unknown": 0.5}
+# with higher-precision attention and dense layers. 8 bits or more is close to the original.
+QUANT_QUALITY = {"aggressive": 0.3, "whole_model": 0.6, "experts_only": 1.0, "eight_bit": 1.0, "unknown": 0.5}
 
 MODALITY_VALUE = {"text": 0.0, "image": 0.75, "video": 1.0}
 
@@ -30,6 +30,8 @@ def quant_tier(bits, scope) -> str:
         return "unknown"
     if bits < 4:
         return "aggressive"
+    if bits >= 8:
+        return "eight_bit"
     return {"all": "whole_model", "experts": "experts_only"}.get(scope, "unknown")
 
 
