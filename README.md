@@ -261,7 +261,7 @@ make -f gui/Makefile
 open gui/SparkServeApp.app
 ```
 
-The window has three tabs:
+The window has four tabs:
 
 - **Overview** shows CPU and GPU utilization charts, memory use, temperature,
   power, and network/disk rates for each physical Spark, plus inference metrics
@@ -272,9 +272,11 @@ The window has three tabs:
 - **Benchmarks** runs bounded decode tests and prefill sweeps against a ready
   managed allocation, with reasoning settings, cancellation, saved history, and
   comparison of two runs. Warmup is separate; token counts come from the server.
+- **Strix Halo** starts and stops models on the two AMD boxes and their
+  cluster; see [Strix Halo tab](#strix-halo-tab).
 
 The app invokes this CLI (`list`, `status`, `watch`, `bench`, `up`, `stop`,
-`reboot`, and `shutdown`) and does not speak SSH itself. Live monitoring starts with the app and
+`reboot`, `shutdown` and `strix`) and does not speak SSH itself. Live monitoring starts with the app and
 stops when it quits. Benchmarks start only when requested. The same interfaces
 are available directly:
 
@@ -341,22 +343,39 @@ not account for differences in the base models' capability.
 
 ### Strix Halo tab
 
-The **Strix Halo** tab manages an AMD Ryzen AI Max+ box (128 GB unified
-memory) with the same model cards, measured speeds and best-model star. The box
-runs one engine at a time — Halogen, Lemonade or vLLM — through `halo-ctl` from
-the separate, private
+The **Strix Halo** tab manages two AMD Ryzen AI Max+ boxes (128 GB unified
+memory each) with the same model cards, measured speeds and best-model star.
+Each box runs one engine at a time (Halogen, Lemonade, vLLM or the llama.cpp
+cluster) through `halo-ctl` from the separate, private
 [halo-inference-control](https://github.com/sw30labs/halo-inference-control)
-repo, which holds the lock and stops the other engines first; its GNOME widget
-uses the same tool. spark-serve only asks it over SSH and never touches the
-Spark controller.
+repo. `halo-ctl` holds the box's lock and stops its other engines first, and
+the boxes' GNOME widget uses the same tool. spark-serve only asks over SSH and
+never touches the Spark controller.
+
+The **cluster** engine serves one model across both boxes with llama.cpp RPC.
+The box it starts on is the master, and the other box's always-on
+`ggml-rpc-server` holds its share of the weights. Only the Mac sees both
+boxes, so spark-serve keeps the pair consistent. Starting the cluster stops
+whatever the other box serves, a model started on the cluster's worker stops
+the cluster first, and stopping the worker stops the cluster. Each Start button
+says what it will stop.
 
 ```sh
 ./spark-serve strix list
-./spark-serve strix status
-./spark-serve strix up halo-gpt-oss-120b     # stops Halogen/vLLM, loads it in Lemonade
-./spark-serve strix stop
-python3 tools/catalog_tps_bench.py run --site strix
+./spark-serve strix status                                    # both boxes, roles, models on disk
+./spark-serve strix up halo-gpt-oss-120b --box amd-halo-2     # stops that box's other engine
+./spark-serve strix up halo-qwen38-cluster --box amd-halo-2   # amd-halo-2 master, amd-halo worker
+./spark-serve strix stop --box amd-halo                       # without --box: both boxes
+./spark-serve strix connection --box amd-halo-2               # base URL, model, API key
+python3 tools/catalog_tps_bench.py run --site strix --box amd-halo-2
 ```
+
+The menu bar repeats the widget for both boxes: each engine's models on that
+box's disk, Stop, and Copy connection details. Models on disk without a catalog
+entry can be started too, as `<engine>:<name>`. The app shows inference mode
+but does not switch it, because it needs the box's password through polkit.
+The [pair runbook](docs/strix-halo-pair.md) has the cluster's measured
+checkpoint facts and the findings from adding the second box.
 
 <p align="center">
   <a href="docs/screenshots/native-strix-models.jpg">
@@ -365,16 +384,18 @@ python3 tools/catalog_tps_bench.py run --site strix
   <em>Strix Halo models, measured October 19, 2026 under the Spark benchmark protocol.</em>
 </p>
 
-Add a `[strix]` section with the box's SSH alias (see `models.example.toml`).
-All three engines require the box's API key, which spark-serve reads over SSH
-for each benchmark and never stores. The Overview shows the box beside the
-Sparks with live decode speed for every engine: Halogen's recent average,
-and for Lemonade and vLLM a rate from their token counters (Lemonade's
-llama.cpp decode steps, which equal tokens with one slot and no drafts).
+Add a `[strix]` section with the boxes' hostnames (see `models.example.toml`)
+and set up key login to each (`ssh-copy-id <box>`). Every engine requires the
+box's API key, which spark-serve reads over SSH for each benchmark or copy and
+never stores. The Overview shows each box beside the Sparks, with live decode
+speed for every engine except the cluster: Halogen's recent average, and for
+Lemonade and vLLM a rate from their token counters (Lemonade's llama.cpp decode
+steps, which equal tokens with one slot and no drafts).
 Each workload card and benchmark records the context the engine actually
 serves; hover a card's context pill to see whether a benchmark confirmed it. Strix models are ranked among themselves;
 their speeds use the same benchmark protocol as the Sparks but different
-hardware. Design notes: [Strix Halo analysis](docs/strix-halo-analysis.md).
+hardware. Design notes: [Strix Halo analysis](docs/strix-halo-analysis.md) and
+[ADR 0013](docs/adr/0013-strix-halo-pair.md).
 
 ### Screenshots
 
