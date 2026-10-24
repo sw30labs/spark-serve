@@ -12,6 +12,7 @@ Single-box design notes: [Strix Halo analysis](strix-halo-analysis.md).
 | `halo-ctl` | Engines `halogen`, `cluster`, `lemonade`, `vllm`; `models` | Same file |
 | RPC worker | `ggml-rpc-server.service`, port 50053, enabled at boot | Same |
 | Cluster weights | `~/models/Qwen3.8-Flash-Next` | Same, copied |
+| Network | 10 GbE only, no Wi-Fi profile | 10 GbE only, Wi-Fi profile with autoconnect off |
 
 `halo-ctl models` lists the same models on both boxes: Halogen
 `halogen-qwen3.8-flash-next`, cluster `qwen3.8-flash-next`, Lemonade
@@ -74,16 +75,36 @@ Inference mode switches system timers through polkit. Over SSH, `pkcheck`
 answers "Authorization requires authentication", so the app shows the mode but
 does not switch it. Use the widget on the box.
 
-## Findings, 2026-10-24 (read-only)
+## Findings, 2026-10-24
 
-1. `amd-halo` refuses this Mac's key, which `amd-halo-2` accepts. Run
-   `ssh-copy-id amd-halo` once.
-2. `amd-halo`'s 10 GbE port `enp97s0` is up at 10 Gb/s with its address but
-   has no IPv4 route. Its default and LAN routes use the Wi-Fi interface
-   `wlp99s0`, and its LAN hostname resolves to the Wi-Fi address. With
+1. `amd-halo` refused this Mac's key, which `amd-halo-2` accepted. Fixed the
+   same day with `ssh-copy-id amd-halo`.
+2. `amd-halo`'s 10 GbE port `enp97s0` was up at 10 Gb/s with its address but
+   had no IPv4 route. Its default and LAN routes used the Wi-Fi interface
+   `wlp99s0`, and its LAN hostname resolved to the Wi-Fi address. With
    `amd-halo` as master, the cluster's RPC stream to `amd-halo-2` therefore
-   goes over Wi-Fi, as does the Mac's traffic to `amd-halo`. The halo-cluster
+   went over Wi-Fi, as did the Mac's traffic to `amd-halo`. The halo-cluster
    README calls for the wired link.
+
+   That boot's log has one anomaly. Right after the wired port took its DHCP
+   address, NetworkManager reported a conflict for that address with another
+   host, whose MAC is the permanent address of `amd-halo`'s own Wi-Fi card.
+   With two interfaces on one subnet and Linux's default `arp_ignore` and
+   `arp_announce` of 0, either card can answer and send ARP for the other's
+   address. The info-level log does not show what removed the routes. The
+   next boot came up with routes on both interfaces.
+
+   Fixed the same day: `amd-halo` is wired-only, like `amd-halo-2`.
+   `~/wired-only.sh` on the box turned the Wi-Fi profile's autoconnect off,
+   took Wi-Fi down and renewed the wired lease, and logged to
+   `~/wired-only.log`. The router now answers `amd-halo` with the wired
+   address. To bring Wi-Fi back, run
+   `sudo nmcli connection modify <profile> connection.autoconnect yes`, then
+   `sudo nmcli connection up <profile>`. Keep one interface per box on the
+   LAN; a cable in the second 10 GbE port, `enp98s0`, would add a second one.
+   The cluster's `scripts/peer.sh` names both boxes' wired addresses, and each
+   RPC worker listens on its box's wired address only, so a changed DHCP lease
+   breaks the cluster.
 3. A cluster load with `amd-halo` as master started at 13:59. The OOM killer
    stopped it at 14:18, after 18½ minutes, with a unit peak of 57.4 GB. Until
    then `halo-ctl` reported it as starting.
