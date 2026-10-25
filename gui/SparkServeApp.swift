@@ -981,7 +981,7 @@ struct SparkServeApp: App {
             MainView()
                 .environmentObject(runner)
                 .environmentObject(strix)
-                .frame(minWidth: 760, minHeight: 660)
+                .frame(minWidth: 900, minHeight: 660)
         }
         .windowStyle(.titleBar)
         .defaultSize(width: 1120, height: 800)

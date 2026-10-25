@@ -106,18 +106,20 @@ struct OverviewView: View {
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 2)) { context in
-            ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
-                    HStack(alignment: .firstTextBaseline) {
-                        Text(strix.configured ? "Your machines" : "Your Sparks").font(.title3.weight(.semibold))
-                        Spacer()
-                        Text("Ten minutes of history while the app is open")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
-                    if let error = telemetry.error {
-                        Label(error, systemImage: "antenna.radiowaves.left.and.right.slash")
-                            .font(.caption).foregroundStyle(.orange)
-                    }
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text(strix.configured ? "Your machines" : "Your Sparks").font(.title3.weight(.semibold))
+                    Spacer()
+                    Text("Ten minutes of history while the app is open")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                if let error = telemetry.error {
+                    Label(error, systemImage: "antenna.radiowaves.left.and.right.slash")
+                        .font(.caption).foregroundStyle(.orange)
+                }
+                // Side by side, Spark left and Halo right; each column scrolls on its own.
+                // No Halos configured -> the Spark column takes the full width.
+                HStack(alignment: .top, spacing: 14) {
                     MachineSection(title: "NVIDIA DGX Spark", systemImage: "desktopcomputer",
                                    subtitle: ["head", "worker"].map { runner.hostName($0) }.joined(separator: " + "),
                                    tint: .green) {
@@ -130,19 +132,20 @@ struct OverviewView: View {
                             strixContent(now: context.date)
                         }
                     }
-                    Text("— means the metric is not reported. Unified RAM is the host memory pool; GPU memory is a separate view of that shared pool.")
-                        .font(.caption).foregroundStyle(.secondary)
                 }
-                .padding(2)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                Text("— means the metric is not reported. Unified RAM is the host memory pool; GPU memory is a separate view of that shared pool.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
+            .padding(2)
         }
         .onAppear { strix.attach() }
         .onDisappear { strix.detach() }
     }
 
     @ViewBuilder private func sparkContent(now: Date) -> some View {
-        // The two Sparks wrap on narrow windows.
-        LazyVGrid(columns: [GridItem(.adaptive(minimum: 250), spacing: 12, alignment: .top)],
+        // One card per row; the column sets the width.
+        LazyVGrid(columns: [GridItem(.flexible(), alignment: .top)],
                   alignment: .leading, spacing: 12) {
             ForEach(["head", "worker"], id: \.self) { node in
                 HostResourceCard(
@@ -162,7 +165,7 @@ struct OverviewView: View {
                 Text("No managed workload is running. Open NVIDIA DGX Spark to start one.")
                     .foregroundStyle(.secondary).padding(.vertical, 6)
             } else if !snapshot.allocations.isEmpty {
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 330), alignment: .top)], spacing: 12) {
+                LazyVGrid(columns: [GridItem(.flexible(), alignment: .top)], spacing: 12) {
                     ForEach(snapshot.allocations) { allocation in
                         AllocationCard(allocation: allocation, telemetry: telemetry, now: now)
                     }
@@ -174,7 +177,7 @@ struct OverviewView: View {
     }
 
     @ViewBuilder private func strixContent(now: Date) -> some View {
-        LazyVGrid(columns: [GridItem(.adaptive(minimum: 250), spacing: 12, alignment: .top)],
+        LazyVGrid(columns: [GridItem(.flexible(), alignment: .top)],
                   alignment: .leading, spacing: 12) {
             ForEach(strix.boxes, id: \.host) { box in
                 StrixHostCard(store: strix, host: box.host, now: now)
@@ -182,7 +185,7 @@ struct OverviewView: View {
         }
         SectionSubheader(title: "Serving workloads", detail: "One card per serving box")
         if strixServing {
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 330), alignment: .top)], spacing: 12) {
+            LazyVGrid(columns: [GridItem(.flexible(), alignment: .top)], spacing: 12) {
                 ForEach(strix.servingHosts, id: \.self) { host in
                     StrixWorkloadCard(store: strix, host: host, now: now)
                 }
@@ -194,7 +197,7 @@ struct OverviewView: View {
     }
 }
 
-/// A framed group of machines and what they serve, one per hardware family.
+/// A framed column of machines and what they serve, one per hardware family; header fixed, content scrolls.
 struct MachineSection<Content: View>: View {
     let title: String
     let systemImage: String
@@ -202,16 +205,22 @@ struct MachineSection<Content: View>: View {
     let tint: Color
     @ViewBuilder let content: () -> Content
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .firstTextBaseline) {
                 Label(title, systemImage: systemImage).font(.headline).foregroundStyle(tint)
-                Text(subtitle).font(.caption).foregroundStyle(.secondary)
-                Spacer()
+                    .lineLimit(1).layoutPriority(1)
+                Text(subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                Spacer(minLength: 0)
             }
-            content()
+            .padding([.top, .horizontal], 14)
+            Divider().overlay(tint.opacity(0.2))
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) { content() }
+                    .padding([.horizontal, .bottom], 14)
+                    .padding(.top, 2)
+            }
         }
-        .padding(14)
-        .frame(maxWidth: .infinity, alignment: .topLeading)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(tint.opacity(0.04), in: RoundedRectangle(cornerRadius: 14))
         .overlay(RoundedRectangle(cornerRadius: 14).stroke(tint.opacity(0.3)))
         .accessibilityElement(children: .contain)
