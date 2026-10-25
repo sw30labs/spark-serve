@@ -85,7 +85,8 @@ usage, are unavailable in the current monitor adapter.
 ## Provenance and qualification
 
 The [source pins](../recipes/glm53-tensorfold/source-pins.json) record upstream
-commit `33b50fde06fd7ea604cbc6a663880068ab1e2ee4`, the immutable image digest,
+commit `bf5f94523a8251029cedae86bf61f8ce37fac218` (123 patches, image
+`v0.6.0-789e8f3bdfa2`; [ADR 0014](adr/0014-glm53-tensorfold-bf5f945.md)), the immutable image digest,
 TensorFold revision and runtime inventories. The [checkpoint manifest](../recipes/glm53-tensorfold/model-source.json)
 pins target revision `078455ffe6472f9a52fbc1139f58b9db2881b25c` and draft
 revision `bf582e4eacc1810f76656d1811693ff6c6737d2a`, including every file's
@@ -109,6 +110,15 @@ checks passed for the GLM EXL3 metadata, DFlash2, vision and exact launch parser
 arguments for ranks 0 and 1. The [local preparation record](../diagnostics/glm53-tensorfold/preparation-2026-10-05.json)
 contains both receipts and confirms existing services were preserved. No model
 was launched during preparation.
+
+That preparation used the earlier `33b50fde` derivative (`v060-33b50fd`). The
+`bf5f9452` derivative (`v060-bf5f945`) keeps the same checkpoints but has not
+yet been built or copied to the worker. Its published base image was pulled
+on the head on 2026-10-25, and its 445 installed files were matched against
+TensorFold `c4646171` plus the 123 patches. The rank environment also
+mirrors upstream's picture budget (102,400 tokens, 1,440 MiB vision
+workspace), `NUCLEUS_UNION=1`, a 15 s SSE keep-alive and `FILL_ROWS=2048`.
+Spill blocks and KV sharding stay off.
 
 Distributed GPU serving, tools, vision, long-context quality and performance
 qualification remain **pending**. Offline checks also cover provenance,

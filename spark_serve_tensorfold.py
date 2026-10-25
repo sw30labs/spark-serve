@@ -279,6 +279,14 @@ def _validate_glm_plan(cfg: dict, mid: str, rank: int) -> TensorFoldPlan:
         "TF_GLM_FILL_BUDGET_MS": "200", "TF_GLM_FILL_DRAFTS": "1", "TF_GLM_L2PF": "1",
         "TF_GLM_EXL3_LOADS": "nc", "TF_GLM_SHARED_PREFIX": "1", "TF_GLM_CACHE_GIB": "12.5",
         "TF_GLM_DISPLAY_KV_MIB": "0",
+        # Upstream scripts/config.sh defaults added by recipe bf5f9452 (ADR 0014). The picture budget is
+        # MAX_IMAGES x IMAGE_TOKENS (50 x 2048) with its matching vision workspace; spill blocks and KV
+        # sharding stay off (no SPILL_GIB / TF_GLM_KV_SHARD).
+        "TENSORFOLD_GLM_REQUEST_IMAGE_TOKENS": "102400", "TENSORFOLD_VISION_WORKSPACE_MIB": "1440",
+        "TENSORFOLD_NUCLEUS_UNION": "1", "TENSORFOLD_SSE_KEEPALIVE_S": "15", "TF_GLM_FILL_ROWS": "2048",
+        "TF_GLM_CACHE_SHARE_PCT": "0", "TF_GLM_KEPT_BYTES_GIB": "0", "TF_GLM_KEEP_PER_CHAT": "0",
+        "TF_GLM_EFFORT_TAIL": "0", "TF_GLM_EXL3_DEC_ORDER": "0", "TF_GLM_DISPLAY_KV_BACKEND": "drm",
+        "TF_GLM_SPILL_QUOTA": "0", "TF_GLM_SPILL_TURNS": "4", "TF_GLM_PREFIX_WAIT": "0",
         "TENSORFOLD_MEMORY_RESERVE_GIB": str(round(14.5 + max(0, parallel - 4) * 0.95 + (window - 32) * 0.04, 1)),
     }
     if "NCCL_DEBUG" in fabric:

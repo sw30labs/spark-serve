@@ -28,7 +28,7 @@ def main() -> None:
     if distribution.version != manifest["tensorfold_version"]:
         raise ValueError("TensorFold version differs from the pinned runtime")
     # Every installed file was extracted from authenticated OCI image layers
-    # and compared with TensorFold v0.6.0 plus the 82 ordered upstream patches.
+    # and compared with TensorFold v0.6.0 plus the ordered upstream patches.
     verify_files(Path(distribution.locate_file("tensorfold")), manifest["files"])
     upstream = json.loads((here / "upstream-files.json").read_text())
     verify_files(here / "upstream", upstream["files"])

@@ -53,6 +53,18 @@ def test_eight_stream_reserve_and_verify_window_track_upstream_formula():
     assert env["TENSORFOLD_MEMORY_RESERVE_GIB"] == "19.6"
 
 
+def test_rank_environment_mirrors_bf5f945_defaults_with_spill_and_kv_shard_off():
+    env = dict(validate_tensorfold_plan(config(), "glm53-tensorfold").environment)
+    assert env["TENSORFOLD_GLM_REQUEST_IMAGE_TOKENS"] == "102400"
+    assert env["TENSORFOLD_VISION_WORKSPACE_MIB"] == "1440"
+    assert env["TENSORFOLD_NUCLEUS_UNION"] == "1"
+    assert env["TENSORFOLD_SSE_KEEPALIVE_S"] == "15"
+    assert env["TF_GLM_FILL_ROWS"] == "2048"
+    assert env["TF_GLM_SPILL_QUOTA"] == "0"
+    assert not any(key.startswith(("TF_GLM_KV_SHARD", "TF_GLM_SPILL_GIB", "TF_GLM_EXIT_ON_BROKEN"))
+                   for key in env)
+
+
 def test_mtp_selects_target_head_and_single_stream():
     cfg = config()
     model = cfg["models"]["glm53-tensorfold"]

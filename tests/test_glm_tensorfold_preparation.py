@@ -232,10 +232,10 @@ def test_published_pins_and_complete_hf_manifests():
     installed = json.loads((prepare.RECIPE / "runtime/installed-runtime.json").read_text())
     assert installed["tensorfold_revision"] == pins["tensorfold_revision"]
     assert installed["tensorfold_version"] == "0.6.0"
-    assert len(installed["files"]) == 426
-    assert installed["patch_count"] == 82
+    assert len(installed["files"]) == 445
+    assert installed["patch_count"] == 123
     assert installed["patches_hash"] == pins["patches_hash"]
-    assert installed["dependencies"] == {"av": "18.1.0", "xgrammar": "0.2.8", "transformers": "5.18.0"}
+    assert installed["dependencies"] == {"av": "18.1.0", "xgrammar": "0.2.8", "transformers": "5.20.1"}
 
 
 def test_worker_copy_uses_qsfp_and_distinct_cache_paths():

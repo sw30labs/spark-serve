@@ -23,7 +23,7 @@ from spark_serve_tensorfold import validate_tensorfold_plan
 RECIPE = ROOT / "recipes" / "glm53-tensorfold"
 MODEL_KEY = "glm53-tensorfold"
 RELATIVE_ROOT = Path("spark-serve/glm53-tensorfold")
-UPSTREAM_REVISION = "33b50fde06fd7ea604cbc6a663880068ab1e2ee4"
+UPSTREAM_REVISION = "bf5f94523a8251029cedae86bf61f8ce37fac218"
 RUNTIME_ROOT = "/opt/spark-serve/glm53-tensorfold"
 CHECKPOINTS = {
     "target": ("Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold", "078455ffe6472f9a52fbc1139f58b9db2881b25c"),

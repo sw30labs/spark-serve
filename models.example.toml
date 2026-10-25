@@ -473,7 +473,7 @@ args = [
 [models.glm53-tensorfold]
 aliases = ["glm53-tf", "glm-tensorfold"]
 label = "GLM-5.3-Flash EXL3 TensorFold"
-image = "spark-serve-glm53-tensorfold:v060-33b50fd"
+image = "spark-serve-glm53-tensorfold:v060-bf5f945"
 recipe = "glm53-tensorfold"
 hf_id = "Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold"
 serve_path = "/cache/huggingface/spark-serve/glm53-tensorfold/models/target/078455ffe6472f9a52fbc1139f58b9db2881b25c"
@@ -498,7 +498,7 @@ hermes_provider = "spark"
 hermes_context_length = 1048576
 hermes_supports_vision = true
 preflight_args = ["/opt/spark-serve/glm53-tensorfold/verify.py", "/cache/huggingface/spark-serve/glm53-tensorfold", "--expected-manifest-sha256", "2967c429558c6dfbf69374db14591e07c754f7b32f69b2d4b1e02cf3b8460780", "--verify-runtime"]
-notes = "TensorFold v0.6.0 TP2, pinned Mia EXL3 4bpw, 4 streams, 1M context, FP8 KV, q4 dense, DFlash2 + copy drafts, image/video/tools. DFlash2 is non-commercial; mtp with parallel=1 avoids it at serving time. Local hardware qualification pending."
+notes = "TensorFold v0.6.0 TP2, Mia recipe @bf5f9452 (image v0.6.0-789e8f3bdfa2, 123 patches), pinned Mia EXL3 4bpw @078455ff, 4 streams, 1M context, FP8 KV, q4 dense, DFlash2 + copy drafts, image/video/tools. DFlash2 is non-commercial; mtp with parallel=1 avoids it at serving time. Local hardware qualification pending."
 
 [models.glm53-tensorfold.tensorfold]
 model_revision = "078455ffe6472f9a52fbc1139f58b9db2881b25c"
