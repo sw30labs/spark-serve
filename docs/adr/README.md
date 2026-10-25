@@ -20,6 +20,7 @@ Dates below are record dates, not reconstructed approval dates. All are accepted
 | [0012](0012-host-poweroff.md) | Power off both Sparks through the fenced CLI |
 | [0013](0013-strix-halo-pair.md) | Keep the Strix Halo pair consistent from the Mac |
 | [0014](0014-glm53-tensorfold-bf5f945.md) | Re-vendor GLM TensorFold to recipe bf5f945, keep its weights |
+| [0015](0015-remove-native-benchmarks-tab.md) | Remove the native Benchmarks tab; benchmarks stay in the CLI |
 
 Keep ADRs short: context, decision, trade-off, evidence. Amend clarifications in
 place. For a changed decision, add a new numbered ADR and link the superseded

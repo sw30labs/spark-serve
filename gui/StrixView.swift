@@ -529,7 +529,7 @@ enum StrixFacts {
     }
 }
 
-// MARK: - Strix Halo tab
+// MARK: - AMD Strix Halo tab
 
 struct StrixView: View {
     @ObservedObject var store: StrixStore

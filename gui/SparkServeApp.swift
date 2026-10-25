@@ -217,7 +217,6 @@ final class CLIRunner: ObservableObject {
     private let home: URL?
     private let cliPath: String
     let telemetry: TelemetryStore
-    let benchmarks: BenchmarkStore
     private var pollTimer: Timer?
     private var refreshInFlight = false
     private var shuttingDown = false
@@ -405,13 +404,11 @@ final class CLIRunner: ObservableObject {
         home = resolvedHome
         cliPath = resolvedHome?.appendingPathComponent("spark-serve").path ?? ""
         telemetry = TelemetryStore(home: resolvedHome)
-        benchmarks = BenchmarkStore(home: resolvedHome)
         terminationObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.willTerminateNotification, object: nil, queue: .main
         ) { [weak self] _ in self?.shutdown() }
         startPolling()
         telemetry.start()
-        benchmarks.refreshHistory()
     }
 
     deinit {
@@ -423,7 +420,6 @@ final class CLIRunner: ObservableObject {
         shuttingDown = true
         stopPolling()
         telemetry.stop()
-        benchmarks.stop()
         if upProcess?.isRunning == true { upProcess?.terminate() }
     }
 
@@ -1155,14 +1151,11 @@ struct MainView: View {
                 Text("Overview").tag("overview")
                 Text("NVIDIA DGX Spark").tag("models")
                 Text("AMD Strix Halo").tag("strix")
-                Text("Benchmarks").tag("benchmarks")
             }
             .pickerStyle(.segmented)
             Divider()
             if selectedTab == "overview" {
                 OverviewView(telemetry: runner.telemetry, strix: strix)
-            } else if selectedTab == "benchmarks" {
-                BenchmarkView(benchmarks: runner.benchmarks, telemetry: runner.telemetry)
             } else if selectedTab == "strix" {
                 StrixView(store: strix)
             } else {

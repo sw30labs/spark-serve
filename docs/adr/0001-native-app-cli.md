@@ -1,6 +1,6 @@
 # ADR 0001: One native app, one CLI boundary
 
-Accepted · Recorded 2026-09-26 (retrospective)
+Accepted · Recorded 2026-09-26 (retrospective) · Benchmarks tab superseded by [ADR 0015](0015-remove-native-benchmarks-tab.md)
 
 **Context.** Monitoring and benchmarks must fit the existing Mac app without
 creating another workload controller.

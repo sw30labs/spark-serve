@@ -14,8 +14,8 @@ client of that box-local authority, exactly as the GNOME widget already is.
 
 ```
  SparkServeApp (Mac)
- ├─ Overview / Models / Benchmarks   ── spark-serve CLI ── Controller (2× GB10, NCCL, fencing)
- └─ Strix Halo tab                   ── spark-serve strix … ──ssh──▶ halo-ctl (on the box)
+ ├─ Overview / NVIDIA DGX Spark     ── spark-serve CLI ── Controller (2× GB10, NCCL, fencing)
+ └─ AMD Strix Halo tab               ── spark-serve strix … ──ssh──▶ halo-ctl (on the box)
                                                                      ├─ halogen  (podman, :8731)
                                          GNOME widget ──────────────▶├─ lemonade (lemond)
                                                                      └─ vllm     (ROCm)

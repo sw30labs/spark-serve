@@ -131,8 +131,6 @@ struct AllocationTelemetry: Decodable, Identifiable {
     let metrics: InferenceMetrics
 
     var title: String { served_name ?? model ?? "Managed workload" }
-    var benchmarkNode: String { nodes.contains("head") ? "head" : (nodes.first ?? "head") }
-    var supportsBenchmark: Bool { ready && ["vllm", "nim", "tensorfold"].contains(runtime ?? "") }
 }
 
 struct InferenceMetrics: Decodable {
@@ -247,11 +245,6 @@ final class TelemetryStore: ObservableObject {
         guard streamRunning, let sampledAt,
               now.timeIntervalSince1970 - sampledAt <= 10 else { return "stale" }
         return "live"
-    }
-
-    func benchmarkTargets(now: Date = Date()) -> [AllocationTelemetry] {
-        guard topologyIsFresh(now: now), let snapshot else { return [] }
-        return snapshot.allocations.filter { $0.supportsBenchmark }
     }
 
     func topologyIsFresh(now: Date) -> Bool {

@@ -15,11 +15,12 @@ serving backend.
 Each single-node model exposes an OpenAI-compatible endpoint on its Spark's LAN
 port 8000. Distributed models expose their endpoint on the head.
 YuE uses one HTTP worker per Spark on port 8011. The SwiftUI app uses the Python
-CLI for workload control, live monitoring, and benchmarks. SSH, Docker, and NCCL
+CLI for workload control and live monitoring. SSH, Docker, and NCCL
 operations stay in that CLI.
 
-The same native app includes live resource and inference metrics, topology-aware
-allocation cards, and saved decode/prefill benchmarks. See
+The same native app includes live resource and inference metrics and
+topology-aware allocation cards. Decode/prefill benchmarks run from the CLI
+(`spark-serve bench`). See
 [native monitoring and benchmarks](docs/native-observability.md) for metric
 definitions, cancellation behavior, and CLI usage.
 
@@ -261,24 +262,25 @@ make -f gui/Makefile
 open gui/SparkServeApp.app
 ```
 
-The window has four tabs:
+The window has three tabs:
 
 - **Overview** shows CPU and GPU utilization charts, memory use, temperature,
   power, and network/disk rates for each physical Spark, plus inference metrics
   for each logical model allocation. A model shared across both Sparks has one
   inference endpoint.
-- **Models** controls placement, start/stop, and Hermes selection. Prepare
+- **NVIDIA DGX Spark** controls placement, start/stop, and Hermes selection. Prepare
   models with CLI `pull`; startup progress and failures appear in the activity log.
-- **Benchmarks** runs bounded decode tests and prefill sweeps against a ready
-  managed allocation, with reasoning settings, cancellation, saved history, and
-  comparison of two runs. Warmup is separate; token counts come from the server.
-- **Strix Halo** starts and stops models on the two AMD boxes and their
-  cluster; see [Strix Halo tab](#strix-halo-tab).
+- **AMD Strix Halo** starts and stops models on the two AMD boxes and their
+  cluster; see [AMD Strix Halo tab](#amd-strix-halo-tab).
 
-The app invokes this CLI (`list`, `status`, `watch`, `bench`, `up`, `stop`,
+The app no longer has a Benchmarks tab (removed 2026-10-25,
+[ADR 0015](docs/adr/0015-remove-native-benchmarks-tab.md)). Run bounded decode
+tests and prefill sweeps with the CLI `bench` commands below.
+
+The app invokes this CLI (`list`, `status`, `watch`, `up`, `stop`,
 `reboot`, `shutdown` and `strix`) and does not speak SSH itself. Live monitoring starts with the app and
-stops when it quits. Benchmarks start only when requested. The same interfaces
-are available directly:
+stops when it quits. Benchmarks run only from the CLI and only when requested.
+The same interfaces are available directly:
 
 ```sh
 ./spark-serve watch --json   # Ctrl-C to stop monitoring
@@ -341,9 +343,9 @@ relative to the rest of the catalog: speed 40%, quantization 30%, context 20%,
 input types 10%. It moves as models are added, removed or re-measured. It does
 not account for differences in the base models' capability.
 
-### Strix Halo tab
+### AMD Strix Halo tab
 
-The **Strix Halo** tab manages two AMD Ryzen AI Max+ boxes (128 GB unified
+The **AMD Strix Halo** tab manages two AMD Ryzen AI Max+ boxes (128 GB unified
 memory each) with the same model cards, measured speeds and best-model star.
 Each box runs one engine at a time (Halogen, Lemonade, vLLM or the llama.cpp
 cluster) through `halo-ctl` from the separate, private
@@ -379,7 +381,7 @@ checkpoint facts and the findings from adding the second box.
 
 <p align="center">
   <a href="docs/screenshots/native-strix-models.jpg">
-    <img src="docs/screenshots/native-strix-models.jpg" alt="Strix Halo tab: Halogen, Lemonade and vLLM model cards with context, quantization, input type, engine and measured tokens per second; the best Strix model carries the animated star" width="900">
+    <img src="docs/screenshots/native-strix-models.jpg" alt="AMD Strix Halo tab: Halogen, Lemonade and vLLM model cards with context, quantization, input type, engine and measured tokens per second; the best Strix model carries the animated star" width="900">
   </a><br>
   <em>Strix Halo models, measured October 19, 2026 under the Spark benchmark protocol.</em>
 </p>
@@ -399,29 +401,16 @@ hardware. Design notes: [Strix Halo analysis](docs/strix-halo-analysis.md) and
 
 ### Screenshots
 
-The Overview above and Benchmarks below were captured from the native app on
-**September 26, 2026**, using **synthetic demo data**. They illustrate the
-interface and do not report hardware performance measurements. Click an image
-to open it at full resolution.
-
-<p align="center">
-  <a href="docs/screenshots/native-benchmarks.jpg">
-    <img src="docs/screenshots/native-benchmarks.jpg" alt="Spark Serve Benchmarks tab with decode and prefill controls, saved runs, and a decode result using synthetic demo data" width="900">
-  </a><br>
-  <em>Native Benchmarks: configure a test, select a saved run, and inspect latency and token rates. Synthetic demo data, September 26, 2026.</em>
-</p>
-
-<p align="center">
-  <a href="docs/screenshots/native-prefill.jpg">
-    <img src="docs/screenshots/native-prefill.jpg" alt="Saved prefill result with a context sweep chart of prompt tokens against first model output latency, using synthetic demo data" width="900">
-  </a><br>
-  <em>Prefill context sweep and saved request statistics. Synthetic demo data, September 26, 2026.</em>
-</p>
+The Overview above was captured from the native app on
+**September 26, 2026**, using **synthetic demo data**. It illustrates the
+interface and does not report hardware performance measurements. Click an image
+to open it at full resolution. Earlier captures of the removed Benchmarks tab
+remain in `docs/screenshots/` (`native-benchmarks.jpg`, `native-prefill.jpg`).
 
 #### Earlier model-control screenshots — September 13, 2026
 
 These earlier captures show independent model control and Hermes sessions.
-They predate the Overview and Benchmarks tabs.
+They predate the Overview tab and the since-removed Benchmarks tab.
 
 <p align="center">
   <a href="docs/screenshots/qwen-nemotron-serving.png">
