@@ -45,6 +45,13 @@ turns) are the author's. DFlash2 (`incoai/GLM-5.3-Flash-DFlash2`) remains
 the quantization, with Z.AI's MIT kept for the base model. Only the notice
 changed, not the pinned files.
 
+**Not ported.** Upstream's `start.sh`, `prepare.sh` and `nodes.sh` changes
+are intentionally left out: the repeated-character smoke test, parked pages
+counted in `_avail_gb`, the CDI warning, the rail probe, the dispram backend
+and the spill arguments. spark-serve owns the lifecycle, readiness and
+preparation itself, and the features those scripts serve (spill blocks,
+KV sharding, dispram) stay off here.
+
 **Evidence.** [Source pins](../../recipes/glm53-tensorfold/source-pins.json),
 [installed runtime](../../recipes/glm53-tensorfold/runtime/installed-runtime.json),
 [rank environment](../../spark_serve_tensorfold.py), [runbook](../glm53-tensorfold.md),
