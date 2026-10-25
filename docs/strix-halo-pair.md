@@ -13,6 +13,7 @@ Single-box design notes: [Strix Halo analysis](strix-halo-analysis.md).
 | RPC worker | `ggml-rpc-server.service`, port 50053, enabled at boot | Same |
 | Cluster weights | `~/models/Qwen3.8-Flash-Next` | Same, copied |
 | Network | 10 GbE only, no Wi-Fi profile | 10 GbE only, Wi-Fi profile with autoconnect off |
+| Hardware | AMD RAH-001, the Ryzen AI Halo reference box built by Compal | Minisforum MS-S1 MAX |
 
 `halo-ctl models` lists the same models on both boxes: Halogen
 `halogen-qwen3.8-flash-next`, cluster `qwen3.8-flash-next`, Lemonade
@@ -34,11 +35,22 @@ are F32, and a few small query/key projections are BF16. The 3.9B MTP draft is
 Q8_0. Cards show 8-bit weights in green, and the ranking scores them like
 4-bit experts.
 
-It is not yet measured under the catalog protocol. The halo-cluster README's
-~28 tok/s (MTP 3, `amd-halo-2` as master) uses a different protocol. To measure:
+Measured on 2026-10-24 under the catalog protocol: 512-token prompts, 256 output
+tokens, thinking off. The server ran MTP 3, `CTX` 65,536, four slots and `-ts 7,3`
+(finding 9):
+
+| Master → worker | One request, end to end | After the first token | First token | Two at once, combined |
+|---|---|---|---|---|
+| `amd-halo` → `amd-halo-2` | 21.7 tok/s | 26.1 tok/s | 2.0 s | 26.4 tok/s |
+| `amd-halo-2` → `amd-halo` | 21.4 tok/s | 25.7 tok/s | 2.0 s | 25.8 tok/s |
+
+The difference is within the spread between requests (24.8–27.7 tok/s after the
+first token), so either box can be master. Loads took 3 to 4 minutes. The card
+shows the `amd-halo` master run. The halo-cluster README's ~28 tok/s uses its own
+prompts, one slot and a 16,384-token context. To measure again:
 
 ```sh
-python3 tools/catalog_tps_bench.py run halo-qwen38-cluster --site strix --box amd-halo-2
+python3 tools/catalog_tps_bench.py run halo-qwen38-cluster --site strix --box amd-halo
 ```
 
 ## Operating
@@ -107,7 +119,7 @@ does not switch it. Use the widget on the box.
    breaks the cluster.
 3. A cluster load with `amd-halo` as master started at 13:59. The OOM killer
    stopped it at 14:18, after 18½ minutes, with a unit peak of 57.4 GB. Until
-   then `halo-ctl` reported it as starting.
+   then `halo-ctl` reported it as starting. Finding 9 explains the kill.
 4. `halogen-stats` reports a 120.0 GiB GTT limit on `amd-halo` and 113.1 GiB on
    `amd-halo-2`. The halo-cluster README says both were set to 120.
 5. On the worker, `halo-ctl` reports `stopped` while the RPC worker holds the
@@ -124,3 +136,25 @@ does not switch it. Use the widget on the box.
 8. The boxes' newer `halo-ctl`, widget and cluster units are uncommitted files
    in `~/projects/halogen-widget` on `amd-halo-2`, a repository with no remote.
    The Mac's halo-inference-control checkout predates them.
+9. The cluster's master keeps about 52 GiB in host memory on top of its GPU
+   share. That is most likely the model's 51 GiB per-layer embedding. llama.cpp
+   split the layers by GPU memory, about 51.5 : 48.5 from the 120 and 113.1 GiB
+   limits, without counting it. Once loaded, `amd-halo` as master had 0.4 GiB
+   available, and the OOM killer stopped it on its first request. `amd-halo-2`
+   as master had 4.7 GiB, and the OOM killer stopped it at two concurrent
+   requests. `serve-qwen38.sh` on both boxes now passes `-ts 7,3`, which puts 70%
+   of the layers on the worker; RPC devices come first in llama.cpp's device list.
+   Each box then kept 22–28 GiB available under load. The original script is
+   kept beside it as `serve-qwen38.sh.bak-before-no-host-20261024`. Two other
+   flags did not help. `--no-host` turned the 52 GiB into process memory.
+   `--load-mode mmap` cut the load to 4 KB reads, about 20–25 MB/s.
+10. After the 19:03 reboot, `amd-halo`'s RPC worker started 9 seconds into boot,
+    before the GPU was ready. It logged "failed to initialize ROCm: no
+    ROCm-capable device is detected" and served on the CPU (`Devices: CPU`).
+    Every run with `amd-halo` as worker therefore used its CPU and reached 11 to
+    13 tok/s, not 21. Restarting the unit put it on the GPU. Both boxes' units now
+    pass `-d ROCm0`. With it, the worker exits while the GPU is missing (tested),
+    and `Restart=always` retries every 5 seconds until it can start. The
+    originals are kept beside the source copies as
+    `ggml-rpc-server.service.bak-before-device-20261024`. To check which device a
+    worker uses, run `journalctl --user -u ggml-rpc-server -b | grep -E "ROCm0|CPU:"`.

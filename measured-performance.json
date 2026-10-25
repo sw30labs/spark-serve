@@ -16,7 +16,7 @@
       "concurrency": 2,
       "requests": 6
     },
-    "placement": "Sparks: both, fresh start per model; Strix: halo-ctl switch per model",
+    "placement": "Sparks: both, fresh start per model; Strix: halo-ctl switch per model on the chosen box",
     "settle_seconds": 30,
     "headline": "p50 completion tokens/s per request, end to end (server usage tokens)"
   },
@@ -150,6 +150,21 @@
         "14e784997d104925915aad2aec923195"
       ],
       "served_context": 262144
+    },
+    "halo-qwen38-cluster": {
+      "measured_at": "2026-10-25",
+      "engine": "cluster",
+      "single_stream_tokens_per_second": 21.723,
+      "single_stream_post_first_output_tokens_per_second": 26.09,
+      "single_stream_ttft_seconds": 2.0148,
+      "concurrent_streams": 2,
+      "concurrent_aggregate_tokens_per_second": 26.362,
+      "reasoning_observed": false,
+      "run_ids": [
+        "9ac13688daeb413eaad0635b7dedf731",
+        "b0c94380f5cc4201a5b03289d70d5799"
+      ],
+      "served_context": 65536
     },
     "mimo26": {
       "measured_at": "2026-10-19",
