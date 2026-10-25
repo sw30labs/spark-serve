@@ -672,13 +672,41 @@ aliases = ["halo-cluster"]
 engine = "cluster"                   # llama.cpp across both boxes; --box picks the master
 served_name = "qwen3.8-flash-next"
 port = 8081
-max_model_len = 65536                # serve-qwen38.sh's CTX; the model's native context is 262144
+max_model_len = 262144               # serve-qwen38.sh's CTX: the model's native maximum
 quant = "Q8_0"
 quant_bits = 8
 quant_scope = "all"
 quant_detail = "unsloth GGUF Q8_0 (175 GiB, 6 shards): experts, attention and the 51B per-layer token embedding all Q8_0; routers and norms F32, a few small projections BF16. The MTP draft head is Q8_0 too."
 modalities = ["text"]
-notes = "llama.cpp b11849 (ROCm) over RPC: the master loads it and the other box's always-on ggml-rpc-server holds its share. 3 MTP drafts on the master. About 2 minutes to load once the worker has cached its share."
+notes = "llama.cpp b11849 (ROCm) over RPC: the master loads it and keeps the per-layer embedding in RAM; the other box's always-on ggml-rpc-server holds 70% of the layers (-ts 7,3). 3 MTP drafts on the master. About 3 minutes to load once the worker has cached its share."
+
+[strix.models.halo-qwen38-cluster-512k]
+label = "Qwen3.8-Flash-Next Q8 cluster 512K"
+aliases = ["halo-cluster-512k"]
+engine = "cluster"                   # halo-cluster/models.json entry qwen3.8-flash-next-512k
+served_name = "qwen3.8-flash-next-512k"
+port = 8081
+max_model_len = 524288               # YaRN factor 2 over the native 262,144
+quant = "Q8_0"
+quant_bits = 8
+quant_scope = "all"
+quant_detail = "unsloth GGUF Q8_0 (175 GiB, 6 shards): experts, attention and the 51B per-layer token embedding all Q8_0; routers and norms F32, a few small projections BF16. The MTP draft head is Q8_0 too."
+modalities = ["text"]
+notes = "The Q8 cluster with YaRN (--rope-scale 2 over the native 262,144 tokens), set by its models.json entry; otherwise the same layout: -ts 7,3, 3 MTP drafts on the master. Recalled 3 of 3 codes in a 310K-token document (2026-10-24), and reading it took 34 minutes. Each box kept 16 to 18 GiB available once loaded."
+
+[strix.models.halo-nemotron35-cluster]
+label = "Nemotron 3.5 Super Q8 cluster"
+aliases = ["halo-nemotron"]
+engine = "cluster"                   # halo-cluster/models.json entry nemotron-3.5-super
+served_name = "nemotron-3.5-super"
+port = 8081
+max_model_len = 1048576              # serve-nemotron35.sh's CTX: the model's native maximum
+quant = "Q8_0"
+quant_bits = 8
+quant_scope = "all"
+quant_detail = "ggml-org GGUF Q8_0 (119.65 GiB, one file): experts and the 40 Mamba and 8 attention layers Q8_0; the routers and a few small tensors F32. The MTP draft head is a separate Q8_0 GGUF (3.98 GiB)."
+modalities = ["text"]
+notes = "llama.cpp b11849 (ROCm) over RPC with the default split by GPU memory; 3 MTP drafts on the master. Text only: the vision projector is not downloaded. Recalled 3 of 3 codes in a 987K-token document (2026-10-24); reading 1M tokens took 2 h 34 min. About 3½ minutes to load."
 
 [strix.models.halo-gpt-oss-120b]
 label = "gpt-oss-120b Lemonade"

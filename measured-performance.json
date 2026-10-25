@@ -121,6 +121,21 @@
       ],
       "served_context": 131072
     },
+    "halo-nemotron35-cluster": {
+      "measured_at": "2026-10-25",
+      "engine": "cluster",
+      "single_stream_tokens_per_second": 15.654,
+      "single_stream_post_first_output_tokens_per_second": 18.874,
+      "single_stream_ttft_seconds": 2.7863,
+      "concurrent_streams": 2,
+      "concurrent_aggregate_tokens_per_second": 18.535,
+      "reasoning_observed": false,
+      "run_ids": [
+        "0f5788c799044dd59034dfbae3a74f2f",
+        "c5fc85ff2c3f4cd5a9ff4ceefd7fdd80"
+      ],
+      "served_context": 1048576
+    },
     "halo-qwen3-coder-30b": {
       "measured_at": "2026-10-19",
       "engine": "lemonade",
@@ -154,17 +169,32 @@
     "halo-qwen38-cluster": {
       "measured_at": "2026-10-25",
       "engine": "cluster",
-      "single_stream_tokens_per_second": 21.723,
-      "single_stream_post_first_output_tokens_per_second": 26.09,
-      "single_stream_ttft_seconds": 2.0148,
+      "single_stream_tokens_per_second": 21.572,
+      "single_stream_post_first_output_tokens_per_second": 25.987,
+      "single_stream_ttft_seconds": 2.0567,
       "concurrent_streams": 2,
-      "concurrent_aggregate_tokens_per_second": 26.362,
+      "concurrent_aggregate_tokens_per_second": 25.854,
       "reasoning_observed": false,
       "run_ids": [
-        "9ac13688daeb413eaad0635b7dedf731",
-        "b0c94380f5cc4201a5b03289d70d5799"
+        "393faa8e08c24e0c96479dbe8e484f23",
+        "a7a7f87a6ade46f4a58beac94efcb8e8"
       ],
-      "served_context": 65536
+      "served_context": 262144
+    },
+    "halo-qwen38-cluster-512k": {
+      "measured_at": "2026-10-25",
+      "engine": "cluster",
+      "single_stream_tokens_per_second": 20.927,
+      "single_stream_post_first_output_tokens_per_second": 25.0,
+      "single_stream_ttft_seconds": 1.9929,
+      "concurrent_streams": 2,
+      "concurrent_aggregate_tokens_per_second": 24.825,
+      "reasoning_observed": false,
+      "run_ids": [
+        "ed86190cfab44dcdacc8d3b67d8bdc12",
+        "2a177ef5a4514ea4b2e3dc23cfe3e9ad"
+      ],
+      "served_context": 524288
     },
     "mimo26": {
       "measured_at": "2026-10-19",
