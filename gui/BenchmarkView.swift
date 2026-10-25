@@ -61,7 +61,7 @@ struct BenchmarkView: View {
             Text("Runs a warmup, then bounded test requests against the selected allocation. Hermes selection is unchanged.")
                 .font(.caption).foregroundStyle(.secondary)
             if targets.isEmpty {
-                Text("A ready managed vLLM, NIM or TensorFold allocation is required. Start a model in Models and wait for live status.")
+                Text("A ready managed vLLM, NIM or TensorFold allocation is required. Start a model in NVIDIA DGX Spark and wait for live status.")
                     .font(.callout).foregroundStyle(.secondary)
             } else {
                 Picker("Target", selection: $targetID) {

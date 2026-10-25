@@ -1153,9 +1153,9 @@ struct MainView: View {
             header
             Picker("Workspace", selection: $selectedTab) {
                 Text("Overview").tag("overview")
-                Text("Models").tag("models")
+                Text("NVIDIA DGX Spark").tag("models")
+                Text("AMD Strix Halo").tag("strix")
                 Text("Benchmarks").tag("benchmarks")
-                Text("Strix Halo").tag("strix")
             }
             .pickerStyle(.segmented)
             Divider()

@@ -930,6 +930,7 @@ struct StrixHostCard: View {
             HStack {
                 Label(host, systemImage: "cpu").font(.headline)
                 Spacer()
+                TemperaturePill(celsius: r?.temp_c)
                 ReadingState(state: store.readingState(host, now: now))
             }
             Text("Strix Halo · " + (b?.error != nil ? "no answer" : (b?.role.map { "cluster \($0) · " } ?? "")
@@ -960,10 +961,7 @@ struct StrixHostCard: View {
                 }
                 .font(.caption2).foregroundStyle(.secondary)
             }
-            HStack {
-                MetricTile(title: "GPU temperature", value: MetricFormat.number(r?.temp_c, suffix: " °C", digits: 0))
-                MetricTile(title: "GPU power", value: MetricFormat.number(r?.power_w, suffix: " W"))
-            }
+            MetricTile(title: "GPU power", value: MetricFormat.number(r?.power_w, suffix: " W"))
             if let error = b?.error {
                 Text(StrixFacts.errorText(error, host: host)).font(.caption).foregroundStyle(.orange).lineLimit(3).help(error)
             }
