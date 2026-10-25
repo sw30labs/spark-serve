@@ -78,17 +78,17 @@
       ]
     },
     "glm53-tensorfold": {
-      "measured_at": "2026-10-19",
+      "measured_at": "2026-10-25",
       "engine": "tensorfold",
-      "single_stream_tokens_per_second": 48.222,
-      "single_stream_post_first_output_tokens_per_second": 53.822,
-      "single_stream_ttft_seconds": 0.5546,
+      "single_stream_tokens_per_second": 49.958,
+      "single_stream_post_first_output_tokens_per_second": 56.395,
+      "single_stream_ttft_seconds": 0.5849,
       "concurrent_streams": 2,
-      "concurrent_aggregate_tokens_per_second": 65.388,
+      "concurrent_aggregate_tokens_per_second": 67.516,
       "reasoning_observed": false,
       "run_ids": [
-        "3463ed37a2e940bba4ad3386c5a4681b",
-        "56f047d48d0e403aa7cda8311c9c7882"
+        "7189187b386d4bdf99e00ef414e88247",
+        "103bf558e49347d2ba262a5b0b382913"
       ]
     },
     "halo-gpt-oss-120b": {
