@@ -238,6 +238,19 @@ def test_the_cluster_already_loading_on_that_master_is_only_awaited(boxes):
     assert commands(fake) == []
 
 
+def test_another_cluster_model_on_the_master_is_swapped_there(boxes):
+    q2 = {**MODELS["halo-q"], "label": "Q2 cluster", "served_name": "q2"}
+    cfg = {"strix": {**CFG["strix"], "models": {**MODELS, "halo-q2": q2}}}
+    fake = boxes(one=("cluster", "ready", "q8"))
+    fake.disk["one"] = {**DISK, "cluster": DISK["cluster"] + [{"id": "q2", "label": "Q2"}]}
+    events = []
+    current = strix.up(cfg, "halo-q2", "one", emit=events.append)
+    # The worker's RPC connection is this master's own, so nothing else is stopped.
+    assert commands(fake) == [("one", "~/bin/halo-ctl up cluster q2")]
+    assert current["cluster"]["model_id"] == "halo-q2" and by_host(current)["two"]["role"] == "worker"
+    assert events[0]["detail"] == "Replacing the cluster's q8 on one"
+
+
 def test_the_cluster_needs_the_workers_rpc_server(boxes):
     fake = boxes()
     fake.rpc["two"] = "inactive"

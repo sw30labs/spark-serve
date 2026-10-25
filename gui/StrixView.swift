@@ -287,7 +287,8 @@ final class StrixStore: ObservableObject {
             if let peerName = b.peer, let peer = box(peerName), peer.isServing {
                 stops.append("\(peer.role == "master" ? "the cluster" : StrixFacts.engineTitle(peer.engine)) on \(peerName)")
             }
-            if b.isServing && b.role != "master" { stops.append("\(StrixFacts.engineTitle(b.engine)) on \(host)") }
+            // Another cluster model on this master gives way too; the same one is not offered.
+            if b.isServing { stops.append(b.role == "master" ? "the cluster's \(b.model)" : "\(StrixFacts.engineTitle(b.engine)) on \(host)") }
         } else {
             if b.isWorker, let master = b.peer { stops.append("the cluster (master \(master))") }
             if b.isServing { stops.append(b.role == "master" ? "the cluster" : "\(StrixFacts.engineTitle(b.engine)) on \(host)") }

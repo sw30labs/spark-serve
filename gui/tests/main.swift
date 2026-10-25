@@ -92,6 +92,8 @@ let cluster = pair.choices(engine: "cluster")[0]
 check(pair.serves(cluster, "one") && pair.blocker(cluster, on: "one") == "Serving on one", "The serving master is marked, not offered")
 check(pair.consequence(cluster, on: "two") == "Stops the cluster on one and Halogen on two", "Moving the master says what stops")
 check(pair.consequence(halogen, on: "one") == "Stops the cluster", "A model on the master says it stops the cluster")
+let q2 = StrixChoice(id: "halo-q2", engine: "cluster", ctlID: "q2", label: "Q2 cluster", catalogued: true)
+check(pair.consequence(q2, on: "one") == "Stops Halogen on two and the cluster's q8", "Another cluster model on the master says which model it replaces")
 check(pair.servingHosts == ["one", "two"] && pair.servingLabel(pair.box("one")!) == "Q cluster", "Workload cards come from boxes serving themselves")
 check(ModelCardFacts.runtimeTitle(wrapper: "cluster") == "llama.cpp RPC" && ModelCardFacts.sparkTitle(topology: "strix-cluster") == "2 Strix Halos", "Cluster cards name the runtime and both boxes")
 check(ModelCardFacts.quantTier(bits: 8, scope: "all") == .eightBit && ModelCardFacts.quantColor(.eightBit) == ModelCardFacts.strongColor, "8-bit weights take the strongest quantization colour")

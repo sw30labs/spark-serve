@@ -387,7 +387,8 @@ def up(cfg: dict, name: str, host: str | None = None, emit=None) -> dict:
 
     The cluster starts with that box as master and stops whatever the other
     box serves first. A model on the cluster's worker stops the cluster first.
-    halo-ctl itself stops the box's own engine.
+    halo-ctl itself stops the box's own engine, including another cluster
+    model on the same master.
     """
     emit = emit or (lambda event: None)
     host = box(cfg, host)
@@ -415,6 +416,9 @@ def up(cfg: dict, name: str, host: str | None = None, emit=None) -> dict:
             if _busy(peer):
                 emit({"event": "progress", "detail": f"Stopping {_describe(peer)} on {peer['host']}: the cluster needs its memory"})
                 ssh(peer["host"], _command(cfg, "stop"), timeout=120)
+            elif me["role"] == "master":
+                # The worker's connection is this master's; halo-ctl swaps the model here.
+                emit({"event": "progress", "detail": f"Replacing the cluster's {me['model']} on {host}"})
             elif peer["rpc_clients"]:
                 raise StrixError(f"{peer['host']}: its RPC worker is already in use by another master")
             emit({"event": "progress", "detail": f"Starting the cluster with {host} as master"})
