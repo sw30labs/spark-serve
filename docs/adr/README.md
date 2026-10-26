@@ -20,6 +20,7 @@ Dates below are record dates, not reconstructed approval dates. All are accepted
 | [0012](0012-host-poweroff.md) | Power off both Sparks through the fenced CLI |
 | [0013](0013-strix-halo-pair.md) | Keep the Strix Halo pair consistent from the Mac |
 | [0014](0014-glm53-tensorfold-bf5f945.md) | Re-vendor GLM TensorFold to recipe bf5f945, keep its weights |
+| [0016](0016-flint-nvfp4-single-spark.md) | Prepare Flint from the official NVFP4 GGUF on one Spark |
 
 Keep ADRs short: context, decision, trade-off, evidence. Amend clarifications in
 place. For a changed decision, add a new numbered ADR and link the superseded

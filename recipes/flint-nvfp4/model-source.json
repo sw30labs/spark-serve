@@ -1,0 +1,107 @@
+{
+  "checkpoint": {
+    "model": "RecursiveSI/flint-nvfp4-gguf",
+    "revision": "6ec43e19b565fc8d560e2d04985d7724f20673bf",
+    "files": [
+      {
+        "path": ".gitattributes",
+        "size": 1630,
+        "lfs": null,
+        "git_blob_sha1": "949d5f6dee5ccc4ab23d0105362bea1a5802e79d"
+      },
+      {
+        "path": "LICENSE",
+        "size": 11356,
+        "lfs": null,
+        "git_blob_sha1": "f49a4e16e68b128803cc2dcea614603632b04eac"
+      },
+      {
+        "path": "README.md",
+        "size": 3322,
+        "lfs": null,
+        "git_blob_sha1": "035362760c015f31774ff6606b57d4f8ee1eb4d2"
+      },
+      {
+        "path": "assets/flint-logo.png",
+        "size": 410238,
+        "lfs": {
+          "sha256": "b95290bec100def989fd410999f8129d43068900705a0609a78cdbafa930ad61",
+          "size": 410238,
+          "pointerSize": 131
+        }
+      },
+      {
+        "path": "flint-nvfp4.gguf",
+        "size": 22863084160,
+        "lfs": {
+          "sha256": "97cc8009ff9b132d5cf3c488e6767962bb5a5dc158a90ed661bbbddf876b8bde",
+          "size": 22863084160,
+          "pointerSize": 136
+        }
+      },
+      {
+        "path": "opencode.json",
+        "size": 779,
+        "lfs": null,
+        "git_blob_sha1": "04245ca13610829a96f33f0b3cdde4b9e7a31811"
+      },
+      {
+        "path": "pi-models.json",
+        "size": 569,
+        "lfs": null,
+        "git_blob_sha1": "2e33da0639f8966ce005b1fe05bb5a81e83f8bf9"
+      }
+    ]
+  },
+  "config_and_tokenizer": {
+    "model": "RecursiveSI/flint",
+    "revision": "2a247be0c0aec895ccb0ac7ca92229ec6df37288",
+    "files": [
+      {
+        "path": "LICENSE",
+        "size": 11356,
+        "lfs": null,
+        "git_blob_sha1": "f49a4e16e68b128803cc2dcea614603632b04eac"
+      },
+      {
+        "path": "README.md",
+        "size": 6250,
+        "lfs": null,
+        "git_blob_sha1": "cf0796a70c4d010c3cd02002ba0fca8f2d2d9ee7"
+      },
+      {
+        "path": "chat_template.jinja",
+        "size": 2328,
+        "lfs": null,
+        "git_blob_sha1": "c70e1186a4bf2211cb559098eb44eacbac194a50"
+      },
+      {
+        "path": "config.json",
+        "size": 2451,
+        "lfs": null,
+        "git_blob_sha1": "465e55f8f0123d380015aad1202938d489997b90"
+      },
+      {
+        "path": "generation_config.json",
+        "size": 202,
+        "lfs": null,
+        "git_blob_sha1": "a19207ebc9ead0c5b163131d55a8574abc93d06e"
+      },
+      {
+        "path": "tokenizer.json",
+        "size": 10879128,
+        "lfs": {
+          "sha256": "a263cce0b7e2b03f7ee07ce809783ef4b47f160c3f268a4ea1524f638da45b68",
+          "size": 10879128,
+          "pointerSize": 133
+        }
+      },
+      {
+        "path": "tokenizer_config.json",
+        "size": 30439,
+        "lfs": null,
+        "git_blob_sha1": "ba3dc958917acb0f130ecfd7b7b359b1fd81e1b6"
+      }
+    ]
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "checkpoint": {"model": "RecursiveSI/flint-nvfp4-gguf", "revision": "6ec43e19b565fc8d560e2d04985d7724f20673bf", "license": "apache-2.0", "gguf_sha256": "97cc8009ff9b132d5cf3c488e6767962bb5a5dc158a90ed661bbbddf876b8bde"},
+  "config_and_tokenizer": {"model": "RecursiveSI/flint", "revision": "2a247be0c0aec895ccb0ac7ca92229ec6df37288", "license": "apache-2.0"},
+  "llamacpp": {"repository": "https://github.com/ggml-org/llama.cpp", "tag": "b11889", "flint_support_since": "b11803", "flint_pr": "https://github.com/ggml-org/llama.cpp/pull/30928", "cuda_architectures": "121a-real"},
+  "vllm": {"image_tag": "vllm/vllm-openai:flint", "arm64_digest": "sha256:5641d14b70c991f8b78c3a5baf0281cb73dbd2ea69932dd6a328820f420ec4bc", "flint_pr": "https://github.com/vllm-project/vllm/pull/62938", "pr_merged": "2026-10-22T21:56:36Z"}
+}
