@@ -113,6 +113,9 @@ final class StrixStore: ObservableObject {
     @Published private(set) var busyIsStart = false
     @Published var lastError: String?
     @Published var logLines: [String] = []
+    /// Timed copy for the window's bottom ticker.
+    @Published var logEntries: [ActivityEntry] = []
+    private var logSequence = 0
     @Published var shownLogs: StrixLogs?
     /// False when the catalog has no [strix] section; the Overview and menu then hide the boxes.
     @Published private(set) var configured = false
@@ -443,6 +446,7 @@ final class StrixStore: ObservableObject {
     private func log(_ line: String) {
         logLines.append(line)
         if logLines.count > 200 { logLines.removeFirst(logLines.count - 200) }
+        appendActivity(&logEntries, line, source: "Strix", cap: 200, next: &logSequence)
     }
 
     static func errorDetail(_ line: String) -> String? {

@@ -292,6 +292,9 @@ final class CLIRunner: ObservableObject {
     @Published var about: AppAbout?
     @Published var bootState: BootState = .idle
     @Published var logLines: [String] = []
+    /// Same lines with a time, for the bottom ticker and its full-log popover.
+    @Published var logEntries: [ActivityEntry] = []
+    private var logSequence = 0
     @Published var rebootDialog = false
     @Published var shutdownDialog = false
     @Published private var isStopping = false
@@ -1008,6 +1011,7 @@ final class CLIRunner: ObservableObject {
         if logLines.count > 400 {
             logLines.removeFirst(logLines.count - 400)
         }
+        appendActivity(&logEntries, line, source: "Spark", cap: 400, next: &logSequence)
     }
 
     private func decode<T: Decodable>(_ args: [String], as type: T.Type) -> T? {
@@ -1271,10 +1275,12 @@ struct MainView: View {
                 .padding(2)
               }
             }
-            Divider()
-            logView.frame(minHeight: 100, maxHeight: 160)
         }
         .padding(16)
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            ActivityTicker(items: TickerFacts.items(runner.logEntries, strix.logEntries),
+                           history: TickerFacts.history(runner.logEntries, strix.logEntries))
+        }
         .confirmationDialog("Cancel active YuE renders and stop?", isPresented: $confirmCancelJobs) {
             Button("Cancel renders and stop", role: .destructive) { runner.stop(cancelJobs: true) }
             Button("Keep rendering", role: .cancel) { }
@@ -1448,27 +1454,6 @@ struct MainView: View {
         }
     }
 
-    private var logView: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("Activity log")
-                .font(.caption.weight(.medium))
-                .foregroundStyle(.secondary)
-            ScrollView {
-                VStack(alignment: .leading, spacing: 1) {
-                    ForEach(Array(runner.logLines.enumerated()), id: \.offset) { _, line in
-                        Text(line)
-                            .font(.system(.caption, design: .monospaced))
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .textSelection(.enabled)
-                    }
-                }
-                .padding(8)
-            }
-            .frame(maxHeight: .infinity)
-            .background(Color(nsColor: .textBackgroundColor))
-            .clipShape(RoundedRectangle(cornerRadius: 6))
-        }
-    }
 }
 
 // MARK: - Individual Sparks

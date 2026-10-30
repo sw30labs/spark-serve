@@ -159,3 +159,22 @@ print("Native protocol smoke passed: status, telemetry, bounded history, stale s
 
 check(HermesTarget.local.useArguments(node: "head") == ["use", "--node", "head", "--hermes-target", "local", "--json"], "Mac Hermes must keep its local target")
 check(HermesTarget.spark.useArguments(node: "worker") == ["use", "--node", "worker", "--hermes-target", "spark", "--json"], "Spark Hermes target must be separate from the model node")
+
+func entryAt(_ id: Int, _ seconds: TimeInterval, _ text: String, _ source: String = "Spark") -> ActivityEntry {
+    ActivityEntry(id: id, date: Date(timeIntervalSince1970: 1_793_400_000 + seconds), text: text, source: source)
+}
+let sparkLog = [entryAt(1, 0, "$ spark-serve up ds41"), entryAt(2, 5, "   "), entryAt(3, 9, "  ready on sparkone")]
+let strixLog = [entryAt(4, 7, "halogen started on amd-halo-2", "Strix")]
+check(TickerFacts.items(sparkLog, strixLog).map(\.id) == [3, 4, 1], "Ticker is newest first across both stores and skips blank lines")
+check(TickerFacts.items(sparkLog, strixLog, limit: 1).map(\.id) == [3], "Ticker keeps only the newest entries")
+check(TickerFacts.history(sparkLog, strixLog).map(\.id) == [1, 2, 4, 3], "Full log stays oldest first")
+check(TickerFacts.items([]).isEmpty && TickerFacts.idleText == "No activity yet", "Empty log shows the idle line")
+check(TickerFacts.display("  a\nb ") == "a b" && TickerFacts.line(sparkLog[2]).hasSuffix("  ready on sparkone"), "Ticker entries are one line")
+check(TickerFacts.time(Date()).count == 8, "Ticker times are HH:mm:ss")
+check(TickerFacts.scrolls(contentWidth: 900, containerWidth: 600, reduceMotion: false), "Long lines scroll")
+check(!TickerFacts.scrolls(contentWidth: 300, containerWidth: 600, reduceMotion: false), "Short lines stay still")
+check(!TickerFacts.scrolls(contentWidth: 900, containerWidth: 600, reduceMotion: true), "Reduce Motion stops the scroll")
+check(abs(TickerFacts.duration(contentWidth: 374, gap: 26) - 10) < 0.001, "Ticker moves at a steady 40 pt/s")
+var bounded: [ActivityEntry] = []; var seq = 0
+for n in 0..<5 { appendActivity(&bounded, "l\(n)", source: "Spark", cap: 3, next: &seq) }
+check(bounded.map(\.text) == ["l2", "l3", "l4"] && bounded.last?.id == 5, "Activity history is bounded")
