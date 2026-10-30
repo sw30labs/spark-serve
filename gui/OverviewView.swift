@@ -106,74 +106,157 @@ struct OverviewView: View {
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 2)) { context in
-            ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
-                    HStack(alignment: .firstTextBaseline) {
-                        Text(strix.configured ? "Your machines" : "Your Sparks").font(.title3.weight(.semibold))
-                        Spacer()
-                        Text("Ten minutes of history while the app is open")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
-                    if let error = telemetry.error {
-                        Label(error, systemImage: "antenna.radiowaves.left.and.right.slash")
-                            .font(.caption).foregroundStyle(.orange)
-                    }
-                    // Two Sparks and the Strix boxes wrap on narrow windows.
-                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 250), spacing: 12, alignment: .top)],
-                              alignment: .leading, spacing: 12) {
-                        ForEach(["head", "worker"], id: \.self) { node in
-                            HostResourceCard(
-                                node: node, host: runner.hostName(node),
-                                sample: telemetry.snapshot?.hosts.first { $0.node == node },
-                                telemetry: telemetry, now: context.date
-                            )
-                        }
-                        if strix.configured {
-                            ForEach(strix.boxes, id: \.host) { box in
-                                StrixHostCard(store: strix, host: box.host, now: context.date)
-                            }
-                        }
-                    }
-                    HStack {
-                        Text("Serving workloads").font(.title3.weight(.semibold))
-                        Spacer()
-                        Text("One card per allocation").font(.caption).foregroundStyle(.secondary)
-                    }
-                    if let snapshot = telemetry.snapshot {
-                        if !telemetry.topologyIsFresh(now: context.date) {
-                            Label(snapshot.status_error ?? "Workload status is stale. Waiting for a fresh snapshot…", systemImage: "exclamationmark.circle")
-                                .font(.caption).foregroundStyle(.orange)
-                        }
-                        if snapshot.allocations.isEmpty && !strixServing && telemetry.topologyIsFresh(now: context.date) {
-                            Text("No managed workload is running. Open Models or Strix Halo to start one.")
-                                .foregroundStyle(.secondary).padding(.vertical, 14)
-                        } else if !snapshot.allocations.isEmpty || strixServing {
-                            LazyVGrid(columns: [GridItem(.adaptive(minimum: 330), alignment: .top)], spacing: 12) {
-                                ForEach(snapshot.allocations) { allocation in
-                                    AllocationCard(allocation: allocation, telemetry: telemetry, now: context.date)
-                                }
-                                if strixServing {
-                                    ForEach(strix.servingHosts, id: \.self) { host in
-                                        StrixWorkloadCard(store: strix, host: host, now: context.date)
-                                    }
-                                }
-                            }
-                        }
-                    } else if strixServing {
-                        ForEach(strix.servingHosts, id: \.self) { host in
-                            StrixWorkloadCard(store: strix, host: host, now: context.date)
-                        }
-                    } else {
-                        Text("Waiting for workload status…").foregroundStyle(.secondary).padding(.vertical, 14)
-                    }
-                    Text("— means the metric is not reported. Unified RAM is the host memory pool; GPU memory is a separate view of that shared pool.")
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text(strix.configured ? "Your machines" : "Your Sparks").font(.title3.weight(.semibold))
+                    Spacer()
+                    Text("Ten minutes of history while the app is open")
                         .font(.caption).foregroundStyle(.secondary)
                 }
-                .padding(2)
+                if let error = telemetry.error {
+                    Label(error, systemImage: "antenna.radiowaves.left.and.right.slash")
+                        .font(.caption).foregroundStyle(.orange)
+                }
+                // Side by side, Spark left and Halo right; each column scrolls on its own.
+                // No Halos configured -> the Spark column takes the full width.
+                HStack(alignment: .top, spacing: 14) {
+                    MachineSection(title: "NVIDIA DGX Spark", systemImage: "desktopcomputer",
+                                   subtitle: ["head", "worker"].map { runner.hostName($0) }.joined(separator: " + "),
+                                   tint: .green) {
+                        sparkContent(now: context.date)
+                    }
+                    if strix.configured {
+                        MachineSection(title: "AMD Strix Halo", systemImage: "cpu",
+                                       subtitle: strix.boxes.map(\.host).joined(separator: " + "),
+                                       tint: .red) {
+                            strixContent(now: context.date)
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                Text("— means the metric is not reported. Unified RAM is the host memory pool; GPU memory is a separate view of that shared pool.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
+            .padding(2)
         }
         .onAppear { strix.attach() }
         .onDisappear { strix.detach() }
+    }
+
+    @ViewBuilder private func sparkContent(now: Date) -> some View {
+        // One card per row; the column sets the width.
+        LazyVGrid(columns: [GridItem(.flexible(), alignment: .top)],
+                  alignment: .leading, spacing: 12) {
+            ForEach(["head", "worker"], id: \.self) { node in
+                HostResourceCard(
+                    node: node, host: runner.hostName(node),
+                    sample: telemetry.snapshot?.hosts.first { $0.node == node },
+                    telemetry: telemetry, now: now
+                )
+            }
+        }
+        SectionSubheader(title: "Serving workloads", detail: "One card per allocation")
+        if let snapshot = telemetry.snapshot {
+            if !telemetry.topologyIsFresh(now: now) {
+                Label(snapshot.status_error ?? "Workload status is stale. Waiting for a fresh snapshot…", systemImage: "exclamationmark.circle")
+                    .font(.caption).foregroundStyle(.orange)
+            }
+            if snapshot.allocations.isEmpty && telemetry.topologyIsFresh(now: now) {
+                Text("No managed workload is running. Open NVIDIA DGX Spark to start one.")
+                    .foregroundStyle(.secondary).padding(.vertical, 6)
+            } else if !snapshot.allocations.isEmpty {
+                LazyVGrid(columns: [GridItem(.flexible(), alignment: .top)], spacing: 12) {
+                    ForEach(snapshot.allocations) { allocation in
+                        AllocationCard(allocation: allocation, telemetry: telemetry, now: now)
+                    }
+                }
+            }
+        } else {
+            Text("Waiting for workload status…").foregroundStyle(.secondary).padding(.vertical, 6)
+        }
+    }
+
+    @ViewBuilder private func strixContent(now: Date) -> some View {
+        LazyVGrid(columns: [GridItem(.flexible(), alignment: .top)],
+                  alignment: .leading, spacing: 12) {
+            ForEach(strix.boxes, id: \.host) { box in
+                StrixHostCard(store: strix, host: box.host, now: now)
+            }
+        }
+        SectionSubheader(title: "Serving workloads", detail: "One card per serving box")
+        if strixServing {
+            LazyVGrid(columns: [GridItem(.flexible(), alignment: .top)], spacing: 12) {
+                ForEach(strix.servingHosts, id: \.self) { host in
+                    StrixWorkloadCard(store: strix, host: host, now: now)
+                }
+            }
+        } else {
+            Text("Nothing is serving on the Strix Halos. Open AMD Strix Halo to start a model.")
+                .foregroundStyle(.secondary).padding(.vertical, 6)
+        }
+    }
+}
+
+/// A framed column of machines and what they serve, one per hardware family; header fixed, content scrolls.
+struct MachineSection<Content: View>: View {
+    let title: String
+    let systemImage: String
+    let subtitle: String
+    let tint: Color
+    @ViewBuilder let content: () -> Content
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline) {
+                Label(title, systemImage: systemImage).font(.headline).foregroundStyle(tint)
+                    .lineLimit(1).layoutPriority(1)
+                Text(subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                Spacer(minLength: 0)
+            }
+            .padding([.top, .horizontal], 14)
+            Divider().overlay(tint.opacity(0.2))
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) { content() }
+                    .padding([.horizontal, .bottom], 14)
+                    .padding(.top, 2)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(tint.opacity(0.04), in: RoundedRectangle(cornerRadius: 14))
+        .overlay(RoundedRectangle(cornerRadius: 14).stroke(tint.opacity(0.3)))
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(title)
+    }
+}
+
+struct SectionSubheader: View {
+    let title: String
+    let detail: String
+    var body: some View {
+        HStack(alignment: .firstTextBaseline) {
+            Text(title).font(.subheadline.weight(.semibold))
+            Spacer()
+            Text(detail).font(.caption).foregroundStyle(.secondary)
+        }
+        .padding(.top, 4)
+    }
+}
+
+/// GPU temperature in the same capsule as ReadingState; no colour thresholds.
+struct TemperaturePill: View {
+    let celsius: Double?
+    private var available: Bool { celsius.map { $0.isFinite } ?? false }
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: "thermometer.medium").imageScale(.small)
+            Text(available ? MetricFormat.number(celsius, suffix: " °C", digits: 0) : "— °C")
+                .font(.caption).monospacedDigit()
+        }
+        .foregroundStyle(available ? Color.primary : Color.secondary)
+        .padding(.horizontal, 8).padding(.vertical, 4)
+        .background(Color.secondary.opacity(available ? 0.15 : 0.08), in: Capsule())
+        .help("GPU temperature")
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(available ? "GPU temperature \(MetricFormat.number(celsius, digits: 0)) degrees Celsius" : "GPU temperature unavailable")
     }
 }
 
@@ -197,6 +280,7 @@ private struct HostResourceCard: View {
             HStack {
                 Label(sample?.host ?? host, systemImage: "desktopcomputer").font(.headline)
                 Spacer()
+                TemperaturePill(celsius: resources?.gpu_temperature_c)
                 ReadingState(state: state)
             }
             Text("\(node.capitalized) · \(MetricFormat.age(sample?.sampled_at, now: now))")
@@ -225,10 +309,7 @@ private struct HostResourceCard: View {
                 }
                 .font(.caption2).foregroundStyle(.secondary)
             }
-            HStack {
-                MetricTile(title: "GPU temperature", value: MetricFormat.number(resources?.gpu_temperature_c, suffix: " °C", digits: 0))
-                MetricTile(title: "GPU power", value: MetricFormat.number(resources?.gpu_power_watts, suffix: " W"))
-            }
+            MetricTile(title: "GPU power", value: MetricFormat.number(resources?.gpu_power_watts, suffix: " W"))
             Divider()
             ioRow("Network", first: "↓ " + MetricFormat.rate(resources?.network_rx_bytes_per_second),
                   second: "↑ " + MetricFormat.rate(resources?.network_tx_bytes_per_second))

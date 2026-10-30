@@ -25,6 +25,90 @@ struct ModelEntry: Identifiable, Codable {
     var ranking: ModelRanking? = nil
     /// Strix entries only: the name halo-ctl takes and lists for this model.
     var ctl_id: String? = nil
+    /// YYYY-MM-DD the entry last changed, and where that date came from (spark_serve_freshness.py).
+    var updated: String? = nil
+    var updated_source: String? = nil
+}
+
+/// `spark-serve about --json`: when this checkout (and its local catalog) last changed.
+struct AppAbout: Codable {
+    var source: String? = nil
+    var short: String? = nil
+    var branch: String? = nil
+    var dirty: Bool? = nil
+    var committed_at: String? = nil
+    var updated: String? = nil
+    var catalog_saved: String? = nil
+}
+
+/// Pure formatting for the header and card "Updated" lines; covered by gui/tests.
+enum FreshnessFacts {
+    private static let isoDay: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = .current
+        f.dateFormat = "yyyy-MM-dd"
+        return f
+    }()
+    private static let longDay: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = .current
+        f.dateFormat = "MMM d, yyyy"
+        return f
+    }()
+
+    /// "2026-10-30" -> "Oct 30, 2026"; anything else passes through unchanged.
+    static func longDate(_ day: String) -> String {
+        guard let date = isoDay.date(from: day) else { return day }
+        return longDay.string(from: date)
+    }
+
+    /// "Updated Oct 30, 2026 · a17400e", or nil before the backend answers.
+    static func headerTitle(_ about: AppAbout?) -> String? {
+        guard let about, let day = about.updated else { return nil }
+        var parts = ["Updated \(longDate(day))"]
+        if let short = about.short { parts.append(about.dirty == true ? "\(short)+" : short) }
+        return parts.joined(separator: " · ")
+    }
+
+    static func headerHelp(_ about: AppAbout?, builtAt: Date?) -> String {
+        guard let about else { return "" }
+        var lines: [String] = []
+        if about.source == "git" {
+            let branch = about.branch.map { " on \($0)" } ?? ""
+            lines.append("Last commit \(about.short ?? "?")\(branch), \(about.committed_at ?? about.updated ?? "?")")
+            if about.dirty == true { lines.append("The checkout also has uncommitted changes (+).") }
+        } else if about.updated != nil {
+            lines.append("Not a git checkout; spark-serve script saved \(about.updated!)")
+        }
+        if let saved = about.catalog_saved { lines.append("models.toml saved \(saved)") }
+        if let builtAt { lines.append("This app was built \(isoDay.string(from: builtAt))") }
+        return lines.joined(separator: "\n")
+    }
+
+    /// Card line: "Updated 2026-10-30".
+    static func cardTitle(_ model: ModelEntry) -> String? {
+        model.updated.map { "Updated \($0)" }
+    }
+
+    static func cardHelp(_ model: ModelEntry) -> String {
+        switch model.updated_source {
+        case "catalog field": return "From the entry's `updated` field in models.toml."
+        case "measured": return "Date the entry was last measured (measured-performance.json)."
+        case "models.toml saved": return "Local-only or locally edited entry: date models.toml was last saved."
+        case let source? where source.hasPrefix("commit "):
+            return "Last git \(source) touching this entry in models.example.toml."
+        default: return ""
+        }
+    }
+
+    /// Build time of the running binary, for the header tooltip.
+    static var builtAt: Date? {
+        guard let path = Bundle.main.executablePath,
+              let attrs = try? FileManager.default.attributesOfItem(atPath: path) else { return nil }
+        return attrs[.modificationDate] as? Date
+    }
 }
 
 /// Catalog-relative score from spark_serve_ranking.py; `best` marks the starred card.
@@ -205,6 +289,7 @@ enum SparkServePaths {
 final class CLIRunner: ObservableObject {
     @Published var status: ClusterStatus?
     @Published var models: [ModelEntry] = []
+    @Published var about: AppAbout?
     @Published var bootState: BootState = .idle
     @Published var logLines: [String] = []
     @Published var rebootDialog = false
@@ -217,7 +302,6 @@ final class CLIRunner: ObservableObject {
     private let home: URL?
     private let cliPath: String
     let telemetry: TelemetryStore
-    let benchmarks: BenchmarkStore
     private var pollTimer: Timer?
     private var refreshInFlight = false
     private var shuttingDown = false
@@ -405,13 +489,11 @@ final class CLIRunner: ObservableObject {
         home = resolvedHome
         cliPath = resolvedHome?.appendingPathComponent("spark-serve").path ?? ""
         telemetry = TelemetryStore(home: resolvedHome)
-        benchmarks = BenchmarkStore(home: resolvedHome)
         terminationObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.willTerminateNotification, object: nil, queue: .main
         ) { [weak self] _ in self?.shutdown() }
         startPolling()
         telemetry.start()
-        benchmarks.refreshHistory()
     }
 
     deinit {
@@ -423,18 +505,19 @@ final class CLIRunner: ObservableObject {
         shuttingDown = true
         stopPolling()
         telemetry.stop()
-        benchmarks.stop()
         if upProcess?.isRunning == true { upProcess?.terminate() }
     }
 
-    func refresh() {
+    func refresh(reloadAbout: Bool = false) {
         // A slow SSH status request must not accumulate behind timer/UI refreshes.
         guard Thread.isMainThread else {
-            DispatchQueue.main.async { [weak self] in self?.refresh() }
+            DispatchQueue.main.async { [weak self] in self?.refresh(reloadAbout: reloadAbout) }
             return
         }
         guard !shuttingDown, !refreshInFlight else { return }
         refreshInFlight = true
+        // Checkout date is local git only; fetch once at load and on a manual Refresh.
+        let needAbout = reloadAbout || about == nil
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             if self.cliPath.isEmpty || !FileManager.default.isExecutableFile(atPath: self.cliPath) {
@@ -445,11 +528,13 @@ final class CLIRunner: ObservableObject {
                 return
             }
             let models = self.decode(["list", "--json"], as: [ModelEntry].self) ?? []
+            let about = needAbout ? self.decode(["about", "--json"], as: AppAbout.self) : nil
             let status = self.decode(["status", "--json"], as: ClusterStatus.self)
             DispatchQueue.main.async {
                 self.refreshInFlight = false
                 guard !self.shuttingDown else { return }
                 self.models = models
+                if let about { self.about = about }
                 self.status = status
                 self.syncBootState(with: status)
             }
@@ -981,7 +1066,7 @@ struct SparkServeApp: App {
             MainView()
                 .environmentObject(runner)
                 .environmentObject(strix)
-                .frame(minWidth: 760, minHeight: 660)
+                .frame(minWidth: 900, minHeight: 660)
         }
         .windowStyle(.titleBar)
         .defaultSize(width: 1120, height: 800)
@@ -1153,16 +1238,13 @@ struct MainView: View {
             header
             Picker("Workspace", selection: $selectedTab) {
                 Text("Overview").tag("overview")
-                Text("Models").tag("models")
-                Text("Benchmarks").tag("benchmarks")
-                Text("Strix Halo").tag("strix")
+                Text("NVIDIA DGX Spark").tag("models")
+                Text("AMD Strix Halo").tag("strix")
             }
             .pickerStyle(.segmented)
             Divider()
             if selectedTab == "overview" {
                 OverviewView(telemetry: runner.telemetry, strix: strix)
-            } else if selectedTab == "benchmarks" {
-                BenchmarkView(benchmarks: runner.benchmarks, telemetry: runner.telemetry)
             } else if selectedTab == "strix" {
                 StrixView(store: strix)
             } else {
@@ -1228,6 +1310,12 @@ struct MainView: View {
                     Text("\(s.head) + \(s.worker)")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                }
+                if let updated = FreshnessFacts.headerTitle(runner.about) {
+                    Text(updated)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .help(FreshnessFacts.headerHelp(runner.about, builtAt: FreshnessFacts.builtAt))
                 }
                 if let note = runner.transitionNote {
                     Text(note)
@@ -1354,7 +1442,7 @@ struct MainView: View {
                         .buttonStyle(.bordered)
                         .disabled(runner.isBusy)
                 }
-                Button("Refresh") { runner.refresh() }
+                Button("Refresh") { runner.refresh(reloadAbout: true) }
                     .buttonStyle(.bordered)
             }
         }
@@ -1928,6 +2016,13 @@ struct ModelCard: View {
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+            }
+            if let updated = FreshnessFacts.cardTitle(model) {
+                Text(updated)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .help(FreshnessFacts.cardHelp(model))
             }
             if showNotes && !model.notes.isEmpty {
                 Text(model.notes)

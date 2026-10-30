@@ -42,7 +42,8 @@ def test_summary_uses_newest_matching_pair_and_drops_host_identity():
     assert "private" not in json.dumps(out)
 
 
-def test_catalog_json_attaches_measured_performance(monkeypatch, capsys):
+def test_catalog_json_attaches_measured_performance(monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("SPARK_SERVE_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(cli, "measured_performance", lambda: {"a": {"single_stream_tokens_per_second": 12.5}})
     cfg = {"cluster": {"nnodes": 2}, "models": {
         "a": {"image": "i", "quant": "EXL3 2.9bpw", "quant_bits": 2.9, "quant_scope": "all", "quant_detail": "d"},

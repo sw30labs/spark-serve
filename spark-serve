@@ -57,6 +57,7 @@ from spark_serve_controller import (
     yue_catalog_entry,
     atomic_json,
 )
+import spark_serve_freshness as freshness
 from spark_serve_nodes import launch_config, node_url, placement
 from spark_serve_nim import validate_nim_plan, nim_docker_argv, parse_nim_primary_node
 from spark_serve_tensorfold import (
@@ -925,9 +926,40 @@ def measured_performance() -> dict:
         return {}
 
 
+def _example_models() -> dict:
+    try:
+        with EXAMPLE.open("rb") as f:
+            return tomllib.load(f).get("models", {})
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+
+
+def catalog_freshness(cfg: dict, performance: dict) -> dict:
+    """Per-entry {"updated", "updated_source"}; see spark_serve_freshness. Never fails the list."""
+    try:
+        paths = [CATALOG, EXAMPLE, HERE / "measured-performance.json"]
+        return freshness.cached(
+            HERE, state_dir() / "catalog-freshness.json", paths,
+            lambda: freshness.entry_dates(HERE, cfg.get("models") or {}, _example_models(),
+                                          performance, CATALOG, EXAMPLE))
+    except Exception:  # noqa: BLE001 - a date must never hide the catalog
+        return {}
+
+
+def cmd_about_json() -> None:
+    try:
+        info = freshness.app_info(HERE)
+    except Exception:  # noqa: BLE001
+        info = {"source": None, "updated": None}
+    stamp = CATALOG.stat().st_mtime if CATALOG.exists() else None
+    info["catalog_saved"] = freshness._day(stamp) if stamp else None
+    print(json.dumps(info, indent=2))
+
+
 def cmd_list_json(cfg: dict) -> None:
     out = []
     performance = measured_performance()
+    dates = catalog_freshness(cfg, performance)
     for mid, m in cfg["models"].items():
         out.append({
             "id": mid,
@@ -947,6 +979,8 @@ def cmd_list_json(cfg: dict) -> None:
             "quant_scope": m.get("quant_scope"),
             "quant_detail": m.get("quant_detail"),
             "modalities": modalities(m),
+            "updated": (dates.get(mid) or {}).get("updated"),
+            "updated_source": (dates.get(mid) or {}).get("updated_source"),
         })
     ranking = score_models(out)
     for item in out:
@@ -1859,6 +1893,9 @@ def build_parser() -> argparse.ArgumentParser:
     lst = sub.add_parser("list", help="show catalog")
     lst.add_argument("--json", action="store_true", help="emit catalog as JSON")
 
+    about = sub.add_parser("about", help="when this checkout and its catalog last changed")
+    about.add_argument("--json", action="store_true", help="emit as JSON (the default)")
+
     st = sub.add_parser("status", help="containers + /v1/models")
     st.add_argument("--json", action="store_true", help="emit status as JSON")
 
@@ -1958,6 +1995,9 @@ def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     if args.cmd in ("watch", "bench"):
         _JSON_MODE = args.cmd == "watch" or args.bench_cmd == "run" or bool(args.json)
+    if args.cmd == "about":
+        cmd_about_json()
+        return
     cfg = load()
     if args.cmd == "strix":
         sys.exit(strix_main(cfg, args, measured_performance()))

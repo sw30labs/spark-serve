@@ -277,7 +277,7 @@ buffers that grow with context. It was not tested. The UD-Q4_K_XL files stay on
 the load. If the master's unit exits, `up` reports the unit's last journal line.
 In the app, Stop abandons a start that is still loading.
 
-The app's Strix Halo tab has one panel per box. Each shows the box's state,
+The app's AMD Strix Halo tab has one panel per box. Each shows the box's state,
 cluster role, resources, inference mode and RPC worker, with Stop, Copy
 connection details and Logs buttons. Below the panels are the model cards, one
 column per engine, including models on disk without a catalog entry. Each card

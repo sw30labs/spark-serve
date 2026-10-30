@@ -1,10 +1,12 @@
 # Native monitoring and benchmarks
 
-Spark Serve keeps model control, monitoring, and benchmarks in the same macOS
-app. The **Overview** shows physical Spark resources and logical model
-allocations. **Models** retains placement, start/stop, and Hermes selection.
-**Benchmarks** exercises an already-serving allocation and stores its results
-locally. Selecting Hermes does not select or move the monitored workload.
+Spark Serve keeps model control and monitoring in the macOS app; benchmarks run
+from the CLI. The **Overview** shows physical Spark resources and logical model
+allocations. **NVIDIA DGX Spark** retains placement, start/stop, and Hermes
+selection. `spark-serve bench` exercises an already-serving allocation and
+stores its results locally. The app's Benchmarks tab was removed on
+2026-10-25 ([ADR 0015](adr/0015-remove-native-benchmarks-tab.md)). Selecting
+Hermes does not select or move the monitored workload.
 
 Rationale: [native app boundary](adr/0001-native-app-cli.md),
 [telemetry](adr/0006-ephemeral-telemetry.md),
@@ -20,9 +22,9 @@ make -f gui/Makefile
 open gui/SparkServeApp.app
 ```
 
-Monitoring starts with the app and stays active across tabs. Use Models to
-manage workloads, then choose a ready allocation in Benchmarks to run a decode
-test or prefill sweep. The app uses the same CLI `watch` and `bench` commands.
+Monitoring starts with the app and stays active across tabs. Use the NVIDIA DGX
+Spark tab to manage workloads, then run `spark-serve bench run` against a ready
+allocation for a decode test or prefill sweep. The app uses the CLI `watch` command.
 The [README screenshots](../README.md#screenshots) show the current interface
 with synthetic demo data captured September 26, 2026, not hardware performance
 measurements.
@@ -128,17 +130,16 @@ measurements or model-quality evaluations. Concurrent user traffic, prefix
 caching, prompt size, reasoning mode, and model configuration affect results.
 
 Admission uses the controller lock to verify physical scope and immutable
-allocation identity. The app also pins the allocation selected when Run was
-clicked (`--allocation-id` in the CLI), rejecting a replacement before sending
-any requests. A benchmark leases all participating hosts, so a TP2 run
+allocation identity. `--allocation-id` pins the selected allocation, rejecting a
+replacement before sending any requests. A benchmark leases all participating hosts, so a TP2 run
 cannot overlap a second run aimed at its worker. Stop, switch, reboot, and
 shutdown revoke overlapping benchmark leases before changing workloads. Cancellation closes
 client requests; it does not prove that the inference engine has already
 reclaimed every request's GPU work. Lifecycle idle checks remain authoritative.
 
 Results live under `~/.local/state/spark-serve/benchmarks` (or
-`SPARK_SERVE_STATE_DIR/benchmarks`). The app reads the same history as the CLI
-and can compare saved runs. Failed and cancelled runs retain their status and
+`SPARK_SERVE_STATE_DIR/benchmarks`). `spark-serve bench list` reads that
+history. Failed and cancelled runs retain their status and
 partial evidence rather than appearing successful.
 
 ## Scope and provenance
@@ -159,6 +160,6 @@ make -f gui/Makefile smoke
 ```
 
 The Python suite uses local fixtures and injected transports. The native smoke
-test decodes synthetic backend-generated status, telemetry, and benchmark
+test decodes synthetic backend-generated status, model, and telemetry
 records and checks bounded history, null counters, and stale state. Neither
 test suite submits inference requests or changes a Spark workload.
