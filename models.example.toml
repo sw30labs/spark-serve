@@ -644,6 +644,25 @@ max_tokens = 32768
 roce = true
 master_port = 29551
 
+# MiaAI-Lab DeepSeek-V4.1-Flash-1017 EXL3 TensorFold TP2 recipe (catalog entry; served by the recipe's own start.sh on port 8888).
+# Recipe: https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks @0e7d421eb4797d98dc781dad764b8f86d34118ae
+# Start (on the head, in the recipe checkout): DRY_RUN=1 ./start.sh, then ./start.sh; after an update a running pair needs ./start.sh restart once.
+[models.ds41-1017-tf]
+label = "DeepSeek-V4.1-Flash-1017 EXL3 TensorFold"
+image = "tensorfold-dsv41:exl3-tp2-7d71dcdf7f2f"  # the recipe's local build tag (scripts/config.sh image_hash @0e7d421e)
+container = "dsv41-1017-exl3-tf"  # the recipe's CONTAINER_NAME, the same on both Sparks
+hf_id = "Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1-2.9-bpw"
+revision = "45ee5d0fd106c94a3d77f721e09cbb2f50e5a16b"  # recipe pin (scripts/config.sh @0e7d421e, EAQ v1); EAQ v1.1 aee640e2 is opt-in (EAQ_V1_1=1)
+served_name = "DeepSeek-V4.1-Flash-1017"
+wrapper = "tensorfold"
+max_model_len = 1048576  # recipe (CONTEXT default); recipe README: 524288 is the practical limit on a head running other software
+quant = "EXL3 2.9bpw (experts 3/2-bit, attn 5-bit)"
+quant_bits = 2
+quant_scope = "all"
+quant_detail = "Routed experts EXL3 3-bit (2-bit in layers 18-22), attention and indexer EXL3 5-8 bit, shared experts 4-5 bit, head 6-bit, DSpark/MTP 4-bit; embeddings and norms BF16, router gate F16/F32; Engram tables taken unmodified from the base repo."
+modalities = ["text", "image"]
+notes = "MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks @0e7d421e, TP2, TensorFold fork bertholomus fbbc9713 + patches 0001-0038 (0002, 0006 removed), weights unchanged (EAQ v1 45ee5d0f / v1.1 aee640e2), image builds locally; TF_FILL_* prefill switches opt-in; restart once after update; not qualified locally."
+
 # AMD Strix Halo boxes: one engine at a time on each through its halo-ctl
 # (halo-inference-control); `./spark-serve strix up <id> --box <host>` stops
 # the others there. The cluster engine spans both boxes: --box is its master.
