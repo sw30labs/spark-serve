@@ -683,7 +683,8 @@ quant_bits = 4
 quant_scope = "all"
 quant_detail = "Halogen v2 checkpoint, 4.16 bits a weight on average: experts and trunk 4-bit, mixing layers 6-bit, draft-head projections 8-bit."
 modalities = ["text"]
-notes = "halogen-flash-server 0.18.11 on gfx1151. 4 KV slots, prompt cache, n-gram + MTP drafts. Vision sidecar present but not loaded."
+notes = "halogen-flash-server 0.18.20 on gfx1151 (amd-halo-2 since 2026-10-30 19:03 ET). 4 KV slots, prompt cache, n-gram + MTP drafts. Vision sidecar present but not loaded."
+updated = 2026-10-30
 
 [strix.models.halo-qwen38-cluster]
 label = "Qwen3.8-Flash-Next Q8 cluster"

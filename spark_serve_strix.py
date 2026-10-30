@@ -500,8 +500,12 @@ def logs(cfg: dict, host: str | None = None, lines: int = 60) -> dict:
     return {"host": host, "units": units, "lines": out.splitlines()[-lines:]}
 
 
-def catalog(cfg: dict, performance: dict) -> list[dict]:
-    """Card entries in the same shape as `spark-serve list --json`, ranked within this site."""
+def catalog(cfg: dict, performance: dict, dates: dict | None = None) -> list[dict]:
+    """Card entries in the same shape as `spark-serve list --json`, ranked within this site.
+
+    ``dates`` maps id -> {"updated", "updated_source"} (spark_serve_freshness).
+    """
+    dates = dates or {}
     from spark_serve_ranking import modalities, score_models
     site(cfg)  # no [strix] hosts: the app hides the boxes
     out = []
@@ -515,6 +519,8 @@ def catalog(cfg: dict, performance: dict) -> list[dict]:
             "quant": m.get("quant"), "quant_bits": m.get("quant_bits"),
             "quant_scope": m.get("quant_scope"), "quant_detail": m.get("quant_detail"),
             "modalities": modalities(m), "ctl_id": ctl_id(m) if m.get("engine") in ENGINES else None,
+            "updated": (dates.get(mid) or {}).get("updated"),
+            "updated_source": (dates.get(mid) or {}).get("updated_source"),
         })
     ranking = score_models(out)
     for item in out:
@@ -640,11 +646,11 @@ def _box_line(b: dict) -> str:
     return f"{b['host']}: {b['engine']} {b['phase']}{role}{serving}"
 
 
-def main(cfg: dict, args, performance: dict) -> int:
+def main(cfg: dict, args, performance: dict, dates: dict | None = None) -> int:
     """`spark-serve strix …` entry point; JSON on stdout, errors as an error event."""
     try:
         if args.strix_cmd == "list":
-            items = catalog(cfg, performance)
+            items = catalog(cfg, performance, dates)
             if args.json:
                 print(json.dumps(items, indent=2))
             else:

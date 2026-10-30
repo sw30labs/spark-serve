@@ -926,22 +926,32 @@ def measured_performance() -> dict:
         return {}
 
 
-def _example_models() -> dict:
+def _example_models(table: str = "models") -> dict:
     try:
         with EXAMPLE.open("rb") as f:
-            return tomllib.load(f).get("models", {})
+            data = tomllib.load(f)
     except (OSError, tomllib.TOMLDecodeError):
         return {}
+    for key in table.split("."):
+        data = data.get(key) if isinstance(data, dict) else None
+    return data if isinstance(data, dict) else {}
 
 
-def catalog_freshness(cfg: dict, performance: dict) -> dict:
-    """Per-entry {"updated", "updated_source"}; see spark_serve_freshness. Never fails the list."""
+def catalog_freshness(cfg: dict, performance: dict, table: str = "models") -> dict:
+    """Per-entry {"updated", "updated_source"}; see spark_serve_freshness. Never fails the list.
+
+    table="strix.models" dates the [strix.models.*] cards with the same rules.
+    """
     try:
+        live = cfg
+        for key in table.split("."):
+            live = (live or {}).get(key) or {}
         paths = [CATALOG, EXAMPLE, HERE / "measured-performance.json"]
+        name = "catalog-freshness.json" if table == "models" else f"catalog-freshness-{table.replace('.', '-')}.json"
         return freshness.cached(
-            HERE, state_dir() / "catalog-freshness.json", paths,
-            lambda: freshness.entry_dates(HERE, cfg.get("models") or {}, _example_models(),
-                                          performance, CATALOG, EXAMPLE))
+            HERE, state_dir() / name, paths,
+            lambda: freshness.entry_dates(HERE, live, _example_models(table),
+                                          performance, CATALOG, EXAMPLE, table))
     except Exception:  # noqa: BLE001 - a date must never hide the catalog
         return {}
 
@@ -2000,7 +2010,9 @@ def main(argv: list[str] | None = None) -> None:
         return
     cfg = load()
     if args.cmd == "strix":
-        sys.exit(strix_main(cfg, args, measured_performance()))
+        performance = measured_performance()
+        dates = catalog_freshness(cfg, performance, "strix.models") if args.strix_cmd == "list" else {}
+        sys.exit(strix_main(cfg, args, performance, dates))
     if args.cmd == "list":
         if args.json:
             cmd_list_json(cfg)

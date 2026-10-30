@@ -136,3 +136,67 @@ def test_about_json(monkeypatch, capsys, tmp_path):
     cli.main(["about", "--json"])
     info = json.loads(capsys.readouterr().out)
     assert info["source"] in ("git", "mtime") and "updated" in info and info["catalog_saved"] is None
+
+
+STRIX_EXAMPLE = """[models.a]
+image = "a1"
+
+[strix]
+hosts = ["one"]
+
+[strix.models.halo-a]
+engine = "halogen"
+notes = "n"
+
+[strix.models.halo-b]
+engine = "halogen"
+"""
+
+
+def test_strix_table_ranges_ignore_spark_entries():
+    assert fr.entry_line_ranges(STRIX_EXAMPLE, "strix.models") == {"halo-a": [(7, 10)], "halo-b": [(11, 12)]}
+    assert fr.entry_line_ranges(STRIX_EXAMPLE) == {"a": [(1, 3)]}
+
+
+def test_strix_entry_dates_use_the_same_rules(tmp_path):
+    git(tmp_path, "init", "-q")
+    example = tmp_path / "models.example.toml"
+    example.write_text(STRIX_EXAMPLE)
+    git(tmp_path, "add", ".")
+    git(tmp_path, "commit", "-qm", "strix", when="2026-10-19T12:00:00")
+    live = {"halo-a": {"engine": "halogen", "notes": "n", "updated": dt.date(2026, 10, 30)},
+            "halo-b": {"engine": "halogen"}}
+    example_models = {"halo-a": {"engine": "halogen", "notes": "n"}, "halo-b": {"engine": "halogen"}}
+    dates = fr.entry_dates(tmp_path, live, example_models, {}, tmp_path / "none.toml", example, "strix.models")
+    assert dates["halo-a"] == {"updated": "2026-10-30", "updated_source": "catalog field"}
+    assert dates["halo-b"]["updated"] == "2026-10-19" and dates["halo-b"]["updated_source"].startswith("commit ")
+
+
+def test_strix_list_json_carries_updated(monkeypatch, capsys, tmp_path):
+    import spark_serve_strix as strix
+    monkeypatch.setenv("SPARK_SERVE_STATE_DIR", str(tmp_path))
+    cfg = {"strix": {"hosts": ["one"], "models": {
+        "halo-a": {"engine": "halogen", "served_name": "a"}, "halo-b": {"engine": "halogen", "served_name": "b"}}}}
+    items = {i["id"]: i for i in strix.catalog(cfg, {}, {"halo-a": {"updated": "2026-10-30", "updated_source": "catalog field"}})}
+    assert items["halo-a"]["updated"] == "2026-10-30" and items["halo-a"]["updated_source"] == "catalog field"
+    assert items["halo-b"]["updated"] is None
+    assert strix.catalog(cfg, {})[0]["updated"] is None  # older callers without dates
+    monkeypatch.setattr(cli, "load", lambda: cfg)
+    monkeypatch.setattr(cli, "measured_performance", lambda: {})
+    seen = {}
+    def fake(c, perf, table="models"):
+        seen["table"] = table
+        return {"halo-b": {"updated": "2026-10-19", "updated_source": "commit abc1234"}}
+    monkeypatch.setattr(cli, "catalog_freshness", fake)
+    try:
+        cli.main(["strix", "list", "--json"])
+    except SystemExit as exc:
+        assert exc.code in (0, None)
+    out = {i["id"]: i for i in json.loads(capsys.readouterr().out)}
+    assert seen["table"] == "strix.models" and out["halo-b"]["updated"] == "2026-10-19"
+
+
+def test_halo_qwen38_card_carries_its_0_18_20_date():
+    import tomllib
+    entry = tomllib.loads((ROOT / "models.example.toml").read_text())["strix"]["models"]["halo-qwen38"]
+    assert entry["updated"] == dt.date(2026, 10, 30) and "0.18.20" in entry["notes"]

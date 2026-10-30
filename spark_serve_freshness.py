@@ -4,7 +4,8 @@ Dates come from sources that already exist, never from "now":
 
 - App: the commit date of the checkout's HEAD (plus short hash and branch).
   Not a git checkout -> the mtime of the spark-serve script.
-- Entry, first match wins:
+- Entry ([models.<id>] or, with table="strix.models", [strix.models.<id>]),
+  first match wins:
   1. an explicit ``updated = 2026-10-30`` in the entry's models.toml table;
   2. the entry matches models.example.toml -> newest committer date among the
      tracked lines of that entry's tables (one ``git blame`` for the file);
@@ -27,7 +28,13 @@ import tempfile
 from pathlib import Path
 
 CACHE_SCHEMA = 1
-_HEADER = re.compile(r"^\s*\[\s*models\.([A-Za-z0-9_-]+)\s*[.\]]")
+_HEADERS: dict[str, re.Pattern] = {}
+
+
+def _header(table: str) -> re.Pattern:
+    if table not in _HEADERS:
+        _HEADERS[table] = re.compile(r"^\s*\[\s*" + re.escape(table) + r"\.([A-Za-z0-9_-]+)\s*[.\]]")
+    return _HEADERS[table]
 _ANY_TABLE = re.compile(r"^\s*\[")
 
 
@@ -65,8 +72,9 @@ def app_info(here: Path) -> dict:
             "committed_at": None, "updated": _day(stamp) if stamp else None}
 
 
-def entry_line_ranges(text: str) -> dict[str, list[tuple[int, int]]]:
-    """1-based inclusive line ranges of each [models.<id>...] table."""
+def entry_line_ranges(text: str, table: str = "models") -> dict[str, list[tuple[int, int]]]:
+    """1-based inclusive line ranges of each [<table>.<id>...] table."""
+    header = _header(table)
     ranges: dict[str, list[tuple[int, int]]] = {}
     current, start = None, 0
     lines = text.splitlines()
@@ -74,7 +82,7 @@ def entry_line_ranges(text: str) -> dict[str, list[tuple[int, int]]]:
         if _ANY_TABLE.match(line):
             if current is not None:
                 ranges.setdefault(current, []).append((start, number - 1))
-            match = _HEADER.match(line)
+            match = header.match(line)
             current, start = (match.group(1), number) if match else (None, 0)
     if current is not None:
         ranges.setdefault(current, []).append((start, len(lines)))
@@ -116,12 +124,12 @@ def _explicit(value) -> str | None:
 
 
 def entry_dates(here: Path, models: dict, example_models: dict | None, performance: dict,
-                catalog: Path, example: Path) -> dict[str, dict]:
+                catalog: Path, example: Path, table: str = "models") -> dict[str, dict]:
     example_models = example_models or {}
     ranges: dict[str, list[tuple[int, int]]] = {}
     times: dict[int, tuple[int, str]] = {}
     if example.exists() and any(mid in example_models for mid in models):
-        ranges = entry_line_ranges(example.read_text(encoding="utf-8", errors="replace"))
+        ranges = entry_line_ranges(example.read_text(encoding="utf-8", errors="replace"), table)
         times = blame_times(here, example.name)
     catalog_mtime = _mtime(catalog)
     out = {}

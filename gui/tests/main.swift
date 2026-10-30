@@ -54,6 +54,8 @@ check(FreshnessFacts.headerTitle(dirtyAbout) == "Updated Oct 25, 2026 · a17400e
 let emptyAbout = try decoder.decode(AppAbout.self, from: Data("{}".utf8))
 check(FreshnessFacts.headerTitle(nil) == nil && FreshnessFacts.headerTitle(emptyAbout) == nil, "No date, no header line")
 check(FreshnessFacts.headerHelp(aboutGit, builtAt: nil).contains("models.toml saved 2026-10-25"), "Header tooltip names the catalog date")
+let strixDated = try decoder.decode(ModelEntry.self, from: Data(#"{"id":"halo-qwen38","label":"Qwen3.8-Flash-Next Halogen","aliases":[],"served_name":"q","ctx":262144,"image":"halogen","notes":"","wrapper":"halogen","hermes_provider":"","backend":"halogen","topology":"strix","ctl_id":"q","updated":"2026-10-30","updated_source":"catalog field"}"#.utf8))
+check(FreshnessFacts.cardTitle(strixDated) == "Updated 2026-10-30" && FreshnessFacts.cardHelp(strixDated).contains("updated"), "Strix cards decode and show their entry date")
 check(sampleModel("x", "X").performance == nil, "Catalog entries without measurements decode without performance")
 check(ModelCardFacts.runtimeTitle(wrapper: "halogen") == "Halogen", "Halogen cards use a Halogen pill")
 check(ModelCardFacts.runtimeTitle(wrapper: "lemonade") == "Lemonade", "Lemonade cards use a Lemonade pill")
