@@ -42,6 +42,18 @@ check(sampleModel("x", "X").ranking == nil && sampleModel("x", "X").modalities =
 check(ModelCardFacts.speedTitle(51.193) == "51.2 tok/s", "Card speed shows one decimal below 100 tok/s")
 check(ModelCardFacts.speedTitle(123.6) == "124 tok/s", "Card speed rounds at or above 100 tok/s")
 check(ModelCardFacts.speedTitle(nil) == nil && ModelCardFacts.speedTitle(0) == nil, "Missing speed hides the pill")
+check(sampleModel("x", "X").updated == nil && FreshnessFacts.cardTitle(sampleModel("x", "X")) == nil, "Entries without a date show no Updated line")
+var dated = sampleModel("x", "X"); dated.updated = "2026-10-30"; dated.updated_source = "commit a17400e"
+check(FreshnessFacts.cardTitle(dated) == "Updated 2026-10-30", "Cards show their entry date")
+check(FreshnessFacts.cardHelp(dated).contains("a17400e"), "Card tooltip names the commit")
+check(FreshnessFacts.longDate("2026-10-30") == "Oct 30, 2026" && FreshnessFacts.longDate("soon") == "soon", "Header dates are spelled out")
+let aboutGit = try decoder.decode(AppAbout.self, from: Data(#"{"source":"git","short":"a17400e","branch":"main","dirty":false,"committed_at":"2026-10-25T12:03:35-04:00","updated":"2026-10-25","catalog_saved":"2026-10-25"}"#.utf8))
+check(FreshnessFacts.headerTitle(aboutGit) == "Updated Oct 25, 2026 · a17400e", "Header shows checkout date and commit")
+var dirtyAbout = aboutGit; dirtyAbout.dirty = true
+check(FreshnessFacts.headerTitle(dirtyAbout) == "Updated Oct 25, 2026 · a17400e+", "Uncommitted changes are marked")
+let emptyAbout = try decoder.decode(AppAbout.self, from: Data("{}".utf8))
+check(FreshnessFacts.headerTitle(nil) == nil && FreshnessFacts.headerTitle(emptyAbout) == nil, "No date, no header line")
+check(FreshnessFacts.headerHelp(aboutGit, builtAt: nil).contains("models.toml saved 2026-10-25"), "Header tooltip names the catalog date")
 check(sampleModel("x", "X").performance == nil, "Catalog entries without measurements decode without performance")
 check(ModelCardFacts.runtimeTitle(wrapper: "halogen") == "Halogen", "Halogen cards use a Halogen pill")
 check(ModelCardFacts.runtimeTitle(wrapper: "lemonade") == "Lemonade", "Lemonade cards use a Lemonade pill")
