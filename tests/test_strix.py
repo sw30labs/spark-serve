@@ -444,3 +444,28 @@ def test_polling_leaves_a_failing_box_alone_for_a_minute_and_actions_retry_it(bo
     clock[0] += 61
     assert by_host(strix.status(CFG, poll=True))["one"]["error"] is None
     assert json.loads((strix._backoff_file()).read_text()) == {}
+
+
+PINNED = {"strix": {**CFG["strix"], "master": "one"}}
+
+
+def test_a_pinned_master_starts_the_cluster_without_a_box_and_refuses_the_other(boxes):
+    fake = boxes()
+    current = strix.up(PINNED, "halo-q")
+    assert commands(fake) == [("one", "~/bin/halo-ctl up cluster q8")]
+    assert current["master"] == "one" and current["cluster"]["worker"] == "two"
+    with pytest.raises(strix.StrixError, match="pinned to one"):
+        strix.up(PINNED, "halo-q", "two")
+
+
+def test_a_pinned_master_leaves_other_engines_on_either_box(boxes):
+    fake = boxes()
+    strix.up(PINNED, "halo-a", "two")
+    assert commands(fake) == [("two", "~/bin/halo-ctl up halogen")]
+
+
+def test_status_reports_the_pinned_master_and_rejects_an_unknown_one(boxes):
+    boxes()
+    assert strix.status(CFG)["master"] is None and strix.status(PINNED)["master"] == "one"
+    with pytest.raises(strix.StrixError, match="not one of the hosts"):
+        strix.pinned_master({"strix": {**CFG["strix"], "master": "three"}})

@@ -668,6 +668,7 @@ notes = "MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks @0e7d421e, TP2, Tensor
 # the others there. The cluster engine spans both boxes: --box is its master.
 [strix]
 hosts = ["strix-halo", "strix-halo-2"]   # SSH aliases; also the LAN hostnames clients use
+# master = "strix-halo"               # optional: the only box that runs the cluster as master
 ctl = "~/.local/bin/halo-ctl"
 api_key_file = "~/.config/halogen/api-key"   # read over SSH when needed, never stored here
 

@@ -62,6 +62,16 @@ def hosts(cfg: dict) -> list[str]:
     return list(names)
 
 
+def pinned_master(cfg: dict) -> str | None:
+    """The box pinned as the cluster's master by `[strix] master`, or None when either may be."""
+    pinned = site(cfg).get("master")
+    if pinned is None:
+        return None
+    if pinned not in hosts(cfg):
+        raise StrixError(f"[strix] master {pinned!r} is not one of the hosts: {', '.join(hosts(cfg))}")
+    return pinned
+
+
 def box(cfg: dict, name: str | None) -> str:
     """The box a command acts on; it must be named once there is more than one."""
     names = hosts(cfg)
@@ -333,7 +343,7 @@ def status(cfg: dict, poll: bool = False) -> dict:
               for b in boxes if b["error"]}
     if failed != {h: v for h, v in held.items() if h in names}:
         atomic_json(_backoff_file(), failed)
-    return _pair(boxes)
+    return {**_pair(boxes), "master": pinned_master(cfg)}
 
 
 def _by_host(current: dict) -> dict:
@@ -391,8 +401,13 @@ def up(cfg: dict, name: str, host: str | None = None, emit=None) -> dict:
     model on the same master.
     """
     emit = emit or (lambda event: None)
-    host = box(cfg, host)
     mid, model = target(cfg, name)
+    pinned = pinned_master(cfg) if model.get("engine") == "cluster" else None
+    if pinned:
+        if host not in (None, pinned):
+            raise StrixError(f"the cluster's master is pinned to {pinned} ([strix] master); start it with --box {pinned}")
+        host = pinned
+    host = box(cfg, host)
     model = {**model, "label": model.get("label") or mid or name}
     engine, wanted = model.get("engine"), ctl_id(model) if model.get("engine") in ENGINES else None
     if engine not in ENGINES:
@@ -701,7 +716,7 @@ def add_parser(sub) -> None:
     st.add_argument("--json", action="store_true")
     upc = commands.add_parser("up", help="serve a model on a box (stops what conflicts; the cluster takes both boxes)")
     upc.add_argument("model", help="catalog id or alias, or <engine>:<name> for a model on the box's disk")
-    upc.add_argument("--box", help="the box to serve on; for the cluster, its master")
+    upc.add_argument("--box", help="the box to serve on; for the cluster, its master ([strix] master pins it)")
     upc.add_argument("--json", action="store_true", help="JSON events are the default output")
     stp = commands.add_parser("stop", help="stop a box (its cluster, for the worker), or every box")
     stp.add_argument("--box", help="default: every box")

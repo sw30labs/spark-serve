@@ -77,6 +77,8 @@ struct StrixCluster: Codable {
 struct StrixSite: Codable {
     let boxes: [StrixStatus]
     let cluster: StrixCluster?
+    /// `[strix] master`: the only box that may run the cluster as master, when set.
+    var master: String? = nil
 }
 
 struct StrixConnection: Codable {
@@ -108,6 +110,7 @@ final class StrixStore: ObservableObject {
     @Published var models: [ModelEntry] = []
     @Published private(set) var boxes: [StrixStatus] = []
     @Published private(set) var cluster: StrixCluster?
+    @Published private(set) var master: String?
     @Published private(set) var busyAction: String?
     /// A start can be abandoned by Stop; a stop runs to the end.
     @Published private(set) var busyIsStart = false
@@ -191,6 +194,7 @@ final class StrixStore: ObservableObject {
     func apply(_ site: StrixSite?, at date: Date) {
         boxes = site?.boxes ?? []
         cluster = site?.cluster
+        master = site?.master
         guard let site else { return }
         sampledAt = date
         let now = date.timeIntervalSince1970
@@ -659,7 +663,9 @@ struct StrixView: View {
         VStack(alignment: .leading, spacing: 10) {
             if let choice = selectedChoice {
                 HStack(alignment: .top, spacing: 16) {
-                    ForEach(store.boxes, id: \.host) { box in
+                    // A pinned master leaves one cluster button; other engines still start on either box.
+                    ForEach(store.boxes.filter { choice.engine != "cluster" || store.master == nil || $0.host == store.master },
+                            id: \.host) { box in
                         startButton(choice, box.host)
                     }
                 }
