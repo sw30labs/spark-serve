@@ -252,6 +252,9 @@ catalog's vLLM argv; the script ends with `exec vllm serve "$@"`.
 CPU-only, offline preflight runs as `python3 -c <file> <preflight_args>` on every
 required Spark before a switch may stop anything (pin: `preflight_script_sha256`).
 `hf_cache_readonly = true` mounts the Hugging Face cache read-only.
+`hermes_base_url` (any model) pins the URL the Start hook writes into the
+`hermes_provider` block instead of `cluster.lan_url` + `/v1`, for example an IPv4
+address when the `.local` name resolves to IPv6 first. The port must match `cluster.port`.
 See [SuperDeepseek](docs/superdeepseek-abl.md) for the recipe that uses all three.
 
 Do not bake a sudo password in here. `up` drops page caches only if

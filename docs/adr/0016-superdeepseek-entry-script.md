@@ -48,7 +48,7 @@ wrapper. The pins, the `recipes/`-only rule and the vLLM-only scope keep it
 reviewable. Patching at start keeps the author's pinned image digest with no
 derived build. The cost is that the target must be re-verified whenever the
 image changes, and preflight does that before any stop. On ready, Hermes is
-retargeted to :8000 instead of the manual :8890. Intentional differences from
+retargeted to :8000 instead of the manual :8890 (see the amendment below). Intentional differences from
 `start.sh`:
 - `docker create` with a fenced start;
 - `--security-opt label=disable` and `-w /tmp`;
@@ -65,3 +65,17 @@ builds matches flag for flag (36 on rank 0, 37 on rank 1), except `--port`. The
 exited sparkone container holds the patched mapping.
 [Tests](../../tests/test_superdeepseek_recipe.py), [runbook](../superdeepseek-abl.md),
 [recipe](../../recipes/superdeepseek-abl/).
+
+**Amendment 2026-11-03 (Hermes over IPv4).** `sparkone.local` resolves to IPv6
+first and vLLM listens on IPv4 only, so the Start hook's
+`cluster.lan_url` target (`spark` provider) failed for Hermes. Other models,
+status and the app's endpoint checks still depend on `cluster.lan_url`, so it
+stays unchanged. Instead, a model may pin `hermes_base_url` (http(s), ending in
+`/v1`, no credentials, port equal to `cluster.port`). `ds4-super-abl` sets it to
+`http://192.168.86.57:8000/v1` with `hermes_provider = "spark-superds"`.
+The override names the head endpoint, so a worker placement keeps the worker
+URL. A bad value refuses `up` before any switch and never edits Hermes. The
+hook keeps an existing provider's display name, the legacy `spark-ds4` alias
+still follows `cluster.lan_url`, and the status `active_node` check also accepts
+the pinned URL, so the app still shows which node Hermes is using.
+[Tests](../../tests/test_superdeepseek_hermes.py).

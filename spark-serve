@@ -23,6 +23,7 @@ import textwrap
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path, PurePosixPath
+from urllib.parse import urlsplit
 
 
 def _ensure_python_311() -> None:
@@ -177,6 +178,32 @@ def recipe_text(model: dict, key: str, mid: str = "model") -> str | None:
             f"{mid}: recipes/{name} does not match {key}_sha256; current workload was not changed"
         )
     return data.decode()
+
+
+def hermes_base_url(cfg: dict, mid: str, model: dict) -> str:
+    """OpenAI base URL Hermes should use for this model.
+
+    Default: cluster.lan_url + /v1. A model may pin `hermes_base_url` (e.g. the
+    head's IPv4 address when its .local name resolves to IPv6 first and the
+    server listens on IPv4 only). The override names the head endpoint, so a
+    worker placement keeps the worker URL, and its port must be cluster.port.
+    """
+    default = cfg["cluster"]["lan_url"].rstrip("/") + "/v1"
+    override = model.get("hermes_base_url")
+    if override is None or (cfg.get("_spark_serve_placement") or {}).get("node") == "worker":
+        return default
+    try:
+        parsed = urlsplit(override) if isinstance(override, str) else None
+        port = parsed and (parsed.port or (443 if parsed.scheme == "https" else 80))
+    except ValueError:
+        parsed = None
+    if (parsed is None or parsed.scheme not in ("http", "https") or not parsed.hostname
+            or parsed.username or parsed.password or parsed.query or parsed.fragment
+            or parsed.path.rstrip("/") != "/v1"):
+        raise ControllerError(f"{mid}: hermes_base_url must be an http(s) URL ending in /v1 without credentials")
+    if port != int(cfg["cluster"].get("port") or 8000):
+        raise ControllerError(f"{mid}: hermes_base_url port must match cluster.port")
+    return override.rstrip("/")
 
 
 def validate_entry_script(mid: str, model: dict) -> None:
@@ -805,9 +832,18 @@ def _active_client_node(cfg: dict, nodes: list[dict]) -> str | None:
         provider = data.get("model", {}).get("provider")
         url = data.get("providers", {}).get(provider, {}).get("base_url", "").rstrip("/")
         selected_model = data.get("model", {}).get("default")
+        models = cfg.get("models") or {}
+
+        def accepted(item: dict) -> set[str]:
+            urls = {node_url(cfg, item["node"]) + "/v1"}
+            pinned = (models.get(item.get("model")) or {}).get("hermes_base_url")
+            if item["node"] == "head" and isinstance(pinned, str):
+                urls.add(pinned.rstrip("/"))
+            return urls
+
         return next((item["node"] for item in nodes
                      if item.get("can_use") and item.get("served") == selected_model
-                     and url == node_url(cfg, item["node"]) + "/v1"), None)
+                     and url in accepted(item)), None)
     except (OSError, ValueError, TypeError, AttributeError, ImportError):
         return None
 
@@ -1306,7 +1342,11 @@ def _hermes_patch(
     provider = model.get("hermes_provider") or "spark"
     ctx = int(model.get("hermes_context_length") or model.get("max_model_len") or 0)
     vision = model.get("hermes_supports_vision")
-    url = cfg["cluster"]["lan_url"].rstrip("/") + "/v1"
+    cluster_url = cfg["cluster"]["lan_url"].rstrip("/") + "/v1"
+    try:
+        url = hermes_base_url(cfg, mid, model)
+    except ControllerError as exc:
+        return (str(exc), False)
     node = cfg.get("_spark_serve_placement", {}).get("node", "head")
     py = None
     for cand in (
@@ -1355,7 +1395,7 @@ if {ctx}:
     model.pop('context_length', None)
 providers = data.setdefault('providers', {{}})
 block = providers.setdefault({provider!r}, {{}})
-block['name'] = 'Spark cluster'
+block['name'] = block.get('name') or 'Spark cluster'
 block['api_key'] = block.get('api_key') or 'dummy'
 block['api_mode'] = block.get('api_mode') or 'chat_completions'
 block['base_url'] = {url!r}
@@ -1367,7 +1407,7 @@ if isinstance({vision!r}, bool):
     settings['supports_vision'] = {vision!r}
 models[{served!r}] = settings
 if 'spark-ds4' in providers and {provider!r} != 'spark-ds4' and {node != 'worker'!r}:
-    providers['spark-ds4']['base_url'] = {url!r}
+    providers['spark-ds4']['base_url'] = {cluster_url!r}
 if engine == 'ruamel':
     buffer = io.StringIO()
     yaml_obj.dump(data, buffer)
@@ -1874,6 +1914,7 @@ def cmd_up(
             scoped = launch_config(cfg, mid, selected)
             # Also guards --print-cmd: a missing or edited entry script refuses here.
             validate_entry_script(mid, scoped["models"][mid])
+            hermes_base_url(scoped, mid, scoped["models"][mid])
         # Explicit placement is independent of client selection. Legacy `up`
         # without --node retains its existing retarget-after-readiness behavior.
         no_hermes = no_hermes or node is not None

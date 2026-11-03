@@ -32,6 +32,13 @@ On sparkone:
 - `spark-serve up ds4-super-abl --print-cmd` shows both rank scripts without
   touching the Sparks.
 
+## Hermes
+
+On ready, Start (without `--no-hermes`) selects provider `spark-superds` at
+`hermes_base_url` (`http://192.168.86.57:8000/v1`: IPv4 on purpose, since
+`sparkone.local` resolves to IPv6 first). It keeps that provider's name, key and
+other models, and leaves the `spark` provider alone.
+
 ## Standalone launcher
 
 `~/superdeepseek-abl/start.sh` / `stop.sh` still work on :8890 with the same
