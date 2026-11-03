@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import os
 import re
@@ -21,7 +22,7 @@ import tempfile
 import textwrap
 import time
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 
 def _ensure_python_311() -> None:
@@ -67,6 +68,16 @@ from spark_serve_tensorfold import (
 HERE = Path(__file__).resolve().parent
 CATALOG = HERE / "models.toml"
 EXAMPLE = HERE / "models.example.toml"
+RECIPES = HERE / "recipes"
+# Recipes whose weights are prepared outside spark-serve; `pull` explains how
+# instead of downloading them during a model switch.
+EXTERNAL_PREPARATION = {
+    "superdeepseek-abl": (
+        "prepare it on sparkone with ~/superdeepseek-abl/prepare.sh --yes (hard-links the local "
+        "DeepSeek-V4-Flash-0731 shards, downloads about 2.4 GiB once and rsyncs it to spark-two "
+        "over QSFP), then prepare.sh --yes --image for the pinned image on both Sparks"
+    ),
+}
 HERMES_CONFIG = Path.home() / ".hermes" / "config.yaml"
 
 # When True, die() emits a JSON-line error event (used by `up --json`).
@@ -142,6 +153,41 @@ def container_name(cfg: dict, model: dict | None = None) -> str:
     return str(cfg["cluster"].get("container") or "vllm_cluster")
 
 
+def recipe_text(model: dict, key: str, mid: str = "model") -> str | None:
+    """Return the reviewed recipe file a catalog key names, or None if unset.
+
+    The path is relative to recipes/ and cannot leave it. With `<key>_sha256`
+    set, the file must match the pin, so an edited script refuses before any
+    switch can stop the current workload.
+    """
+    name = model.get(key)
+    if name is None:
+        return None
+    relative = PurePosixPath(name) if isinstance(name, str) else None
+    if (relative is None or not name or relative.is_absolute() or ".." in relative.parts
+            or "\\" in name):
+        raise ControllerError(f"{mid}: {key} must be a relative path under recipes/")
+    path = RECIPES / relative
+    if not path.resolve().is_relative_to(RECIPES.resolve()) or not path.is_file():
+        raise ControllerError(f"{mid}: {key} recipes/{name} not found")
+    data = path.read_bytes()
+    pin = model.get(f"{key}_sha256")
+    if pin is not None and hashlib.sha256(data).hexdigest() != pin:
+        raise ControllerError(
+            f"{mid}: recipes/{name} does not match {key}_sha256; current workload was not changed"
+        )
+    return data.decode()
+
+
+def validate_entry_script(mid: str, model: dict) -> None:
+    """entry_script replaces the image ENTRYPOINT with a reviewed bash script."""
+    if model.get("entry_script") is None:
+        return
+    if (model.get("wrapper") or "vllm") != "vllm":
+        raise ControllerError(f"{mid}: entry_script is supported only with wrapper = \"vllm\"")
+    recipe_text(model, "entry_script", mid)
+
+
 def docker_base(cfg: dict, model: dict, name: str, rank: int = 0) -> list[str]:
     cluster = cfg["cluster"]
     shm = str(model.get("shm_size") or "10g")
@@ -167,7 +213,8 @@ def docker_base(cfg: dict, model: dict, name: str, rank: int = 0) -> list[str]:
         cache = ((cluster.get("worker_hf_cache_host") or cluster["hf_cache_host"])
                  if rank == 1 else cluster["hf_cache_host"])
         mount = model.get("hf_mount") or "/cache/huggingface"
-        cmd.extend(["-v", f"{cache}:{mount}"])
+        # Offline recipes can serve straight from a read-only cache.
+        cmd.extend(["-v", f"{cache}:{mount}" + (":ro" if model.get("hf_cache_readonly") else "")])
     for mnt in model.get("mounts") or []:
         if not isinstance(mnt, dict):
             continue
@@ -276,7 +323,15 @@ def docker_run_script(cfg: dict, model: dict, rank: int, headless: bool) -> str:
         )
         full = base + ["--entrypoint", "bash", image, "-lc", inner]
     else:
-        full = base + [image, *argv]
+        mid = (cfg.get("_spark_serve_placement") or {}).get("model") or name
+        entry = recipe_text(model, "entry_script", mid)
+        if entry is None:
+            full = base + [image, *argv]
+        else:
+            # The reviewed script travels inside the container command (visible
+            # in docker inspect), runs its in-container patches, then execs
+            # `vllm serve "$@"` with the catalog argv. No host files involved.
+            full = base + ["--entrypoint", "bash", image, "-c", entry, "spark-serve-entry", *argv]
     return docker_create_start_script(full, rank)
 
 
@@ -1383,6 +1438,8 @@ def cmd_pull(cfg: dict, name: str, node: str | None = None) -> None:
                    "qwen38-dual": "prepare_qwen38_dual.py",
                    "qwen38-dual-tensorfold": "prepare_qwen38_dual_tensorfold.py",
                    "dsv41-exl3": "prepare_dsv41_exl3.py"}
+        if recipe in EXTERNAL_PREPARATION:
+            die(f"{mid}: spark-serve does not download this recipe; {EXTERNAL_PREPARATION[recipe]}")
         if recipe not in scripts:
             die(f"unknown preparation recipe {recipe!r} for {mid}")
         command = [
@@ -1726,9 +1783,13 @@ def model_ready_timeout(model: dict) -> int:
 def model_preflight(cfg: dict, mid: str, model: dict, sink: _Sink) -> None:
     """Verify prepared assets without GPUs or changes to the current workload."""
     arguments = model.get("preflight_args")
-    if arguments is None:
+    # preflight_script: a reviewed recipes/ file run as `python3 -c <file> <preflight_args>`.
+    script = recipe_text(model, "preflight_script", mid)
+    if arguments is None and script is None:
         return
-    if (not isinstance(arguments, list) or not arguments
+    if script is not None and arguments is None:
+        arguments = []
+    if (not isinstance(arguments, list) or (script is None and not arguments)
             or any(not isinstance(arg, str) or not arg for arg in arguments)):
         raise ControllerError(f"{mid}: preflight_args must be a nonempty list of strings")
     preflight_timeout = model.get("preflight_timeout", 120)
@@ -1749,6 +1810,8 @@ def model_preflight(cfg: dict, mid: str, model: dict, sink: _Sink) -> None:
             # before the controller may stop either allocation member.
             plan = validate_tensorfold_plan(cfg, mid, rank=rank)
             rank_arguments = [*arguments, "--serve-args-json", json.dumps(plan.argv, separators=(",", ":"))]
+        if script is not None:
+            rank_arguments = ["-c", script, *rank_arguments]
         # Do not inherit docker_base(): it grants GPUs, RDMA devices, host
         # networking, writable caches, and model-specific privileged options.
         command = [
@@ -1809,6 +1872,8 @@ def cmd_up(
             mid, model = resolve_model(cfg, name)
             selected, hosts = placement(cfg, model, node)
             scoped = launch_config(cfg, mid, selected)
+            # Also guards --print-cmd: a missing or edited entry script refuses here.
+            validate_entry_script(mid, scoped["models"][mid])
         # Explicit placement is independent of client selection. Legacy `up`
         # without --node retains its existing retarget-after-readiness behavior.
         no_hermes = no_hermes or node is not None

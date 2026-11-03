@@ -663,6 +663,134 @@ quant_detail = "Routed experts EXL3 3-bit (2-bit in layers 18-22), attention and
 modalities = ["text", "image"]
 notes = "MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks @0e7d421e, TP2, TensorFold fork bertholomus fbbc9713 + patches 0001-0038 (0002, 0006 removed), weights unchanged (EAQ v1 45ee5d0f / v1.1 aee640e2), image builds locally; TF_FILL_* prefill switches opt-in; restart once after update; not qualified locally."
 
+# SuperDeepseek V4 Flash abliterated MQ (Jiunsong) — two Sparks, Anemll DSpark vLLM 0.25.1 fork.
+# ABLITERATED (refusals removed): the model card makes operators responsible for access control; keep it on the LAN.
+# spark-serve starts it on the spark-serve lane (:8000) through recipes/superdeepseek-abl/entry.sh, which applies the
+# recipe's tokenizer patch in the container and then execs `vllm serve` with the args below (docs/superdeepseek-abl.md).
+# The preflight checks the snapshot and the patch target on both Sparks before a switch stops anything.
+# `pull` does not download it: prepare with ~/superdeepseek-abl/prepare.sh on sparkone (hard-links the local
+# DeepSeek-V4-Flash-0731 shards, fetches ~2.43 GiB once, rsyncs over QSFP). That launcher's start.sh/stop.sh
+# still work on their own (:8890, same container name); only one of the two can run at a time.
+[models.ds4-super-abl]
+aliases = ["superdeepseek", "superdeepseek-abl"]
+label = "SuperDeepseek V4 Flash abliterated MQ (Jiunsong, 2x DGX)"
+image = "ghcr.io/anemll/dspark-vllm-gx10:0.1.1@sha256:a83948492cf13df455170fb42885f5ef4db54fefe0feff0f841ecbff464ac9d8"
+recipe = "superdeepseek-abl"
+hf_id = "Jiunsong/SuperDeepseek-V4-Flash-abliterated-MQ-2xDGX"
+revision = "2a7dd6a12d46f752e290c6255140a42600897864"
+serve_path = "/cache/huggingface/hub/models--Jiunsong--SuperDeepseek-V4-Flash-abliterated-MQ-2xDGX/snapshots/2a7dd6a12d46f752e290c6255140a42600897864"
+served_name = "SuperDeepseek-V4-Flash-abliterated-MQ-2xDGX"
+quant = "FP4 experts + FP8 attn/shared"
+quant_bits = 4
+quant_scope = "all"
+quant_detail = "Routed experts (backbone + 3 MTP layers) FP4 packed as I8 with F8_E8M0 scales per 32; attention, shared experts and indexer FP8 E4M3 128x128 blocks with UE8M0 scales; embeddings, output head (abliteration-recovered overlay), router, norms BF16. Same layout as the official parent; only 46 wo_b pairs and head.weight changed. nvfp4_ds_mla KV."
+modalities = ["text"]
+wrapper = "vllm"
+entry_script = "superdeepseek-abl/entry.sh"
+entry_script_sha256 = "c9ab386da20fa5afe7794449cd201cd12312a44b4808d882c1bd214d291405fa"
+preflight_script = "superdeepseek-abl/verify.py"
+preflight_script_sha256 = "74363826f4f379b962967c6a55661c21fb87815b51b78627389e851458b809bf"
+preflight_args = ["/cache/huggingface/hub/models--Jiunsong--SuperDeepseek-V4-Flash-abliterated-MQ-2xDGX/snapshots/2a7dd6a12d46f752e290c6255140a42600897864", "--expected-files", "50", "--expected-index-sha256", "57baa0244cf7679a07758f8aea6045a8eadc2b9a1cac874330382b1014457849", "--expected-encoding-sha256", "abc0d26120250dda0ae077dc64aa28836026e61e970854aaeb792445e6a0dde6"]
+container = "vllm_superdeepseek_abl"
+nnodes = 2
+tensor_parallel = 2
+master_port = 25001
+hf_mount = "/cache/huggingface"
+hf_cache_readonly = true
+drop_caches = true
+shm_size = "64g"
+docker_extra = ["--ulimit", "memlock=-1:-1", "--ulimit", "stack=67108864:67108864"]
+ready_timeout = 3600
+max_model_len = 1048576
+max_num_seqs = 6
+gpu_memory_utilization = 0.85
+hermes_provider = "spark"
+hermes_context_length = 1048576
+host_ip_head = "192.168.100.10"
+host_ip_worker = "192.168.100.11"
+notes = "ABLITERATED (refusals removed; card: operators responsible for access control). Weight edit of deepseek-ai/DeepSeek-V4-Flash-0731@9e165c30 (48 shards byte-identical to the parent; overlay + head-recovery files override 92 wo_b tensors and head.weight). TP2 over QSFP, DSpark K=1, 1M context, gpu-mem 0.85 (author 0.80; ~4-5 GiB MemAvailable left per node when loaded, fall back to 0.80 if a start OOMs). Measured 2026-11-03 via the local launcher: 8m32s load, ~21 tok/s warm, 2.83M KV tokens. Answers in reasoning mode (DEFAULT_THINKING low)."
+
+[[models.ds4-super-abl.mounts]]
+# Same per-node compile caches as ~/superdeepseek-abl/start.sh, so either launcher starts warm.
+container = "/root/.cache/vllm"
+head = "/home/spider/superdeepseek-abl/work/vllm"
+worker = "/home/spider/superdeepseek-abl/work/vllm"
+
+[[models.ds4-super-abl.mounts]]
+container = "/cache/flashinfer"
+head = "/home/spider/superdeepseek-abl/work/flashinfer"
+worker = "/home/spider/superdeepseek-abl/work/flashinfer"
+
+[[models.ds4-super-abl.mounts]]
+container = "/tmp"
+head = "/home/spider/superdeepseek-abl/work/tmp"
+worker = "/home/spider/superdeepseek-abl/work/tmp"
+
+[models.ds4-super-abl.env]
+# NCCL rails come from [cluster.nccl]; these are the launcher's extra NCCL/UCX settings and the author's runtime env.
+HF_HUB_OFFLINE = "1"
+TRANSFORMERS_OFFLINE = "1"
+HF_HUB_DISABLE_XET = "1"
+NCCL_IB_ADDR_FAMILY = "AF_INET"
+NCCL_IB_ROCE_VERSION_NUM = "2"
+NCCL_NVLS_ENABLE = "0"
+UCX_NET_DEVICES = "rocep1s0f1:1,roceP2p1s0f1:1"
+VLLM_ALLOW_LONG_MAX_MODEL_LEN = "1"
+VLLM_SPARSE_INDEXER_MAX_LOGITS_MB = "256"
+VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS = "0"
+VLLM_USE_BREAKABLE_CUDAGRAPH = "0"
+VLLM_USE_B12X_MOE = "1"
+VLLM_USE_FLASHINFER_SAMPLER = "1"
+VLLM_B12X_W4A16_FORCE_BLOCKS_PER_SM = "0"
+VLLM_B12X_W4A16_FORCE_BLOCKS_MAX_M = "16"
+VLLM_NO_USAGE_STATS = "1"
+DO_NOT_TRACK = "1"
+TORCH_CUDA_ARCH_LIST = "12.1a"
+FLASHINFER_CUDA_ARCH_LIST = "12.1a"
+CUTE_DSL_ARCH = "sm_121a"
+FLASHINFER_DISABLE_VERSION_CHECK = "1"
+FLASHINFER_WORKSPACE_BASE = "/cache/flashinfer"
+TILELANG_CLEANUP_TEMP_FILES = "1"
+DG_JIT_USE_NVRTC = "0"
+DG_JIT_NVCC_COMPILER = "/usr/local/cuda/bin/nvcc"
+PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True"
+
+[models.ds4-super-abl.vllm]
+# Same flags as ~/superdeepseek-abl/container-entry.sh (GRAPH_PROFILE regular, DEFAULT_THINKING low) except --port:
+# spark-serve serves on [cluster].port. It appends --nnodes/--node-rank/--master-addr/--master-port 25001/
+# --distributed-executor-backend mp and --headless on rank 1.
+args = [
+  "--served-model-name", "SuperDeepseek-V4-Flash-abliterated-MQ-2xDGX",
+  "--host", "0.0.0.0", "--port", "8000",
+  "--trust-remote-code",
+  "--tensor-parallel-size", "2",
+  "--pipeline-parallel-size", "1",
+  "--kv-cache-dtype", "nvfp4_ds_mla",
+  "--block-size", "256",
+  "--max-model-len", "1048576",
+  "--max-num-seqs", "6",
+  "--max-num-batched-tokens", "8192",
+  "--gpu-memory-utilization", "0.85",
+  "--enable-prefix-caching",
+  "--enable-prompt-tokens-details",
+  "--cudagraph-metrics",
+  "--async-scheduling",
+  "--enable-chunked-prefill",
+  "--speculative-config", '{"method":"dspark","num_speculative_tokens":1,"draft_sample_method":"greedy"}',
+  "--tokenizer-mode", "deepseek_v4",
+  "--moe-backend", "flashinfer_b12x",
+  "--tool-call-parser", "deepseek_v4",
+  "--enable-auto-tool-choice",
+  "--reasoning-parser", "deepseek_v4",
+  "--reasoning-config", '{"reasoning_parser":"deepseek_v4","reasoning_start_str":"<think>","reasoning_end_str":"</think>"}',
+  "--default-chat-template-kwargs", '{"thinking":true,"reasoning_effort":"low"}',
+  "--generation-config", "vllm",
+  "--enable-flashinfer-autotune",
+  "--max-cudagraph-capture-size", "32",
+  "--performance-mode", "interactivity",
+  "--compilation-config", '{"backend":"eager"}',
+]
+
 # AMD Strix Halo boxes: one engine at a time on each through its halo-ctl
 # (halo-inference-control); `./spark-serve strix up <id> --box <host>` stops
 # the others there. The cluster engine spans both boxes: --box is its master.

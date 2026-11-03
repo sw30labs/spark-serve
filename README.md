@@ -244,6 +244,16 @@ Add a model by copying a `[models.<id>]` table. `wrapper = "vllm"` for a stock
 `vllm/vllm-openai:*` image (ENTRYPOINT already `vllm serve`). `wrapper = "dsv4"`
 for the Aiden GB10 DeepSeek image.
 
+A `vllm` recipe that must patch the image before serving names a reviewed bash
+script under `recipes/` with `entry_script` (pin it with `entry_script_sha256`).
+spark-serve runs it as the container entrypoint with the serve path and the
+catalog's vLLM argv; the script ends with `exec vllm serve "$@"`.
+`preflight_script` names a reviewed Python file under `recipes/` that the
+CPU-only, offline preflight runs as `python3 -c <file> <preflight_args>` on every
+required Spark before a switch may stop anything (pin: `preflight_script_sha256`).
+`hf_cache_readonly = true` mounts the Hugging Face cache read-only.
+See [SuperDeepseek](docs/superdeepseek-abl.md) for the recipe that uses all three.
+
 Do not bake a sudo password in here. `up` drops page caches only if
 passwordless sudo already works on the Sparks.
 
