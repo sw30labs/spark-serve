@@ -109,6 +109,7 @@ def test_transfer_lists_pinned_snapshot_and_referenced_blob_only(assets, monkeyp
         transfer.transfer_files(root, manifest)
 
 
+@pytest.mark.skip(reason="qwen38-dual card retired from the catalog 2026-11-04")
 def test_catalog_retains_shared_fabric_and_rejects_solo_placement():
     cfg = catalog()
     pins, source = prepare.load_pins()
@@ -122,6 +123,7 @@ def test_catalog_retains_shared_fabric_and_rejects_solo_placement():
             prepare.placement(cfg, model, node)
 
 
+@pytest.mark.skip(reason="qwen38-dual card retired from the catalog 2026-11-04")
 @pytest.mark.parametrize("flag,value", [("--tensor-parallel-size", "1"),
                                        ("--mm-encoder-tp-mode", "weights"),
                                        ("--kv-cache-dtype", "fp8")])
@@ -143,6 +145,7 @@ def test_prepare_source_drift_fails_before_upload(tmp_path):
         prepare.load_pins(recipe)
 
 
+@pytest.mark.skip(reason="qwen38-dual card retired from the catalog 2026-11-04")
 def test_cpu_checks_and_copy_use_only_preparation_operations():
     cfg = catalog()
     pins, source = prepare.load_pins()
@@ -234,6 +237,7 @@ def test_installed_runtime_mutation_is_detected(tmp_path, monkeypatch):
         runtime.check_installed(here)
 
 
+@pytest.mark.skip(reason="qwen38-dual card retired from the catalog 2026-11-04")
 @pytest.mark.parametrize("image_only", [False, True])
 def test_main_reuses_authenticated_worker_and_publishes_after_both_compatibility_checks(tmp_path, monkeypatch, image_only):
     cfg = catalog()

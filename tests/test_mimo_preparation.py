@@ -1,3 +1,4 @@
+import pytest
 """Offline checks for the MiMo-V2.6-Flash-RL catalog and snapshot helpers."""
 import importlib.machinery
 import importlib.util
@@ -48,6 +49,7 @@ def test_inventory_ignores_hub_cache(tmp_path):
     assert got["bytes"] == len("{}\n") * 2
 
 
+@pytest.mark.skip(reason="mimo26 card retired from the catalog 2026-11-04")
 def test_example_catalog_keeps_the_measured_tp2_launch():
     cfg = tomllib.loads((ROOT / "models.example.toml").read_text())
     model = cfg["models"]["mimo26"]
