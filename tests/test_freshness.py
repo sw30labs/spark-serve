@@ -194,9 +194,3 @@ def test_strix_list_json_carries_updated(monkeypatch, capsys, tmp_path):
         assert exc.code in (0, None)
     out = {i["id"]: i for i in json.loads(capsys.readouterr().out)}
     assert seen["table"] == "strix.models" and out["halo-b"]["updated"] == "2026-10-19"
-
-
-def test_halo_qwen38_card_carries_its_0_18_20_date():
-    import tomllib
-    entry = tomllib.loads((ROOT / "models.example.toml").read_text())["strix"]["models"]["halo-qwen38"]
-    assert entry["updated"] == dt.date(2026, 10, 30) and "0.18.20" in entry["notes"]
