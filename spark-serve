@@ -60,6 +60,8 @@ from spark_serve_controller import (
     atomic_json,
 )
 import spark_serve_freshness as freshness
+import spark_serve_batch as batch
+from spark_serve_controller import SERVER_WRAPPERS, read_state
 from spark_serve_nodes import launch_config, node_url, placement
 from spark_serve_nim import validate_nim_plan, nim_docker_argv, parse_nim_primary_node
 from spark_serve_tensorfold import (
@@ -70,8 +72,8 @@ HERE = Path(__file__).resolve().parent
 CATALOG = HERE / "models.toml"
 EXAMPLE = HERE / "models.example.toml"
 RECIPES = HERE / "recipes"
-# Catalog cards spark-serve shows but never starts, stops or prepares (ADR 0017),
-# e.g. a one-GPU batch job such as Pika H3 Flex that owns its own process.
+# Batch entries (ADR 0018) run a one-GPU job instead of a server; see spark_serve_batch.
+# Anything not in SERVER_WRAPPERS (spark_serve_controller) is refused before a stop.
 BATCH_WRAPPERS = ("batch",)
 # Recipes whose weights are prepared outside spark-serve; `pull` explains how
 # instead of downloading them during a model switch.
@@ -105,13 +107,20 @@ def load() -> dict:
 
 
 def launch_refusal(mid: str, model: dict) -> str | None:
-    """Why up/pull must refuse a card-only entry, or None when spark-serve manages it.
+    """Why `up` must refuse a card-only entry, or None when spark-serve can launch it.
 
-    `wrapper = "batch"` or `launch = false` marks a card only. The refusal comes
-    before placement, preflight, SSH or the controller, so no workload is touched.
+    `launch = false` marks a card only (ADR 0017); so does a batch entry without a
+    runnable [models.<id>.batch] table (ADR 0018). The refusal comes before
+    placement, preflight, SSH or the controller, so no workload is touched.
     """
-    if model.get("launch", True) is not False and (model.get("wrapper") or "vllm") not in BATCH_WRAPPERS:
-        return None
+    if model.get("launch", True) is not False:
+        if (model.get("wrapper") or "vllm") not in BATCH_WRAPPERS:
+            return None
+        try:
+            batch.batch_table(mid, model)
+            return None
+        except ControllerError:
+            pass
     hint = str(model.get("run_hint") or "").strip()
     return (f"{mid} is a catalog card only; spark-serve does not start, stop or prepare it; "
             "the current workload was not changed" + (f". {hint}" if hint else ""))
@@ -143,10 +152,9 @@ def ssh_cmd(
     check: bool = True,
     timeout: int = 660,
 ) -> subprocess.CompletedProcess:
-    opts = list(cfg["cluster"].get("ssh_opts") or ["-o", "BatchMode=yes"])
     try:
         proc = subprocess.run(
-            ["ssh", *opts, "-o", "ConnectTimeout=8", host, "bash", "-s"],
+            ssh_argv(cfg, host) + ["bash", "-s"],
             input=remote, text=True, capture_output=True, timeout=timeout, check=False,
         )
     except subprocess.TimeoutExpired:
@@ -155,6 +163,20 @@ def ssh_cmd(
         err = (proc.stderr or proc.stdout or "").strip()
         die(f"{host}: {err or f'exit {proc.returncode}'}")
     return proc
+
+
+def ssh_argv(cfg: dict, host: str) -> list[str]:
+    """SSH prefix for a host; empty when this process already runs on it.
+
+    Only the Spark-side batch restore (ADR 0018) sets these variables: a
+    job-scoped ssh_config (the Mac's HostName and host keys, never ~/.ssh) and
+    the Spark it runs on, which cannot SSH to itself.
+    """
+    if host in [h for h in os.environ.get("SPARK_SERVE_LOCAL_HOSTS", "").split(",") if h]:
+        return []
+    opts = list(cfg["cluster"].get("ssh_opts") or ["-o", "BatchMode=yes"])
+    config = os.environ.get("SPARK_SERVE_NODE_SSH_CONFIG")
+    return ["ssh", *(["-F", config] if config else []), *opts, "-o", "ConnectTimeout=8", host]
 
 
 def ssh_out(cfg: dict, host: str, remote: str) -> str:
@@ -691,6 +713,10 @@ def cmd_reboot(
 ) -> None:
     sink = _Sink(json_mode)
     plan = reboot_auth_plan(cfg, password)
+    try:
+        batch_guard(cfg)
+    except ControllerError as exc:
+        sink.fail(str(exc))
     sink.event("start", model="reboot", label="reboot both Sparks")
     controller = Controller(cfg, ssh_cmd, sink.event)
 
@@ -725,6 +751,10 @@ def cmd_shutdown(
     """Drain managed workloads, then power off both hosts. They stay off."""
     sink = _Sink(json_mode)
     plan = reboot_auth_plan(cfg, password)
+    try:
+        batch_guard(cfg)
+    except ControllerError as exc:
+        sink.fail(str(exc))
     sink.event("start", model="shutdown", label="shut down both Sparks")
     controller = Controller(cfg, ssh_cmd, sink.event)
 
@@ -1011,6 +1041,7 @@ def cmd_stop(cfg: dict, cancel_jobs: bool = False, node: str = "both", json_mode
         if node not in ("head", "worker", "both"):
             raise ControllerError("node must be head, worker, or both")
         hosts = [cfg["cluster"][role] for role in (("head", "worker") if node == "both" else (node,))]
+        batch_guard(cfg)
         Controller(cfg, ssh_cmd, sink.event).switch("none", cancel_jobs=cancel_jobs, hosts=hosts)
     except ControllerError as exc:
         sink.fail(str(exc))
@@ -1027,9 +1058,10 @@ def cmd_list(cfg: dict) -> None:
         aliases = ",".join(m.get("aliases") or [])
         ctx = m.get("max_model_len") or ""
         image = m.get("image") or ""
-        if launch_refusal(mid, m):
+        if launch_refusal(mid, m) or (m.get("wrapper") or "vllm") in BATCH_WRAPPERS:
             where = home_host(cfg, m)
-            image = f"card only: {m.get('wrapper') or 'batch'} job" + (f" on {where}" if where else "") + ", no endpoint"
+            kind = "card only: " if launch_refusal(mid, m) else ""
+            image = f"{kind}{m.get('wrapper') or 'batch'} job" + (f" on {where}" if where else "") + ", no endpoint"
         print(f"{mid:<10} {aliases:<28} {m.get('served_name',''):<24} {ctx:>8}  {image}")
         if m.get("notes"):
             print(f"           {m['notes']}")
@@ -1109,7 +1141,9 @@ def cmd_list_json(cfg: dict) -> None:
             "outputs": list(m["outputs"]) if m.get("outputs") else None,
             "launch": launch_refusal(mid, m) is None,
             "launch_note": m.get("run_hint") if launch_refusal(mid, m) else None,
+            "batch": batch.form(mid, m),
             "home_host": home_host(cfg, m),
+            "home_node": m.get("home_node"),
             "updated": (dates.get(mid) or {}).get("updated"),
             "updated_source": (dates.get(mid) or {}).get("updated_source"),
         })
@@ -1120,7 +1154,9 @@ def cmd_list_json(cfg: dict) -> None:
 
 
 def cmd_status_json(cfg: dict) -> None:
-    print(json.dumps(collect_status(cfg), indent=2))
+    result = collect_status(cfg)
+    result["batch"] = batch_view(cfg)
+    print(json.dumps(result, indent=2))
 
 
 def status_host(cfg: dict, host: str) -> str:
@@ -1500,6 +1536,8 @@ def cmd_pull(cfg: dict, name: str, node: str | None = None) -> None:
     refusal = launch_refusal(mid, model)
     if refusal:
         die(refusal)
+    if (model.get("wrapper") or "vllm") in BATCH_WRAPPERS:
+        die(f"{mid}: batch jobs are prepared by hand on their Spark; spark-serve does not download them")
     selected, hosts = placement(cfg, model, node)
     recipe = model.get("recipe")
     if recipe:
@@ -1590,6 +1628,8 @@ class _Sink:
             print(f"  image  {fields.get('image')}")
             print(f"  served {fields.get('served')}  ctx {fields.get('ctx')}")
             print(f"  url    {fields.get('url')}")
+        elif name.startswith("batch_"):
+            print(f"  {fields.get('message') or name}", flush=True)
         elif name == "stop":
             print(f"  stop {fields.get('host')}: {fields.get('output')}")
         elif name == "reboot":
@@ -1925,6 +1965,191 @@ def model_preflight(cfg: dict, mid: str, model: dict, sink: _Sink) -> None:
         sink.event("preflight", model=mid, host=host, detail="passed", output=(proc.stdout or "").strip()[-8192:])
 
 
+def validate_server_wrapper(mid: str, model: dict) -> None:
+    wrapper = model.get("wrapper") or "vllm"
+    if wrapper not in SERVER_WRAPPERS:
+        raise ControllerError(f"{mid}: unknown model wrapper {wrapper!r}; the current workload was not changed")
+
+
+def batch_view(cfg: dict) -> dict | None:
+    """Latest batch job (local record + the Spark's state.json); adopts a finished restore.
+
+    Never raises: an unreachable Spark leaves the record as it was, flagged.
+    """
+    record = batch.load_record()
+    if record is None:
+        return None
+    if record.get("closed"):
+        return record
+    proc = ssh_cmd(cfg, record["host"], batch.read_script(record["job_dir"]), check=False, timeout=20)
+    try:
+        remote = json.loads(proc.stdout) if proc.returncode == 0 else None
+    except ValueError:
+        remote = None
+    if not isinstance(remote, dict) or not remote:
+        record["unreachable"] = True
+        return record
+    record.pop("unreachable", None)
+    record["job"] = remote
+    if batch.finished(remote):
+        try:
+            _adopt_restore(cfg, record, remote)
+            record["closed"] = True
+        except ControllerError as exc:
+            record["adopt_error"] = str(exc)
+    batch.save_record(record)
+    return record
+
+
+def _adopt_restore(cfg: dict, record: dict, remote: dict) -> None:
+    """Take over the Spark-side restore's controller state so later Mac switches stay fenced."""
+    if remote.get("restore") == "none":
+        return
+    script = f'cat "$HOME/{record["job_dir"][2:]}/controller/controller.json"\n'
+    proc = ssh_cmd(cfg, record["host"], script, check=False, timeout=20)
+    try:
+        state = json.loads(proc.stdout)
+        if not isinstance(state, dict) or not isinstance(state.get("nodes"), dict):
+            raise ValueError("no node map")
+    except ValueError:
+        raise ControllerError("cannot read the Spark-side restore state") from None
+    controller = Controller(cfg, ssh_cmd)
+    with controller.lock():
+        controller.state = state
+        controller.save()
+
+
+def batch_guard(cfg: dict) -> None:
+    """Refuse lifecycle changes while a batch job (or its restore) owns the Sparks."""
+    record = batch.load_record()
+    if record is None or record.get("closed"):
+        return
+    view = batch_view(cfg) or {}
+    if view.get("closed"):
+        return
+    phase = (view.get("job") or {}).get("phase") or "unknown"
+    where = " (Spark unreachable; its state is unknown)" if view.get("unreachable") else ""
+    raise ControllerError(
+        f"batch job {view.get('id')} ({view.get('model')}) on {view.get('host')} is {phase}{where}; "
+        "it restores the previous model itself. Use `spark-serve batch stop` to end it early."
+    )
+
+
+def cmd_batch_up(cfg: dict, mid: str, model: dict, sink: "_Sink", options: dict, *,
+                 print_cmd: bool = False, node: str | None = None) -> None:
+    """Stop the current model, run a batch job on its Spark, restore Spark-side (ADR 0018).
+
+    Every check that can fail runs before the stop: options, the job record,
+    the current allocation, the upload, and a read-only preflight on the Spark.
+    """
+    job_dir = None
+    stopped = False
+    prev = prev_node = None
+    try:
+        if node not in (None, model.get("home_node")):
+            raise ControllerError(f"{mid} runs on its home Spark ({home_host(cfg, model)}) only")
+        prompt = options.get("prompt")
+        if options.get("prompt_file"):
+            try:
+                prompt = Path(options["prompt_file"]).expanduser().read_text()
+            except OSError as exc:
+                raise ControllerError(f"cannot read prompt file: {exc}") from None
+        spec = batch.build_spec(cfg, mid, model, prompt=prompt, resolution=options.get("resolution"),
+                                duration=options.get("duration"), aspect=options.get("aspect"),
+                                seed=options.get("seed"))
+        controller = Controller(cfg, ssh_cmd, sink.event)
+        prev, prev_node = batch.previous_allocation(cfg, read_state(controller.directory))
+        spec["restore"] = batch.restore_spec(spec, cfg, prev, prev_node)
+        if print_cmd:
+            plan = {k: v for k, v in spec.items() if k != "prompt"}
+            print(json.dumps(plan, indent=2))
+            return
+        batch_guard(cfg)
+        host = spec["host"]
+        peers = [h for h in (cfg["cluster"]["head"], cfg["cluster"]["worker"]) if h != host] if prev else []
+        ssh_config, known = batch.ssh_material(cfg, host) if peers else ("", [])
+        sink.event("batch_preflight", host=host, message=f"checking {host} for {spec['label']}")
+        supervisor = (RECIPES / "batch" / "supervisor.py").read_bytes()
+        up = ssh_cmd(cfg, host, batch.upload_script(spec, batch.snapshot(HERE), ssh_config, known, supervisor),
+                     check=False, timeout=120)
+        if up.returncode:
+            raise ControllerError(f"{host}: job upload failed: {(up.stderr or up.stdout).strip()[-400:]}")
+        job_dir = spec["job_dir"]
+        pre = ssh_cmd(cfg, host, batch.preflight_script(spec, peers), check=False, timeout=180)
+        if pre.returncode:
+            raise ControllerError(f"{host}: {(pre.stderr or pre.stdout).strip()[-400:] or 'preflight failed'}; "
+                                  "the current workload was not changed")
+        if prev:
+            sink.event("batch_stopping", model=prev, message=f"stopping {prev} on {prev_node} (restored after the job)")
+            stopped = True
+            controller.switch("none")
+        state_json = json.dumps(read_state(controller.directory))
+        sink.event("batch_launch", host=host, message=f"starting the job on {host}")
+        run = ssh_cmd(cfg, host, batch.launch_script(spec, state_json), check=False, timeout=90)
+        try:
+            remote = json.loads(run.stdout) if run.returncode == 0 else {}
+        except ValueError:
+            remote = {}
+        if not remote.get("supervisor_pid"):
+            raise ControllerError(f"{host}: the job supervisor did not start: {(run.stderr or run.stdout).strip()[-400:]}")
+        record = {"id": spec["id"], "model": mid, "label": spec["label"], "host": host, "job_dir": job_dir,
+                  "output": spec["output"], "options": spec["options"], "previous": prev, "previous_node": prev_node,
+                  "expected_minutes": spec.get("expected_minutes"), "launched_at": time.time(), "job": remote}
+        batch.save_record(record)
+        job_dir = None  # started: the supervisor owns it now
+        sink.event("batch_started", id=spec["id"], host=host, output=spec["output"], previous=prev,
+                   message=f"job {spec['id']} running on {host}; output {spec['output']}; "
+                           + (f"{prev} comes back automatically when it ends" if prev else "nothing to restore"))
+    except ControllerError as exc:
+        if job_dir:
+            ssh_cmd(cfg, home_host(cfg, model) or cfg["cluster"]["worker"], batch.cleanup_script(job_dir),
+                    check=False, timeout=30)
+        message = str(exc)
+        if stopped and prev:
+            message += _restore_from_mac(prev, prev_node, sink)
+        sink.fail(message)
+
+
+def _restore_from_mac(prev: str, node: str, sink: "_Sink") -> str:
+    """The job never started after the stop: bring the previous model back from here."""
+    sink.event("batch_restore", model=prev, message=f"job did not start; restoring {prev} from the Mac")
+    proc = subprocess.run([sys.executable, str(HERE / "spark-serve"), "up", prev, "--node", node, "--no-hermes"],
+                          capture_output=True, text=True, check=False)
+    return (f"; restored {prev}" if proc.returncode == 0 else
+            f"; restoring {prev} also failed: {(proc.stderr or proc.stdout).strip()[-300:]}. "
+            f"Run: spark-serve up {prev} --node {node} --no-hermes")
+
+
+def cmd_batch(cfg: dict, action: str, json_mode: bool) -> None:
+    sink = _Sink(json_mode)
+    if action == "status":
+        view = batch_view(cfg)
+        if json_mode:
+            print(json.dumps(view, indent=2))
+            return
+        if not view:
+            print("no batch job recorded")
+            return
+        job = view.get("job") or {}
+        print(f"{view['id']}  {view['model']} on {view['host']}")
+        print(f"  phase {job.get('phase', 'unknown')}  result {job.get('result') or '-'}  restore {job.get('restore', '-')}"
+              + ("  (Spark unreachable)" if view.get("unreachable") else ""))
+        print(f"  output {view['output']}" + (f" ({job['output_bytes']} bytes)" if job.get("output_bytes") else ""))
+        if job.get("error"):
+            print(f"  error {job['error']}")
+        if job.get("restore_error"):
+            print(f"  restore {job['restore_error']}")
+        return
+    record = batch.load_record()
+    if record is None or record.get("closed") or batch.finished((batch_view(cfg) or {}).get("job") or {}):
+        sink.fail("no running batch job")
+    proc = ssh_cmd(cfg, record["host"], batch.stop_script(record["job_dir"]), check=False, timeout=30)
+    if proc.returncode:
+        sink.fail(f"{record['host']}: could not signal the job: {(proc.stderr or proc.stdout).strip()[-300:]}")
+    sink.event("batch_stopping_job", id=record["id"], message=(
+        f"stopping job {record['id']}; " + (f"{record['previous']} is restored on the Spark" if record.get("previous") else "nothing to restore")))
+
+
 def cmd_up(
     cfg: dict,
     name: str,
@@ -1934,10 +2159,18 @@ def cmd_up(
     print_cmd: bool = False,
     cancel_jobs: bool = False,
     node: str | None = None,
+    batch_options: dict | None = None,
 ) -> None:
     sink = _Sink(json_mode)
     yue = name.strip().lower() in ("yue", "yue-icl")
+    if not yue:
+        mid, model = resolve_model(cfg, name)
+        if (model.get("wrapper") or "vllm") in BATCH_WRAPPERS and not launch_refusal(mid, model):
+            cmd_batch_up(cfg, mid, model, sink, batch_options or {}, print_cmd=print_cmd, node=node)
+            return
     try:
+        if not print_cmd:
+            batch_guard(cfg)
         if yue:
             selected, hosts = placement(cfg, None, node)
             scoped, mid = cfg, "yue"
@@ -1946,6 +2179,7 @@ def cmd_up(
             refusal = launch_refusal(mid, model)
             if refusal:
                 raise ControllerError(refusal)
+            validate_server_wrapper(mid, model)
             selected, hosts = placement(cfg, model, node)
             scoped = launch_config(cfg, mid, selected)
             # Also guards --print-cmd: a missing or edited entry script refuses here.
@@ -2091,6 +2325,15 @@ def build_parser() -> argparse.ArgumentParser:
     up.add_argument("--no-wait", action="store_true", help="do not block on the ready probe")
     up.add_argument("--json", action="store_true", help="emit JSON-line progress events")
     up.add_argument("--print-cmd", action="store_true", help=argparse.SUPPRESS)
+    up.add_argument("--prompt", help="batch entries: the prompt text")
+    up.add_argument("--prompt-file", help="batch entries: read the prompt from this file")
+    up.add_argument("--resolution", help="batch entries: e.g. 480p or 768p")
+    up.add_argument("--duration", type=int, help="batch entries: seconds")
+    up.add_argument("--aspect", help="batch entries: e.g. 16:9")
+    up.add_argument("--seed", type=int, help="batch entries: seed")
+    bjob = sub.add_parser("batch", help="status or stop of the running batch job (it restores the previous model)")
+    bjob.add_argument("action", choices=["status", "stop"])
+    bjob.add_argument("--json", action="store_true")
 
     pull = sub.add_parser("pull", help="prepare the model on its selected Spark(s)")
     pull.add_argument("model")
@@ -2229,7 +2472,12 @@ def main(argv: list[str] | None = None) -> None:
             print_cmd=bool(args.print_cmd),
             cancel_jobs=args.cancel_jobs,
             node=args.node,
+            batch_options={"prompt": args.prompt, "prompt_file": args.prompt_file, "resolution": args.resolution,
+                           "duration": args.duration, "aspect": args.aspect, "seed": args.seed},
         )
+    elif args.cmd == "batch":
+        _JSON_MODE = bool(args.json)
+        cmd_batch(cfg, args.action, json_mode=_JSON_MODE)
     elif args.cmd == "pull":
         try:
             cmd_pull(cfg, args.model, node=args.node)

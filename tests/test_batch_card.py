@@ -100,10 +100,10 @@ def test_text_list_handles_card_without_image(capsys):
     assert "card only: batch job on sparktwo, no endpoint" in line
 
 
-def test_example_catalog_pika_entry_is_card_only():
+def test_example_catalog_pika_entry_is_a_launchable_batch_job():
     cfg = example()
     model = cfg["models"]["pika-h3-flex"]
-    assert cli.launch_refusal("pika-h3-flex", model)
+    assert cli.launch_refusal("pika-h3-flex", model) is None  # ADR 0018 superseded card-only for Pika
     assert model["home_node"] == "worker" and int(model["nnodes"]) == 1
     assert "container" not in model  # never joins the stop set
     assert cli.resolve_model(cfg, "pika") == ("pika-h3-flex", model)

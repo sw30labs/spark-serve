@@ -22,7 +22,8 @@ Dates below are record dates, not reconstructed approval dates. All are accepted
 | [0014](0014-glm53-tensorfold-bf5f945.md) | Re-vendor GLM TensorFold to recipe bf5f945, keep its weights |
 | [0015](0015-remove-native-benchmarks-tab.md) | Remove the native Benchmarks tab; benchmarks stay in the CLI |
 | [0016](0016-superdeepseek-entry-script.md) | Start SuperDeepseek through a pinned in-container entry script |
-| [0017](0017-batch-card-only-entries.md) | Show batch jobs (Pika H3 Flex) as card-only catalog entries |
+| [0017](0017-batch-card-only-entries.md) | Show batch jobs as card-only catalog entries (superseded for runnable entries by 0018) |
+| [0018](0018-batch-jobs-spark-side-restore.md) | Run batch entries (Pika H3 Flex) with validate-before-stop and a Spark-side restore |
 
 Keep ADRs short: context, decision, trade-off, evidence. Amend clarifications in
 place. For a changed decision, add a new numbered ADR and link the superseded

@@ -79,6 +79,9 @@ def classify_gpu_processes(compute: str, proc_root="/proc") -> dict:
             "blocking_gpu_processes": blocking}
 
 
+SERVER_WRAPPERS = ("vllm", "dsv4", "dsv4-vision", "nim", "tensorfold")
+
+
 class ControllerError(RuntimeError):
     pass
 
@@ -890,6 +893,11 @@ print(json.dumps({"listening_ports": sorted(listening), "containers": [{"id": c[
         mid, model = self._model(target)
         if target not in ("none", "yue") and model is None:
             raise ControllerError(f"Unknown workload {target!r}")
+        # Validate before stop (ADR 0018): a target this controller cannot start
+        # as a server must never drain the running model first.
+        if model is not None and (model.get("wrapper") or "vllm") not in SERVER_WRAPPERS:
+            raise ControllerError(f"{mid}: wrapper {model.get('wrapper')!r} is not a server this controller starts; "
+                                  "the current workload was not changed")
         nnodes = int((model or {}).get("nnodes") or self.cfg["cluster"].get("nnodes") or 1)
         if model is not None and nnodes > len(selected):
             raise ControllerError(f"{mid} requires both nodes; select both Sparks")

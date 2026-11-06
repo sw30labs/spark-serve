@@ -28,12 +28,98 @@ struct ModelEntry: Identifiable, Codable {
     var launch: Bool? = nil
     var launch_note: String? = nil
     var home_host: String? = nil
+    var home_node: String? = nil
+    /// Batch entries (ADR 0018): the job options the Run form offers.
+    var batch: BatchForm? = nil
     var ranking: ModelRanking? = nil
     /// Strix entries only: the name halo-ctl takes and lists for this model.
     var ctl_id: String? = nil
     /// YYYY-MM-DD the entry last changed, and where that date came from (spark_serve_freshness.py).
     var updated: String? = nil
     var updated_source: String? = nil
+}
+
+/// `list --json` "batch": options for a batch entry's Run form (ADR 0018).
+struct BatchForm: Codable {
+    var resolutions: [String]
+    var aspects: [String]
+    var duration_min: Int
+    var duration_max: Int
+    var default_resolution: String? = nil
+    var default_aspect: String? = nil
+    var default_duration: Int
+    var default_seed: Int
+    var expected_minutes: Double? = nil
+}
+
+/// The Spark-side supervisor's state.json for one batch job.
+struct BatchJobState: Codable {
+    var phase: String? = nil
+    var result: String? = nil
+    var restore: String? = nil
+    var error: String? = nil
+    var restore_error: String? = nil
+    var output_bytes: Int? = nil
+    var started_at: Double? = nil
+    var ended_at: Double? = nil
+}
+
+/// `status --json` "batch": the latest batch job, as the Mac last saw it.
+struct BatchJobView: Codable {
+    let id: String
+    let model: String
+    var label: String? = nil
+    let host: String
+    let output: String
+    var previous: String? = nil
+    var previous_node: String? = nil
+    var closed: Bool? = nil
+    var unreachable: Bool? = nil
+    var launched_at: Double? = nil
+    var job: BatchJobState? = nil
+}
+
+/// Pure wording for the batch Run form and status row; covered by gui/tests.
+enum BatchFacts {
+    static func isActive(_ j: BatchJobView) -> Bool {
+        if j.closed == true { return false }
+        return !(j.job?.phase == "finished" && ["ok", "failed", "none"].contains(j.job?.restore ?? ""))
+    }
+
+    static func title(_ j: BatchJobView, now: Double = Date().timeIntervalSince1970) -> String {
+        let name = j.label ?? j.model
+        let s = j.job
+        if j.unreachable == true && isActive(j) {
+            return "\(name): \(j.host) unreachable; last seen \(s?.phase ?? "starting")"
+        }
+        switch s?.phase ?? "starting" {
+        case "running":
+            let start = s?.started_at ?? j.launched_at ?? now
+            return "\(name): rendering on \(j.host) · \(max(0, Int((now - start) / 60))) min"
+        case "stopping":
+            return "\(name): stopping the job on \(j.host)"
+        case "restoring":
+            return "\(name): job \(s?.result ?? "ended"); bringing back \(j.previous ?? "the previous model")"
+        case "finished":
+            let back: String
+            switch s?.restore {
+            case "ok": back = "; \(j.previous ?? "previous model") is back"
+            case "failed": back = "; restoring \(j.previous ?? "the previous model") FAILED"
+            default: back = ""
+            }
+            return "\(name): job \(s?.result ?? "ended")\(back)"
+        default:
+            return "\(name): starting on \(j.host)"
+        }
+    }
+
+    static func confirmMessage(model: ModelEntry, serving: String, form: BatchForm) -> String {
+        let minutes = form.expected_minutes.map { "about \(Int($0)) min" } ?? "a while"
+        let stop = serving == "nothing" ? "Nothing is serving now." : "This stops \(serving) on both Sparks first."
+        return "\(stop) \(model.label) then renders on \(model.home_host ?? "its Spark") (\(minutes)), "
+            + "and the Spark brings \(serving == "nothing" ? "nothing" : serving) back by itself when the job ends, "
+            + "even if this Mac is offline."
+    }
 }
 
 /// `spark-serve about --json`: when this checkout (and its local catalog) last changed.
@@ -230,6 +316,7 @@ struct ClusterStatus: Codable {
     let transition_error: String?
     var nodes: [SparkNodeStatus]? = nil
     var active_node: String? = nil
+    var batch: BatchJobView? = nil
 }
 
 enum HermesTarget: String, CaseIterable {
@@ -336,6 +423,53 @@ final class CLIRunner: ObservableObject {
 
     func canLaunch(_ model: ModelEntry) -> Bool {
         model.launch != false
+    }
+
+    func isBatch(_ model: ModelEntry) -> Bool {
+        model.backend == "batch"
+    }
+
+    var batchJob: BatchJobView? { status?.batch }
+
+    var batchActive: Bool { batchJob.map(BatchFacts.isActive) ?? false }
+
+    var servingSummary: String {
+        let ids = servingModelIDs.sorted()
+        return ids.isEmpty ? "nothing" : ids.joined(separator: ", ")
+    }
+
+    /// Batch entries start through `up` with job options; the CLI stops and restores.
+    func startBatch(model: ModelEntry, prompt: String, resolution: String, aspect: String, duration: Int, seed: Int) {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("spark-serve-prompt-\(UUID().uuidString).txt")
+        do {
+            try prompt.write(to: url, atomically: true, encoding: .utf8)
+        } catch {
+            bootState = .failed(message: "Cannot write the prompt: \(error.localizedDescription)")
+            return
+        }
+        startUp(model: model.id, node: model.home_node ?? "worker", extraArgs: [
+            "--prompt-file", url.path, "--resolution", resolution, "--aspect", aspect,
+            "--duration", String(duration), "--seed", String(seed),
+        ])
+    }
+
+    /// Kills the running batch job; the Spark-side supervisor still restores the previous model.
+    func stopBatch() {
+        guard !isBusy else { return }
+        appendLog("$ spark-serve batch stop --json")
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let (out, code) = self.runResult(["batch", "stop", "--json"])
+            DispatchQueue.main.async {
+                for line in out.split(whereSeparator: \.isNewline) {
+                    let s = String(line).trimmingCharacters(in: .whitespaces)
+                    if !s.isEmpty { self.parseEvent(s, model: "batch") }
+                }
+                if code != 0 { self.bootState = .failed(message: "Stop job needs attention; see log") }
+                self.refresh()
+            }
+        }
     }
 
     func requiresBothSparks(_ model: ModelEntry) -> Bool {
@@ -570,7 +704,7 @@ final class CLIRunner: ObservableObject {
         pollTimer = nil
     }
 
-    func startUp(model: String, node: String? = nil, noHermes: Bool = true) {
+    func startUp(model: String, node: String? = nil, noHermes: Bool = true, extraArgs: [String] = []) {
         guard !isBusy else { return }
         let entry = models.first { $0.id == model }
         let target = entry.map { requiresBothSparks($0) } == true ? "both" : (node ?? "head")
@@ -584,6 +718,7 @@ final class CLIRunner: ObservableObject {
 
         var args: [String] = ["up", model, "--node", target, "--json"]
         if noHermes { args.append("--no-hermes") }
+        args += extraArgs
 
         let process = makeProcess(args)
         let pipe = Pipe()
@@ -1162,7 +1297,7 @@ struct MenuBarView: View {
                 .padding(.horizontal, 8)
             }
 
-            ForEach(runner.models.filter { runner.canLaunch($0) }) { m in
+            ForEach(runner.models.filter { runner.canLaunch($0) && !runner.isBatch($0) }) { m in
                 if runner.requiresBothSparks(m) {
                     Button("\(m.label) · both Sparks") {
                         runner.openMainWindow()
@@ -1422,12 +1557,18 @@ struct MainView: View {
     @ViewBuilder
     private var controls: some View {
         VStack(alignment: .leading, spacing: 10) {
+            if let job = runner.batchJob {
+                BatchStatusView(job: job)
+            }
             if let selectedEntry {
                 if !runner.canLaunch(selectedEntry) {
                     Text(ModelCardFacts.cardOnlyHelp(selectedEntry))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)
+                } else if runner.isBatch(selectedEntry), let form = selectedEntry.batch {
+                    BatchRunForm(model: selectedEntry, form: form)
+                        .id(selectedEntry.id)
                 } else if runner.requiresBothSparks(selectedEntry) {
                     HStack {
                         Button("Start on both Sparks") {
@@ -1473,6 +1614,113 @@ struct MainView: View {
 
 // MARK: - Individual Sparks
 
+// MARK: - Batch jobs (ADR 0018)
+
+struct BatchRunForm: View {
+    @EnvironmentObject var runner: CLIRunner
+    let model: ModelEntry
+    let form: BatchForm
+    @State private var prompt = ""
+    @State private var resolution = ""
+    @State private var aspect = ""
+    @State private var duration = 5
+    @State private var seed = ""
+    @State private var confirming = false
+
+    private var ready: Bool {
+        !runner.isBusy && !runner.batchActive && Int(seed) != nil
+            && !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("\(model.label) runs one job on \(model.home_host ?? "its Spark"); the MP4 lands in its outputs folder.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            TextEditor(text: $prompt)
+                .font(.body)
+                .frame(minHeight: 70, maxHeight: 120)
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.gray.opacity(0.3)))
+                .accessibilityLabel("Prompt")
+            HStack(spacing: 12) {
+                Picker("Resolution", selection: $resolution) {
+                    ForEach(form.resolutions, id: \.self) { Text($0).tag($0) }
+                }
+                .frame(width: 170)
+                Picker("Aspect", selection: $aspect) {
+                    ForEach(form.aspects, id: \.self) { Text($0).tag($0) }
+                }
+                .frame(width: 140)
+                Stepper("\(duration) s", value: $duration, in: form.duration_min...max(form.duration_min, form.duration_max))
+                    .frame(width: 100)
+                TextField("Seed", text: $seed)
+                    .frame(width: 90)
+                    .accessibilityLabel("Seed")
+            }
+            HStack {
+                Button("Run on \(model.home_host ?? "Spark")…") { confirming = true }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!ready)
+                if runner.batchActive {
+                    Text("A batch job is already running.").font(.caption).foregroundStyle(.secondary)
+                }
+            }
+        }
+        .onAppear {
+            resolution = form.default_resolution ?? form.resolutions.first ?? ""
+            aspect = form.default_aspect ?? form.aspects.first ?? ""
+            duration = form.default_duration
+            seed = String(form.default_seed)
+        }
+        .alert("Run \(model.label)?", isPresented: $confirming) {
+            Button(runner.servingSummary == "nothing" ? "Run" : "Stop \(runner.servingSummary) and run", role: .destructive) {
+                runner.startBatch(model: model, prompt: prompt, resolution: resolution, aspect: aspect,
+                                  duration: duration, seed: Int(seed) ?? form.default_seed)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(BatchFacts.confirmMessage(model: model, serving: runner.servingSummary, form: form))
+        }
+    }
+}
+
+struct BatchStatusView: View {
+    @EnvironmentObject var runner: CLIRunner
+    let job: BatchJobView
+    @State private var confirmingStop = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Image(systemName: "film")
+                Text(BatchFacts.title(job)).font(.subheadline.weight(.semibold))
+                Spacer()
+                if BatchFacts.isActive(job) && !["restoring", "stopping"].contains(job.job?.phase ?? "") {
+                    Button("Stop job") { confirmingStop = true }
+                        .buttonStyle(.bordered)
+                        .tint(.red)
+                        .disabled(runner.isBusy)
+                }
+            }
+            Text("Output: \(job.output)").font(.caption).textSelection(.enabled)
+            if let error = job.job?.error, !error.isEmpty {
+                Text(error).font(.caption2).foregroundStyle(.red).lineLimit(3).help(error)
+            }
+            if let error = job.job?.restore_error, !error.isEmpty {
+                Text(error).font(.caption2).foregroundStyle(.red).lineLimit(3).help(error)
+            }
+        }
+        .padding(8)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color(nsColor: .controlBackgroundColor)))
+        .alert("Stop the \(job.label ?? job.model) job?", isPresented: $confirmingStop) {
+            Button("Stop job", role: .destructive) { runner.stopBatch() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(job.previous.map { "The Spark then brings \($0) back." } ?? "Nothing needs restoring.")
+        }
+    }
+}
+
 struct SparkNodePanel: View {
     @EnvironmentObject var runner: CLIRunner
     let node: SparkNodeStatus
@@ -1497,11 +1745,13 @@ struct SparkNodePanel: View {
     }
     private var startEnabled: Bool {
         guard let selectedModel else { return false }
-        return !runner.isBusy && runner.canLaunch(selectedModel) && !runner.requiresBothSparks(selectedModel) && !node.sharedModel
+        return !runner.isBusy && runner.canLaunch(selectedModel) && !runner.isBatch(selectedModel)
+            && !runner.batchActive && !runner.requiresBothSparks(selectedModel) && !node.sharedModel
     }
     private var startTitle: String {
         guard let selectedModel else { return "Choose a model" }
         if !runner.canLaunch(selectedModel) { return "Card only: not started here" }
+        if runner.isBatch(selectedModel) { return "Batch job: use Run below" }
         return runner.requiresBothSparks(selectedModel)
             ? "Selected model uses both Sparks" : "Start \(selectedModel.label)"
     }
@@ -1995,7 +2245,7 @@ struct ModelCard: View {
                 }
             }
             Text(model.backend == "yue" ? "Artist Twin song / take queue"
-                 : model.launch == false ? "batch job\(model.home_host.map { " on \($0)" } ?? "") · no endpoint"
+                 : model.launch == false || model.backend == "batch" ? "batch job\(model.home_host.map { " on \($0)" } ?? "") · no endpoint"
                  : "served: \(model.served_name)")
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -2003,7 +2253,7 @@ struct ModelCard: View {
             // Selection row: context, quantization, input types.
             PillFlow(spacing: 6) {
                 InfoPill(text: ModelCardFacts.contextTitle(ctx: model.ctx, backend: model.backend),
-                         color: model.backend == "yue" || model.launch == false ? ModelCardFacts.neutralColor : ModelCardFacts.contextColor(ctx: model.ctx))
+                         color: model.backend == "yue" || model.backend == "batch" || model.launch == false ? ModelCardFacts.neutralColor : ModelCardFacts.contextColor(ctx: model.ctx))
                     .help(ModelCardFacts.contextHelp(ctx: model.ctx, performance: model.performance))
                 if let quant = model.quant {
                     let tier = ModelCardFacts.quantTier(bits: model.quant_bits, scope: model.quant_scope)

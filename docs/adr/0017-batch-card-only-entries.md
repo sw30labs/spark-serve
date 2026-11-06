@@ -1,6 +1,6 @@
 # ADR 0017: Show batch jobs as card-only catalog entries
 
-Accepted · Recorded 2026-11-05
+Accepted · Recorded 2026-11-05 · Superseded for runnable batch entries by [ADR 0018](0018-batch-jobs-spark-side-restore.md); `launch = false` keeps this meaning
 
 **Context.** Pika H3 Flex (`Pika-Labs/Pika-H3-Flex` @`0ddf55ad`, a 33B
 video + audio model on `MiniMaxAI/MiniMax-H3` @`42ed227e`) now runs on
