@@ -18,6 +18,9 @@ systemd user unit on one box serves outside halo-ctl (box, unit, port). The
 app shows it and reads its health, but never starts or stops it, and leaves
 that box's halo-ctl alone: a halo-ctl up or stop there would kill whatever
 holds its engine ports and take the box's GPU memory from the service.
+
+`strix use` points Hermes at a model that is already ready (the same config
+fields as Spark's `use`). It does not start or stop anything.
 """
 from __future__ import annotations
 
@@ -28,6 +31,7 @@ import shlex
 import subprocess
 import time
 import uuid
+from urllib.parse import urlsplit
 
 ENGINES = ("halogen", "cluster", "lemonade", "vllm")
 SERVICE = "service"   # an always-on systemd unit outside halo-ctl (ADR 0019)
@@ -180,6 +184,37 @@ def api_key(cfg: dict, host: str) -> str | None:
     return out or None
 
 
+def needs_bearer(model: dict) -> bool:
+    """Whether Hermes must send the box API key for this card.
+
+    halo-ctl engines always do. Always-on services do not (ADR 0019: those
+    llama-servers take none), except ``halogen.service`` — Halogen's :8731
+    server requires its bearer — and any service card that sets ``api_key = true``.
+    ``api_key = false`` turns the bearer off. The key itself is never in the catalog.
+    """
+    flag = model.get("api_key")
+    if isinstance(flag, bool):
+        return flag
+    if model.get("engine") == SERVICE:
+        return model.get("unit") == "halogen.service"
+    return model.get("engine") in ENGINES
+
+
+def _client_base_url(url: str | None) -> str | None:
+    """http(s) URL ending in /v1 with no userinfo, query, or fragment."""
+    if not isinstance(url, str) or not url:
+        return None
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return None
+    if (parsed.scheme not in ("http", "https") or not parsed.hostname
+            or parsed.username or parsed.password or parsed.query or parsed.fragment
+            or parsed.path.rstrip("/") != "/v1"):
+        return None
+    return url.rstrip("/")
+
+
 def _match(cfg: dict, engine: str, reported: str) -> str | None:
     for mid, model in models(cfg).items():
         if model.get("engine") == engine and _reports(model, reported):
@@ -252,20 +287,22 @@ def count(text):
             name, value = match.group(1), float(match.group(2))
             counters[name] = max(counters.get(name, 0.0), value) if "kv_cache" in name else counters.get(name, 0.0) + value
     return counters
-# Always-on llama-servers outside halo-ctl (ADR 0019): unit state, served id, context, counters. No key sent.
+# Always-on units outside halo-ctl (ADR 0019). The fourth field is whether this
+# card's server requires the box bearer (halogen.service does). The key is read
+# on the box and is not returned. Keyless llama-servers are still probed without one.
 services = []
-for sid, unit, sport in SERVICES:
+for sid, unit, sport, auth in SERVICES:
     item = {"id": sid, "unit": unit, "port": sport, "model": None, "served_context": None,
             "active": sh("systemctl", "--user", "is-active", unit).strip() or "unknown"}
     try:
-        item["model"] = json.loads(get("http://127.0.0.1:%%s/v1/models" %% sport, False))["data"][0].get("id")
+        item["model"] = json.loads(get("http://127.0.0.1:%%s/v1/models" %% sport, auth))["data"][0].get("id")
     except Exception:
         pass
     try:
-        item["served_context"] = (json.loads(get("http://127.0.0.1:%%s/props" %% sport, False)).get("default_generation_settings") or {}).get("n_ctx")
+        item["served_context"] = (json.loads(get("http://127.0.0.1:%%s/props" %% sport, auth)).get("default_generation_settings") or {}).get("n_ctx")
     except Exception:
         pass
-    item["counters"] = count(get("http://127.0.0.1:%%s/metrics" %% sport, False))
+    item["counters"] = count(get("http://127.0.0.1:%%s/metrics" %% sport, auth))
     services.append(item)
 print(json.dumps({"state": state, "stats": stats, "served_context": served, "counters": count(text),
                   "disk": disk, "rpc_worker": rpc, "rpc_clients": rpc_clients, "services": services}))
@@ -337,7 +374,7 @@ def _service(cfg: dict, host: str, raw: dict) -> dict:
 def _box(cfg: dict, host: str) -> dict:
     specs = services(cfg, host)
     script = _PROBE % {"ctl": _ctl(cfg), "key": site(cfg).get("api_key_file") or DEFAULT_KEY,
-                       "services": [[sid, m["unit"], int(m["port"])] for sid, m in specs.items()]}
+                       "services": [[sid, m["unit"], int(m["port"]), needs_bearer(m)] for sid, m in specs.items()]}
     raw = json.loads(ssh(host, "python3 - <<'SPARK_SERVE_PROBE'\n" + script + "\nSPARK_SERVE_PROBE").strip().splitlines()[-1])
     state, stats = raw.get("state") or {}, raw.get("stats") or {}
     svc = [_service(cfg, host, s) for s in raw.get("services") or []]
@@ -609,6 +646,113 @@ def connection(cfg: dict, host: str | None = None) -> dict:
             "api_key": api_key(cfg, me["host"])}
 
 
+def _ready_for(box_status: dict, mid: str | None, model: dict) -> bool:
+    """The box is serving this catalog card (or disk model) and has a base URL."""
+    if (box_status.get("error") or box_status.get("phase") != "ready"
+            or box_status.get("engine") != model.get("engine") or not box_status.get("url")):
+        return False
+    if model.get("engine") == "halogen":
+        return True
+    if mid and box_status.get("model_id"):
+        return box_status["model_id"] == mid
+    return _reports(model, box_status.get("model"))
+
+
+def hermes_selection(cfg: dict, name: str, host: str | None = None) -> dict:
+    """Live endpoint for a selected Strix model that is already ready.
+
+    Does not start or stop anything. A service uses its own box. The cluster
+    uses its master, including when ``--box`` names the worker. ``hermes_base_url``
+    on the card replaces the live host URL (an IPv4 pin, for example). The API
+    key is included only when the card requires a bearer, and is read from the
+    box rather than the catalog.
+    """
+    mid, model = target(cfg, name)
+    if model.get("engine") == SERVICE:
+        if not mid:
+            raise StrixError(f"unknown Strix model {name!r}")
+        home = model["box"]
+        if host is not None and box(cfg, host) != home:
+            raise StrixError(f"{model.get('label') or mid} is always on {home}")
+        current = _by_host(status(cfg))[home]
+        if current["error"]:
+            raise StrixError(current["error"])
+        service = next((item for item in current.get("services") or [] if item.get("id") == mid), None)
+        if not service or service.get("phase") != "ready" or not service.get("url"):
+            raise StrixError(f"{model.get('label') or mid} is not ready on {home}")
+        served = model.get("served_name") or service.get("model")
+        live, where = service["url"], home
+    else:
+        if host is not None:
+            host = box(cfg, host)
+        current = status(cfg)
+        by_host = _by_host(current)
+        if host is not None and model.get("engine") == "cluster":
+            me = by_host[host]
+            peer = by_host.get(me.get("peer") or "")
+            if me.get("role") == "worker" and peer and peer.get("role") == "master":
+                host = me["peer"]
+        matches = [item for item in current["boxes"]
+                   if _ready_for(item, mid, model) and (host is None or item["host"] == host)]
+        label = model.get("label") or name
+        if host is not None and not matches:
+            raise StrixError(f"{label} is not ready on {host}")
+        if len(matches) != 1:
+            raise StrixError("choose the box serving it with --box" if len(matches) > 1 else f"{label} is not ready")
+        me = matches[0]
+        served = model.get("served_name") or (
+            me["model"].rsplit("/", 1)[-1] if me["engine"] == "vllm" else me["model"])
+        live, where = me.get("url"), me["host"]
+    if model.get("hermes_base_url"):
+        url = _client_base_url(model.get("hermes_base_url"))
+        if url is None:
+            raise StrixError(f"{mid or name}: hermes_base_url must be an http(s) URL ending in /v1 without credentials")
+    else:
+        url = _client_base_url(live)
+    if not url or not served:
+        raise StrixError(f"{model.get('label') or name} has no usable base URL")
+    key = None
+    if needs_bearer(model):
+        key = api_key(cfg, where)
+        if not key:
+            path = site(cfg).get("api_key_file") or DEFAULT_KEY
+            raise StrixError(f"{where}: no API key in {path}; Hermes was not changed")
+    return {"id": mid, "model": model, "host": where, "base_url": url, "served": served, "api_key": key}
+
+
+def use(cfg: dict, name: str, host: str | None, hermes_target: str, patch) -> dict:
+    """Write the selected ready Strix model into Hermes. ``patch`` is spark-serve._hermes_patch."""
+    if hermes_target not in ("local", "spark"):
+        raise StrixError("Hermes target must be local or spark")
+    if patch is None:
+        raise StrixError("Hermes update is unavailable")
+    hermes_host = None
+    if hermes_target == "spark":
+        head = (cfg.get("cluster") or {}).get("head")
+        if not isinstance(head, str) or not head:
+            raise StrixError("Hermes (Spark) needs cluster.head")
+        hermes_host = head
+    chosen = hermes_selection(cfg, name, host)
+    model = dict(chosen["model"])
+    model["served_name"] = chosen["served"]
+    if not model.get("hermes_provider"):
+        model["hermes_provider"] = "amd-halo"
+    message, ok = patch(
+        cfg, chosen["id"] or name, model, False,
+        remote_host=hermes_host, base_url=chosen["base_url"], api_key=chosen["api_key"],
+        provider_label="AMD Strix Halo", move_ds4=False,
+    )
+    secret = chosen["api_key"]
+    if secret and secret in (message or ""):
+        message = message.replace(secret, "***")
+    if not ok:
+        raise StrixError(message)
+    return {"message": message, "host": chosen["host"], "served": chosen["served"],
+            "base_url": chosen["base_url"], "provider": model["hermes_provider"],
+            "hermes_target": hermes_target, "hermes_host": hermes_host,
+            "label": model.get("label") or chosen["served"]}
+
+
 def logs(cfg: dict, host: str | None = None, lines: int = 60) -> dict:
     """Recent journal lines of the box's engine, of its RPC worker while it is one, else of every engine."""
     host = box(cfg, host)
@@ -781,7 +925,7 @@ def _box_line(b: dict) -> str:
     return f"{b['host']}: {b['engine']} {b['phase']}{role}{serving}{always}"
 
 
-def main(cfg: dict, args, performance: dict, dates: dict | None = None) -> int:
+def main(cfg: dict, args, performance: dict, dates: dict | None = None, hermes_patch=None) -> int:
     """`spark-serve strix …` entry point; JSON on stdout, errors as an error event."""
     try:
         if args.strix_cmd == "list":
@@ -804,6 +948,19 @@ def main(cfg: dict, args, performance: dict, dates: dict | None = None) -> int:
             _emit_json({"event": "ready", "status": up(cfg, args.model, args.box, emit=_emit_json)})
         elif args.strix_cmd == "stop":
             _emit_json({"event": "stopped", "status": stop(cfg, args.box, emit=_emit_json)})
+        elif args.strix_cmd == "use":
+            result = use(cfg, args.model, args.box, args.hermes_target, hermes_patch)
+            if args.json:
+                _emit_json({"event": "hermes", "detail": result["message"]})
+                _emit_json({"event": "selected", "host": result["host"], "served": result["served"],
+                            "url": result["base_url"], "label": result["label"],
+                            "hermes_target": result["hermes_target"], "hermes_host": result["hermes_host"]})
+            else:
+                target = "Hermes (Spark)" if result["hermes_target"] == "spark" else "Hermes (Mac)"
+                where = f" on {result['hermes_host']}" if result["hermes_host"] else ""
+                print(f"hermes: {result['message']}")
+                print(f"{target}{where} uses {result['host']}: {result['label']}")
+                print(f"  {result['base_url']}  model {result['served']}")
         elif args.strix_cmd == "connection":
             details = connection(cfg, args.box)
             if args.json:
@@ -843,6 +1000,12 @@ def add_parser(sub) -> None:
     stp = commands.add_parser("stop", help="stop a box (its cluster, for the worker), or every box")
     stp.add_argument("--box", help="default: every box")
     stp.add_argument("--json", action="store_true", help="JSON events are the default output")
+    use_cmd = commands.add_parser("use", help="point Hermes at a Strix model that is already serving")
+    use_cmd.add_argument("model", help="catalog id or alias, or <engine>:<name> for a model on the box's disk")
+    use_cmd.add_argument("--box", help="the box serving it, when more than one is ready; a service uses its own box")
+    use_cmd.add_argument("--hermes-target", choices=["local", "spark"], default="local",
+                         help="Hermes config to update: this Mac (default) or the configured head Spark")
+    use_cmd.add_argument("--json", action="store_true", help="emit JSON-line progress")
     con = commands.add_parser("connection", help="base URL, model and API key of what a box serves")
     con.add_argument("--box")
     con.add_argument("--json", action="store_true")

@@ -519,9 +519,27 @@ def test_service_entries_need_box_unit_port_and_a_known_box():
 
 
 def test_the_probe_formats_and_compiles_with_services():
-    script = strix._PROBE % {"ctl": "~/bin/halo-ctl", "key": "~/k", "services": [["svc-llm", "llm.service", 8080]]}
+    script = strix._PROBE % {"ctl": "~/bin/halo-ctl", "key": "~/k",
+                             "services": [["svc-llm", "llm.service", 8080, False]]}
     compile(script, "probe", "exec")
-    assert "SERVICES = [['svc-llm', 'llm.service', 8080]]" in script
+    assert "SERVICES = [['svc-llm', 'llm.service', 8080, False]]" in script
+
+
+def test_a_halogen_service_probe_sends_the_box_key_and_other_services_do_not():
+    cfg = {"strix": {"hosts": ["two"], "models": {
+        "h": {"engine": "service", "box": "two", "unit": "halogen.service", "port": 8731, "served_name": "h"},
+        "e": {"engine": "service", "box": "two", "unit": "embed.service", "port": 8081, "served_name": "e",
+              "api_key": False},
+    }}}
+    listed = [[sid, m["unit"], int(m["port"]), strix.needs_bearer(m)] for sid, m in strix.services(cfg).items()]
+    script = strix._PROBE % {"ctl": "~/bin/halo-ctl", "key": "~/.config/halogen/api-key", "services": listed}
+    compile(script, "probe", "exec")
+    assert "['h', 'halogen.service', 8731, True]" in script
+    assert "['e', 'embed.service', 8081, False]" in script
+    assert strix.needs_bearer({"engine": "service", "unit": "llm.service"}) is False
+    assert strix.needs_bearer({"engine": "service", "unit": "halogen.service", "api_key": False}) is False
+    assert strix.needs_bearer({"engine": "service", "unit": "other.service", "api_key": True}) is True
+    assert strix.needs_bearer({"engine": "halogen"}) is True
 
 
 def test_services_are_read_and_halo_ctls_cluster_misreading_is_dropped(boxes):
@@ -600,6 +618,140 @@ def test_the_cli_status_line_lists_services(boxes, capsys):
     serve_always(boxes())
     line = strix._box_line(by_host(strix.status(SVC))["two"])
     assert "always on: LLM (always on) (llm.service) ready · llm · http://two:8080/v1" in line
+
+
+# --- Hermes selection of the model that is already ready ---
+
+HALOGEN_SERVICE = {"strix": {"hosts": ["one", "two"], "ctl": "~/bin/halo-ctl", "api_key_file": "~/.config/halogen/api-key",
+                             "models": {"strix-halogen-flash-next": {
+                                 "label": "Halogen flash", "engine": "service", "box": "two", "unit": "halogen.service",
+                                 "served_name": "halogen-qwen3.8-flash-next", "port": 8731, "max_model_len": 262144,
+                                 "aliases": ["halogen"]}}}}
+
+
+def serve_halogen(fake, model="halogen-qwen3.8-flash-next", active="active"):
+    original = fake.probe
+
+    def probe(host):
+        out = original(host)
+        if host == "two":
+            out["services"] = [{"id": "strix-halogen-flash-next", "unit": "halogen.service", "port": 8731,
+                                "active": active, "model": model, "served_context": 262144, "counters": {}}]
+        return out
+    fake.probe = probe
+    return fake
+
+
+def test_hermes_selection_of_a_ready_engine_reads_its_key_and_url(boxes):
+    fake = boxes(two=("halogen", "ready", "a"))
+    chosen = strix.hermes_selection(CFG, "halo-a")
+    assert (chosen["host"], chosen["base_url"], chosen["served"], chosen["api_key"]) == (
+        "two", "http://two:8731/v1", "a", "key-two")
+    assert any(command.startswith("cat ") for _, command in fake.calls)
+    assert commands(fake) == []
+
+
+def test_hermes_selection_refuses_a_model_that_is_not_ready_and_asks_when_two_are(boxes):
+    boxes()
+    with pytest.raises(strix.StrixError, match="not ready"):
+        strix.hermes_selection(CFG, "halo-a")
+    boxes(one=("halogen", "ready", "a"), two=("halogen", "ready", "a"))
+    with pytest.raises(strix.StrixError, match="--box"):
+        strix.hermes_selection(CFG, "halo-a")
+    chosen = strix.hermes_selection(CFG, "halo-a", "one")
+    assert chosen["base_url"] == "http://one:8731/v1" and chosen["api_key"] == "key-one"
+
+
+def test_cluster_hermes_uses_the_master_even_from_the_worker(boxes):
+    boxes(one=("cluster", "ready", "q8"))
+    chosen = strix.hermes_selection(CFG, "halo-q", "two")
+    assert (chosen["host"], chosen["base_url"], chosen["served"], chosen["api_key"]) == (
+        "one", "http://one:8081/v1", "q8", "key-one")
+
+
+def test_halogen_service_hermes_uses_the_live_url_model_and_bearer(boxes):
+    fake = serve_halogen(boxes())
+    chosen = strix.hermes_selection(HALOGEN_SERVICE, "halogen")
+    assert (chosen["id"], chosen["host"], chosen["base_url"], chosen["served"], chosen["api_key"]) == (
+        "strix-halogen-flash-next", "two", "http://two:8731/v1", "halogen-qwen3.8-flash-next", "key-two")
+    assert commands(fake) == []
+    pinned = {"strix": {**HALOGEN_SERVICE["strix"], "models": {
+        "strix-halogen-flash-next": {**HALOGEN_SERVICE["strix"]["models"]["strix-halogen-flash-next"],
+                                     "hermes_base_url": "http://192.168.86.51:8731/v1"}}}}
+    assert strix.hermes_selection(pinned, "halogen")["base_url"] == "http://192.168.86.51:8731/v1"
+    bad = {"strix": {**HALOGEN_SERVICE["strix"], "models": {
+        "strix-halogen-flash-next": {**HALOGEN_SERVICE["strix"]["models"]["strix-halogen-flash-next"],
+                                     "hermes_base_url": "http://user:secret@192.168.86.51:8731/v1"}}}}
+    with pytest.raises(strix.StrixError, match="hermes_base_url"):
+        strix.hermes_selection(bad, "halogen")
+
+
+def test_a_down_or_other_box_service_is_not_selected(boxes):
+    serve_halogen(boxes(), model=None, active="inactive")
+    with pytest.raises(strix.StrixError, match="not ready"):
+        strix.hermes_selection(HALOGEN_SERVICE, "halogen")
+    serve_halogen(boxes())
+    with pytest.raises(strix.StrixError, match="always on two"):
+        strix.hermes_selection(HALOGEN_SERVICE, "halogen", "one")
+
+
+def test_a_keyless_service_does_not_read_or_send_a_bearer(boxes):
+    fake = serve_always(boxes())
+    chosen = strix.hermes_selection(SVC, "svc-llm")
+    assert (chosen["base_url"], chosen["served"], chosen["api_key"]) == ("http://two:8080/v1", "llm", None)
+    assert not any(command.startswith("cat ") for _, command in fake.calls)
+    keyed = {"strix": {**SVC["strix"], "models": {**SERVICE_MODELS, "svc-llm": {**SERVICE_MODELS["svc-llm"], "api_key": True}}}}
+    assert strix.hermes_selection(keyed, "svc-llm")["api_key"] == "key-two"
+
+
+def test_use_patches_hermes_without_starting_or_logging_the_key(boxes, capsys):
+    fake = serve_halogen(boxes())
+    seen = {}
+
+    def patch(cfg, mid, model, skip, **kwargs):
+        seen.update(mid=mid, served=model["served_name"], provider=model["hermes_provider"], skip=skip, **kwargs)
+        return ("patched", True)
+
+    args = argparse.Namespace(strix_cmd="use", model="halogen", box=None, hermes_target="local", json=True)
+    assert strix.main(HALOGEN_SERVICE, args, {}, hermes_patch=patch) == 0
+    assert commands(fake) == []
+    assert seen["provider"] == "amd-halo" and seen["served"] == "halogen-qwen3.8-flash-next"
+    assert seen["base_url"] == "http://two:8731/v1" and seen["api_key"] == "key-two"
+    assert seen["remote_host"] is None and seen["provider_label"] == "AMD Strix Halo" and seen["move_ds4"] is False
+    assert seen["skip"] is False and seen["mid"] == "strix-halogen-flash-next"
+    out = capsys.readouterr().out
+    assert "key-two" not in out
+    events = [json.loads(line) for line in out.splitlines()]
+    assert [event["event"] for event in events] == ["hermes", "selected"]
+    selected = events[1]
+    assert selected["url"] == "http://two:8731/v1" and selected["served"] == "halogen-qwen3.8-flash-next"
+    assert selected["hermes_target"] == "local" and selected["hermes_host"] is None and selected["host"] == "two"
+    assert "api_key" not in selected
+
+
+def test_spark_hermes_target_uses_the_head_and_a_miss_never_patches(boxes, capsys):
+    serve_halogen(boxes())
+    seen = {}
+
+    def patch(*args, **kwargs):
+        seen["remote_host"] = kwargs["remote_host"]
+        return ("patched", True)
+
+    cfg = {**HALOGEN_SERVICE, "cluster": {"head": "sparkone"}}
+    args = argparse.Namespace(strix_cmd="use", model="strix-halogen-flash-next", box="two",
+                              hermes_target="spark", json=True)
+    assert strix.main(cfg, args, {}, hermes_patch=patch) == 0
+    assert seen["remote_host"] == "sparkone"
+    assert json.loads(capsys.readouterr().out.splitlines()[-1])["hermes_host"] == "sparkone"
+    with pytest.raises(strix.StrixError, match="cluster.head"):
+        strix.use(HALOGEN_SERVICE, "halogen", None, "spark", patch)
+    called = []
+    with pytest.raises(strix.StrixError, match="not ready"):
+        strix.use(CFG, "halo-a", None, "local", lambda *a, **k: called.append(True))
+    assert called == []
+    assert strix.main(HALOGEN_SERVICE, argparse.Namespace(
+        strix_cmd="use", model="halogen", box=None, hermes_target="local", json=True), {}) == 1
+    assert "unavailable" in capsys.readouterr().out
 
 
 def test_shipped_catalogs_keep_services_consistent():

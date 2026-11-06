@@ -235,6 +235,110 @@ def test_failed_remote_patch_never_emits_selected(monkeypatch, capsys):
     assert '"event": "selected"' not in capsys.readouterr().out
 
 
+def test_explicit_endpoint_writes_url_and_key_without_moving_spark(monkeypatch, tmp_path):
+    path = tmp_path / "config.yaml"
+    original = {
+        "model": {"default": "old", "provider": "spark", "max_tokens": 4096},
+        "providers": {
+            "spark": {"name": "Spark cluster", "api_key": "PRIVATE-SPARK-KEY",
+                      "base_url": "http://sparkone.lan:8000/v1", "default_model": "old"},
+            "spark-ds4": {"base_url": "http://sparkone.lan:8000/v1"},
+        },
+    }
+    path.write_text(yaml.safe_dump(original, sort_keys=False))
+    monkeypatch.setattr(cli, "HERMES_CONFIG", path)
+    model = {"served_name": "halogen-qwen3.8-flash-next", "hermes_provider": "amd-halo",
+             "max_model_len": 262144, "hermes_supports_vision": False}
+
+    message, ok = cli._hermes_patch(
+        config(), "strix-halogen", model, False,
+        base_url="http://192.168.86.51:8731/v1", api_key="abc{def}PRIVATE-HALOGEN-KEY",
+        provider_label="AMD Strix Halo", move_ds4=False,
+    )
+
+    assert ok, message
+    assert "PRIVATE-HALOGEN-KEY" not in message and "abc{def}" not in message
+    actual = yaml.safe_load(path.read_text())
+    assert actual["model"]["default"] == "halogen-qwen3.8-flash-next"
+    assert actual["model"]["provider"] == "amd-halo"
+    assert actual["model"]["max_tokens"] == 4096
+    block = actual["providers"]["amd-halo"]
+    assert block["base_url"] == "http://192.168.86.51:8731/v1"
+    assert block["default_model"] == "halogen-qwen3.8-flash-next"
+    assert block["api_key"] == "abc{def}PRIVATE-HALOGEN-KEY"
+    assert block["name"] == "AMD Strix Halo"
+    assert block["models"]["halogen-qwen3.8-flash-next"] == {
+        "context_length": 262144, "supports_vision": False,
+    }
+    assert actual["providers"]["spark"] == original["providers"]["spark"]
+    assert actual["providers"]["spark-ds4"] == original["providers"]["spark-ds4"]
+
+
+def test_keyless_explicit_endpoint_keeps_the_dummy_key_rule(monkeypatch, tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text("model: {default: old, provider: other}\n")
+    monkeypatch.setattr(cli, "HERMES_CONFIG", path)
+    monkeypatch.setenv("SPARK_SERVE_HERMES_KEY", "PRIVATE-ENV-KEY")
+    model = {"served_name": "llm", "hermes_provider": "amd-halo", "max_model_len": 131072}
+
+    message, ok = cli._hermes_patch(
+        config(), "svc-llm", model, False,
+        base_url="http://strix-amd:8080/v1", provider_label="AMD Strix Halo", move_ds4=False,
+    )
+
+    assert ok, message
+    assert "PRIVATE-ENV-KEY" not in message
+    block = yaml.safe_load(path.read_text())["providers"]["amd-halo"]
+    assert block["api_key"] == "dummy"
+    assert block["base_url"] == "http://strix-amd:8080/v1"
+
+
+def test_bad_explicit_url_never_writes_or_logs_credentials(monkeypatch, tmp_path):
+    path = tmp_path / "config.yaml"
+    original = "model: {default: old, provider: spark}\n"
+    path.write_text(original)
+    monkeypatch.setattr(cli, "HERMES_CONFIG", path)
+
+    message, ok = cli._hermes_patch(
+        config(), "strix-halogen", {"served_name": "h", "hermes_provider": "amd-halo"}, False,
+        base_url="http://user:PRIVATE-URL-SECRET@192.168.86.51:8731/v1",
+        api_key="PRIVATE-HALOGEN-KEY", move_ds4=False,
+    )
+
+    assert not ok
+    assert path.read_text() == original
+    assert "PRIVATE-URL-SECRET" not in message and "PRIVATE-HALOGEN-KEY" not in message
+
+
+def test_remote_explicit_key_is_written_only_on_the_remote_config(remote_home):
+    path, local, calls = remote_home
+    path.write_text("model: {default: old, provider: other}\n")
+
+    message, ok = cli._hermes_patch(
+        config(), "strix-halogen",
+        {"served_name": "halogen-qwen3.8-flash-next", "hermes_provider": "amd-halo", "max_model_len": 262144},
+        False, remote_host="sparkone", base_url="http://strix-amd:8731/v1",
+        api_key="PRIVATE-HALOGEN-KEY", provider_label="AMD Strix Halo", move_ds4=False,
+    )
+
+    assert ok, message
+    assert calls == ["sparkone"]
+    assert "PRIVATE-HALOGEN-KEY" not in message
+    block = yaml.safe_load(path.read_text())["providers"]["amd-halo"]
+    assert block["base_url"] == "http://strix-amd:8731/v1"
+    assert block["api_key"] == "PRIVATE-HALOGEN-KEY"
+    assert block["default_model"] == "halogen-qwen3.8-flash-next"
+
+
+def test_strix_use_parser_defaults_to_this_mac():
+    parser = cli.build_parser()
+    args = parser.parse_args(["strix", "use", "halogen", "--box", "strix-amd"])
+    assert args.strix_cmd == "use" and args.model == "halogen" and args.box == "strix-amd"
+    assert args.hermes_target == "local" and args.json is False
+    spark = parser.parse_args(["strix", "use", "halogen", "--hermes-target", "spark", "--json"])
+    assert spark.hermes_target == "spark" and spark.json is True
+
+
 def test_skipped_remote_patch_never_connects(monkeypatch):
     ssh = Mock()
     monkeypatch.setattr(cli, "ssh_cmd", ssh)
