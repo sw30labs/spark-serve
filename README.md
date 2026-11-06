@@ -284,7 +284,8 @@ The window has three tabs:
 - **NVIDIA DGX Spark** controls placement, start/stop, and Hermes selection. Prepare
   models with CLI `pull`; startup progress and failures appear in the activity log.
 - **AMD Strix Halo** starts and stops models on the two AMD boxes and their
-  cluster; see [AMD Strix Halo tab](#amd-strix-halo-tab).
+  cluster, and points Hermes at the selected ready model the same way the Spark
+  tab does; see [AMD Strix Halo tab](#amd-strix-halo-tab).
 
 The app no longer has a Benchmarks tab (removed 2026-10-25,
 [ADR 0015](docs/adr/0015-remove-native-benchmarks-tab.md)). Run bounded decode
@@ -382,8 +383,29 @@ says what it will stop.
 ./spark-serve strix up halo-qwen38-cluster --box amd-halo-2   # amd-halo-2 master, amd-halo worker
 ./spark-serve strix stop --box amd-halo                       # without --box: both boxes
 ./spark-serve strix connection --box amd-halo-2               # base URL, model, API key
+./spark-serve strix use strix-gpt-oss-120b                    # ready model; --hermes-target spark updates the head
 python3 tools/catalog_tps_bench.py run --site strix --box amd-halo-2
 ```
+
+Under the selected model, **Use in Hermes (Mac)** and **Use in Hermes (Spark)**
+match the Spark tab: same labels, bordered buttons, and log lines
+(`connecting Hermes (Mac) to <box>…`, then `Hermes (Mac) uses <box>: <model>`).
+The button stays off until that model is ready. It writes `~/.hermes/config.yaml`
+on this Mac, or the head Spark's copy with `--hermes-target spark`:
+
+- `model.provider` becomes `amd-halo`, or the card's `hermes_provider`
+- `model.default`, and that provider's `base_url` and `default_model`, become the
+  ready endpoint and served model id (`http://<box>:<port>/v1`, or the card's
+  `hermes_base_url` when set)
+- `providers.<name>.models.<served>.context_length` comes from the card
+- the provider `api_key` is the box key from `api_key_file` when the engine or
+  the card needs a bearer (`halogen.service` does; `api_key = true` opts in,
+  `api_key = false` opts out). Keyless services keep the Spark rule: the key
+  already in that provider block, or `dummy`. The key is read over SSH for the
+  write and is not stored in the catalog or printed.
+
+Spark's own Hermes buttons are unchanged, and a Strix selection does not rewrite
+the `spark` provider block.
 
 The menu bar repeats the widget for both boxes: each engine's models on that
 box's disk, Stop, and Copy connection details. Models on disk without a catalog

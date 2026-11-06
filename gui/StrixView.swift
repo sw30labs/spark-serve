@@ -121,6 +121,13 @@ struct StrixLogs: Codable, Identifiable {
     var id: String { host }
 }
 
+/// A ready Strix endpoint Hermes can be pointed at: the box, its OpenAI base URL, and the served model id.
+struct StrixHermesEndpoint: Equatable {
+    let host: String
+    let url: String
+    let model: String
+}
+
 /// Something to start: a catalog card, or a model on a box's disk that the catalog lacks.
 struct StrixChoice: Identifiable, Hashable {
     /// Catalog id, or `<engine>:<halo-ctl id>` as `spark-serve strix up` takes it.
@@ -165,6 +172,14 @@ final class StrixStore: ObservableObject {
     private var lineBuffer = Data()
     private var cancelled = false
     private var afterCancel: (() -> Void)?
+    /// Set for the duration of a Hermes selection so the log can confirm it the way the Spark screen does.
+    private var pendingHermes: PendingHermes?
+    private var didReportHermes = false
+
+    private struct PendingHermes {
+        let title: String
+        let host: String
+    }
 
     /// `poll` reads the boxes every 15 s for the menu bar, window or not; tests pass false.
     init(poll: Bool = false) {
@@ -319,6 +334,44 @@ final class StrixStore: ObservableObject {
 
     func isServingAnywhere(_ choice: StrixChoice) -> Bool { boxes.contains { serves(choice, $0.host) } }
 
+    /// The selected model, once it is ready: one box, its base URL, and the id Hermes should request.
+    /// Nil when it is not serving, or when more than one box is ready and the choice is ambiguous.
+    func hermesEndpoint(_ choice: StrixChoice) -> StrixHermesEndpoint? {
+        if choice.engine == "service" {
+            guard let host = serviceBox(choice),
+                  let service = service(choice, host),
+                  service.phase == "ready",
+                  let url = service.url, !url.isEmpty,
+                  let name = service.model, !name.isEmpty else { return nil }
+            return StrixHermesEndpoint(host: host, url: url, model: name)
+        }
+        let ready = boxes.filter {
+            serves(choice, $0.host) && servingPhase(choice, $0.host) == "ready" && !($0.url ?? "").isEmpty
+        }
+        let endpoints = choice.engine == "cluster" ? ready.filter { $0.role != "worker" } : ready
+        guard endpoints.count == 1, let box = endpoints.first, let url = box.url else { return nil }
+        let catalogued = models.first { $0.id == choice.id }?.served_name ?? ""
+        let name = !catalogued.isEmpty ? catalogued : (!box.model.isEmpty ? box.model : choice.ctlID)
+        guard !name.isEmpty else { return nil }
+        return StrixHermesEndpoint(host: box.host, url: url, model: name)
+    }
+
+    /// `spark-serve strix use` arguments for the selected ready model. Nil until it is ready.
+    func hermesArguments(_ choice: StrixChoice, target: HermesTarget) -> [String]? {
+        guard let endpoint = hermesEndpoint(choice) else { return nil }
+        return ["strix", "use", choice.id, "--box", endpoint.host, "--hermes-target", target.rawValue, "--json"]
+    }
+
+    /// Same control as the Spark panels: write the selected ready model into Hermes on this Mac or the head Spark.
+    func useInHermes(_ choice: StrixChoice, target: HermesTarget) {
+        guard !isBusy, let endpoint = hermesEndpoint(choice),
+              let args = hermesArguments(choice, target: target) else { return }
+        didReportHermes = false
+        pendingHermes = PendingHermes(title: target.title, host: endpoint.host)
+        log("  connecting \(target.title) to \(endpoint.host)…")
+        perform("Connecting \(target.title)", args, isStart: false)
+    }
+
     /// Why a start on this box is not offered, or nil when it is.
     func blocker(_ choice: StrixChoice, on host: String) -> String? {
         guard let b = box(host) else { return "No reading from \(host) yet" }
@@ -450,6 +503,7 @@ final class StrixStore: ObservableObject {
             lastError = "\(title) failed: \(error.localizedDescription)"
             busyAction = nil
             busyIsStart = false
+            pendingHermes = nil
             return
         }
         running = process
@@ -465,6 +519,11 @@ final class StrixStore: ObservableObject {
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.consume(Data([0x0a]))
+                if code == 0, let pending = self.pendingHermes, !self.didReportHermes {
+                    self.log("  \(pending.title) now uses \(pending.host)")
+                }
+                self.pendingHermes = nil
+                self.didReportHermes = false
                 if code != 0 && !self.cancelled && self.lastError == nil { self.lastError = "\(title) failed; see the log." }
                 self.running = nil
                 self.busyAction = nil
@@ -501,6 +560,18 @@ final class StrixStore: ObservableObject {
             log("  error: \(detail)")
         case "progress":
             if let detail = event["detail"] as? String { log("  \(detail)") }
+        case "hermes":
+            if let detail = event["detail"] as? String { log("  hermes: \(detail)") }
+        case "selected":
+            let target = HermesTarget(rawValue: event["hermes_target"] as? String ?? "local") ?? .local
+            let host = event["host"] as? String ?? ""
+            let destination = (event["hermes_host"] as? String).map { " on \($0)" } ?? ""
+            let served = event["served"] as? String
+            let label = (event["label"] as? String)
+                ?? models.first { $0.served_name == served }?.label
+                ?? served
+            log("  \(target.title)\(destination) uses \(host)\(label.map { ": \($0)" } ?? "")")
+            didReportHermes = true
         case "ready":
             log("  ready")
         default:
@@ -738,6 +809,7 @@ struct StrixView: View {
                         startButton(choice, box.host)
                     }
                 }
+                hermesButtons(choice)
             }
             HStack(spacing: 12) {
                 Button("Stop both boxes") { store.stop(nil) }
@@ -754,6 +826,24 @@ struct StrixView: View {
             Text("Every engine requires the box's API key. vLLM takes about 2 minutes to start; Stop abandons a start that is still loading.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+        }
+    }
+
+    /// Same labels, style, and help as the Spark node panel. Disabled until the selected model is ready.
+    private func hermesButtons(_ choice: StrixChoice) -> some View {
+        let ready = store.hermesEndpoint(choice) != nil
+        return HStack(spacing: 8) {
+            ForEach(HermesTarget.allCases, id: \.self) { target in
+                Button("Use in \(target.title)") {
+                    store.useInHermes(choice, target: target)
+                }
+                .buttonStyle(.bordered)
+                .disabled(store.isBusy || !ready)
+                .accessibilityLabel("Use \(choice.label) in \(target.title)")
+                .help(target == .local
+                      ? "Update Hermes on this Mac"
+                      : "Update Hermes on the head Spark")
+            }
         }
     }
 

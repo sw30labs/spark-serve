@@ -1395,10 +1395,32 @@ def cmd_wait(cfg: dict, node: str = "head") -> None:
     print(f"ready: {served}")
 
 
+def _openai_base_url(url: str) -> str | None:
+    """An OpenAI base URL Hermes can store: http(s), no credentials, path /v1."""
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return None
+    if (parsed.scheme not in ("http", "https") or not parsed.hostname
+            or parsed.username or parsed.password or parsed.query or parsed.fragment
+            or parsed.path.rstrip("/") != "/v1"):
+        return None
+    return url.rstrip("/")
+
+
 def _hermes_patch(
     cfg: dict, mid: str, model: dict, skip: bool, *, remote_host: str | None = None,
+    base_url: str | None = None, api_key: str | None = None,
+    provider_label: str | None = None, move_ds4: bool = True,
 ) -> tuple[str, bool]:
-    """Return (message, ok). ok=False means the patch did not apply."""
+    """Return (message, ok). ok=False means the patch did not apply.
+
+    Spark selection leaves base_url, api_key, and move_ds4 at their defaults:
+    the cluster URL, the provider's existing key or ``dummy``, and the leftover
+    spark-ds4 URL move. Strix passes the live endpoint, the box bearer when the
+    card requires one, and move_ds4=False so Spark provider blocks stay put.
+    The bearer travels in SPARK_SERVE_HERMES_KEY, not in the script text.
+    """
     if skip:
         return ("skipped (--no-hermes)", False)
     path = HERMES_CONFIG
@@ -1408,12 +1430,25 @@ def _hermes_patch(
     provider = model.get("hermes_provider") or "spark"
     ctx = int(model.get("hermes_context_length") or model.get("max_model_len") or 0)
     vision = model.get("hermes_supports_vision")
-    cluster_url = cfg["cluster"]["lan_url"].rstrip("/") + "/v1"
-    try:
-        url = hermes_base_url(cfg, mid, model)
-    except ControllerError as exc:
-        return (str(exc), False)
+    label = provider_label or "Spark cluster"
+    if base_url is None:
+        try:
+            url = hermes_base_url(cfg, mid, model)
+        except ControllerError as exc:
+            return (str(exc), False)
+    else:
+        url = _openai_base_url(base_url)
+        if url is None:
+            return (f"{mid}: Hermes base URL must be an http(s) URL ending in /v1 without credentials", False)
     node = cfg.get("_spark_serve_placement", {}).get("node", "head")
+    if move_ds4:
+        cluster_url = cfg["cluster"]["lan_url"].rstrip("/") + "/v1"
+        ds4_update = (
+            f"if 'spark-ds4' in providers and {provider!r} != 'spark-ds4' and {node != 'worker'!r}:\n"
+            f"    providers['spark-ds4']['base_url'] = {cluster_url!r}\n"
+        )
+    else:
+        ds4_update = ""
     py = None
     for cand in (
         Path.home() / ".hermes/hermes-agent/venv/bin/python",
@@ -1461,8 +1496,12 @@ if {ctx}:
     model.pop('context_length', None)
 providers = data.setdefault('providers', {{}})
 block = providers.setdefault({provider!r}, {{}})
-block['name'] = block.get('name') or 'Spark cluster'
-block['api_key'] = block.get('api_key') or 'dummy'
+block['name'] = block.get('name') or {label!r}
+forced = os.environ.get('SPARK_SERVE_HERMES_KEY')
+if forced:
+    block['api_key'] = forced
+else:
+    block['api_key'] = block.get('api_key') or 'dummy'
 block['api_mode'] = block.get('api_mode') or 'chat_completions'
 block['base_url'] = {url!r}
 block['default_model'] = {served!r}
@@ -1472,9 +1511,7 @@ settings['context_length'] = {ctx} or 8192
 if isinstance({vision!r}, bool):
     settings['supports_vision'] = {vision!r}
 models[{served!r}] = settings
-if 'spark-ds4' in providers and {provider!r} != 'spark-ds4' and {node != 'worker'!r}:
-    providers['spark-ds4']['base_url'] = {cluster_url!r}
-if engine == 'ruamel':
+{ds4_update}if engine == 'ruamel':
     buffer = io.StringIO()
     yaml_obj.dump(data, buffer)
     rendered = buffer.getvalue()
@@ -1501,11 +1538,20 @@ print('patched', p, 'via', engine, 'provider', {provider!r}, 'model', {served!r}
              + "\nexcept Exception:\n    print('PATCH_ERROR')\n    sys.exit(1)\n")
     try:
         if remote_host is None:
-            proc = subprocess.run([py, "-c", patch], text=True, capture_output=True, check=False, timeout=30)
+            env = os.environ.copy()
+            env.pop("SPARK_SERVE_HERMES_KEY", None)
+            if api_key is not None:
+                env["SPARK_SERVE_HERMES_KEY"] = api_key
+            proc = subprocess.run(
+                [py, "-c", patch], text=True, capture_output=True, check=False, timeout=30, env=env,
+            )
         else:
+            # The key rides on stdin to bash -s, not in argv. A fresh remote shell has no inherited key.
+            exported = f"export SPARK_SERVE_HERMES_KEY={shlex.quote(api_key)}\n" if api_key is not None else ""
             remote = (
                 'set -euo pipefail\n'
-                'hermes_python="$HOME/.hermes/hermes-agent/venv/bin/python"\n'
+                + exported
+                + 'hermes_python="$HOME/.hermes/hermes-agent/venv/bin/python"\n'
                 'if [ ! -x "$hermes_python" ]; then hermes_python="$(command -v python3)"; fi\n'
                 'exec "$hermes_python" -c ' + shlex.quote(patch) + '\n'
             )
@@ -2397,7 +2443,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.cmd == "strix":
         performance = measured_performance()
         dates = catalog_freshness(cfg, performance, "strix.models") if args.strix_cmd == "list" else {}
-        sys.exit(strix_main(cfg, args, performance, dates))
+        sys.exit(strix_main(cfg, args, performance, dates, hermes_patch=_hermes_patch))
     if args.cmd == "list":
         if args.json:
             cmd_list_json(cfg)

@@ -475,6 +475,10 @@ hosts = ["strix-halo", "strix-halo-2"]   # SSH aliases; also the LAN hostnames c
 # master = "strix-halo"               # optional: the only box that runs the cluster as master
 ctl = "~/.local/bin/halo-ctl"
 api_key_file = "~/.config/halogen/api-key"   # read over SSH when needed, never stored here
+# `strix use <id>` points Hermes at a model that is already ready (provider amd-halo,
+# unless the card sets hermes_provider). hermes_base_url pins that base URL, for
+# example an IPv4 address. A service sets api_key = true when it needs the bearer;
+# halogen.service always does. Keyless services do not. The key is never written here.
 
 [strix.models.halo-nemotron35-cluster]
 label = "Nemotron 3.5 Super Q8 cluster"
