@@ -70,6 +70,9 @@ HERE = Path(__file__).resolve().parent
 CATALOG = HERE / "models.toml"
 EXAMPLE = HERE / "models.example.toml"
 RECIPES = HERE / "recipes"
+# Catalog cards spark-serve shows but never starts, stops or prepares (ADR 0017),
+# e.g. a one-GPU batch job such as Pika H3 Flex that owns its own process.
+BATCH_WRAPPERS = ("batch",)
 # Recipes whose weights are prepared outside spark-serve; `pull` explains how
 # instead of downloading them during a model switch.
 EXTERNAL_PREPARATION = {
@@ -99,6 +102,25 @@ def load() -> dict:
         die(f"missing catalog {CATALOG} — {hint}")
     with CATALOG.open("rb") as f:
         return tomllib.load(f)
+
+
+def launch_refusal(mid: str, model: dict) -> str | None:
+    """Why up/pull must refuse a card-only entry, or None when spark-serve manages it.
+
+    `wrapper = "batch"` or `launch = false` marks a card only. The refusal comes
+    before placement, preflight, SSH or the controller, so no workload is touched.
+    """
+    if model.get("launch", True) is not False and (model.get("wrapper") or "vllm") not in BATCH_WRAPPERS:
+        return None
+    hint = str(model.get("run_hint") or "").strip()
+    return (f"{mid} is a catalog card only; spark-serve does not start, stop or prepare it; "
+            "the current workload was not changed" + (f". {hint}" if hint else ""))
+
+
+def home_host(cfg: dict, model: dict) -> str | None:
+    """Physical Spark a card-only entry lives on (`home_node = "head"|"worker"`)."""
+    node = model.get("home_node")
+    return str(cfg["cluster"].get(node)) if node in ("head", "worker") and cfg["cluster"].get(node) else None
 
 
 def resolve_model(cfg: dict, name: str) -> tuple[str, dict]:
@@ -1004,7 +1026,11 @@ def cmd_list(cfg: dict) -> None:
     for mid, m in cfg["models"].items():
         aliases = ",".join(m.get("aliases") or [])
         ctx = m.get("max_model_len") or ""
-        print(f"{mid:<10} {aliases:<28} {m.get('served_name',''):<24} {ctx:>8}  {m['image']}")
+        image = m.get("image") or ""
+        if launch_refusal(mid, m):
+            where = home_host(cfg, m)
+            image = f"card only: {m.get('wrapper') or 'batch'} job" + (f" on {where}" if where else "") + ", no endpoint"
+        print(f"{mid:<10} {aliases:<28} {m.get('served_name',''):<24} {ctx:>8}  {image}")
         if m.get("notes"):
             print(f"           {m['notes']}")
 
@@ -1070,7 +1096,7 @@ def cmd_list_json(cfg: dict) -> None:
             "ctx": int(m.get("max_model_len") or 0),
             "image": m.get("image", ""),
             "notes": m.get("notes", ""),
-            "backend": m["wrapper"] if m.get("wrapper") in ("nim", "tensorfold") else "vllm",
+            "backend": m["wrapper"] if m.get("wrapper") in ("nim", "tensorfold", *BATCH_WRAPPERS) else "vllm",
             "topology": "single" if int(m.get("nnodes") or cfg["cluster"]["nnodes"]) == 1 else "distributed",
             "wrapper": m.get("wrapper", "vllm"),
             "hermes_provider": m.get("hermes_provider", "spark"),
@@ -1080,6 +1106,10 @@ def cmd_list_json(cfg: dict) -> None:
             "quant_scope": m.get("quant_scope"),
             "quant_detail": m.get("quant_detail"),
             "modalities": modalities(m),
+            "outputs": list(m["outputs"]) if m.get("outputs") else None,
+            "launch": launch_refusal(mid, m) is None,
+            "launch_note": m.get("run_hint") if launch_refusal(mid, m) else None,
+            "home_host": home_host(cfg, m),
             "updated": (dates.get(mid) or {}).get("updated"),
             "updated_source": (dates.get(mid) or {}).get("updated_source"),
         })
@@ -1467,6 +1497,9 @@ def maybe_hermes_json(cfg: dict, mid: str, model: dict, skip: bool) -> str:
 
 def cmd_pull(cfg: dict, name: str, node: str | None = None) -> None:
     mid, model = resolve_model(cfg, name)
+    refusal = launch_refusal(mid, model)
+    if refusal:
+        die(refusal)
     selected, hosts = placement(cfg, model, node)
     recipe = model.get("recipe")
     if recipe:
@@ -1910,6 +1943,9 @@ def cmd_up(
             scoped, mid = cfg, "yue"
         else:
             mid, model = resolve_model(cfg, name)
+            refusal = launch_refusal(mid, model)
+            if refusal:
+                raise ControllerError(refusal)
             selected, hosts = placement(cfg, model, node)
             scoped = launch_config(cfg, mid, selected)
             # Also guards --print-cmd: a missing or edited entry script refuses here.

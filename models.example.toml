@@ -415,6 +415,43 @@ args = [
   "--compilation-config", '{"backend":"eager"}',
 ]
 
+# Pika H3 Flex (Pika-Labs) — 33B text/image-to-video + audio on MiniMax-H3 with LoRA adapters.
+# Card only (ADR 0017): spark-serve never starts, stops or prepares it, and `up`/`pull` refuse it.
+# It is a one-GPU batch CLI (`pika-h3-pro`) on sparktwo, not an OpenAI-compatible server.
+# Its ~68 GiB GPU peak does not fit beside qwen38-dual-tensorfold (~68 GB on each Spark),
+# so stop the Sparks first and bring the server back with `up` afterwards. Runbook: docs/pika-h3-flex.md.
+[models.pika-h3-flex]
+aliases = ["pika", "pika-h3"]
+label = "Pika H3 Flex video + audio"
+wrapper = "batch"
+launch = false
+# No prepare script: older spark-serve builds refuse `pull` on an unknown recipe before any SSH.
+recipe = "pika-h3-flex"
+home_node = "worker"
+nnodes = 1
+hf_id = "Pika-Labs/Pika-H3-Flex"
+revision = "0ddf55ad7067ca1e76812253bd7b4600df87f759"
+base_model = "MiniMaxAI/MiniMax-H3@42ed227ee7df40d41602854ae760620d6eb651fe"
+served_name = ""
+image = ""
+quant = "BF16"
+quant_bits = 16
+quant_scope = "all"
+quant_detail = "Unquantized BF16: transformer 62 GB, text encoder 63 GB, video VAE 9.8 GB, audio VAE 0.6 GB, FL2VA LoRA 2.6 GB (137 GB on disk)."
+modalities = ["text", "image"]
+outputs = ["video", "audio"]
+gpu_peak_gib = 68
+run_hint = "Run it on sparktwo with ~/pika-h3-flex/run-t2va.sh (pika-h3-pro in ~/pika-h3-flex/venv) after stopping both Sparks; clips land in ~/pika-h3-flex/outputs."
+notes = "Batch job on sparktwo only, no API endpoint. 480p/768p, 5–15 s, tasks t2va/i2va/l2va/fl2va/ref2va; only the FL2VA adapter is installed and only t2va is tested. Needs the Spark's GPU to itself: ~68 GiB peak (66.6 GiB allocated while sampling), ~52 GiB host RSS, so it cannot run beside Qwen. 480p 5 s t2va on 2026-11-05: 19 min wall (7.2 min conditioning, 6.5 min transformer load, 1.8 min sampling, 3.2 min decode)."
+
+[models.pika-h3-flex.batch]
+venv = "~/pika-h3-flex/venv"
+cli = "pika-h3-pro"
+script = "~/pika-h3-flex/run-t2va.sh"
+weights = "~/pika-h3-flex/weights"
+adapter = "~/pika-h3-flex/weights/fl2va"
+outputs = "~/pika-h3-flex/outputs"
+
 # AMD Strix Halo boxes: one engine at a time on each through its halo-ctl
 # (halo-inference-control); `./spark-serve strix up <id> --box <host>` stops
 # the others there. The cluster engine spans both boxes: --box is its master.

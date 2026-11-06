@@ -22,6 +22,12 @@ struct ModelEntry: Identifiable, Codable {
     var quant_scope: String? = nil
     var quant_detail: String? = nil
     var modalities: [String]? = nil
+    /// What a card-only batch job produces (e.g. video + audio); nil for servers.
+    var outputs: [String]? = nil
+    /// false: a catalog card spark-serve never starts (ADR 0017). nil (older CLIs) means launchable.
+    var launch: Bool? = nil
+    var launch_note: String? = nil
+    var home_host: String? = nil
     var ranking: ModelRanking? = nil
     /// Strix entries only: the name halo-ctl takes and lists for this model.
     var ctl_id: String? = nil
@@ -327,6 +333,10 @@ final class CLIRunner: ObservableObject {
     }
 
     var nodes: [SparkNodeStatus] { status?.nodes ?? [] }
+
+    func canLaunch(_ model: ModelEntry) -> Bool {
+        model.launch != false
+    }
 
     func requiresBothSparks(_ model: ModelEntry) -> Bool {
         model.backend == "yue" || model.topology != "single"
@@ -1152,7 +1162,7 @@ struct MenuBarView: View {
                 .padding(.horizontal, 8)
             }
 
-            ForEach(runner.models) { m in
+            ForEach(runner.models.filter { runner.canLaunch($0) }) { m in
                 if runner.requiresBothSparks(m) {
                     Button("\(m.label) · both Sparks") {
                         runner.openMainWindow()
@@ -1413,7 +1423,12 @@ struct MainView: View {
     private var controls: some View {
         VStack(alignment: .leading, spacing: 10) {
             if let selectedEntry {
-                if runner.requiresBothSparks(selectedEntry) {
+                if !runner.canLaunch(selectedEntry) {
+                    Text(ModelCardFacts.cardOnlyHelp(selectedEntry))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                } else if runner.requiresBothSparks(selectedEntry) {
                     HStack {
                         Button("Start on both Sparks") {
                             runner.startUp(model: selectedEntry.id, node: "both")
@@ -1482,10 +1497,11 @@ struct SparkNodePanel: View {
     }
     private var startEnabled: Bool {
         guard let selectedModel else { return false }
-        return !runner.isBusy && !runner.requiresBothSparks(selectedModel) && !node.sharedModel
+        return !runner.isBusy && runner.canLaunch(selectedModel) && !runner.requiresBothSparks(selectedModel) && !node.sharedModel
     }
     private var startTitle: String {
         guard let selectedModel else { return "Choose a model" }
+        if !runner.canLaunch(selectedModel) { return "Card only: not started here" }
         return runner.requiresBothSparks(selectedModel)
             ? "Selected model uses both Sparks" : "Start \(selectedModel.label)"
     }
@@ -1681,16 +1697,29 @@ enum ModelCardFacts {
         case "cluster": return "llama.cpp RPC"
         case "lemonade": return "Lemonade"
         case "yue": return "YuE"
+        case "batch": return "Batch CLI"
         default: return wrapper
         }
     }
 
     static func contextTitle(ctx: Int, backend: String?) -> String {
         if backend == "yue" { return "2 workers" }
+        if backend == "batch" { return "batch job" }
         if ctx >= 1_048_576 && ctx % 1_048_576 == 0 { return "\(ctx / 1_048_576)M ctx" }
         if ctx == 262_144 { return "262k ctx" }
         if ctx % 1024 == 0 { return "\(ctx / 1024)k ctx" }
         return "\(Int((Double(ctx) / 1000).rounded()))k ctx"
+    }
+
+    /// Card-only entries (launch == false): what the card is and how to run it.
+    static func cardOnlyHelp(_ model: ModelEntry) -> String {
+        let place = model.home_host.map { " on \($0)" } ?? ""
+        let note = (model.launch_note ?? "").isEmpty ? "" : " \(model.launch_note!)"
+        return "\(model.label) is a card only: a batch job\(place) with no API endpoint. Spark Serve does not start or stop it.\(note)"
+    }
+
+    static func outputTitle(_ outputs: [String]) -> String {
+        "Makes " + outputs.joined(separator: " + ")
     }
 
     static func sparkTitle(topology: String?) -> String? {
@@ -1965,14 +1994,16 @@ struct ModelCard: View {
                         .font(.caption)
                 }
             }
-            Text(model.backend == "yue" ? "Artist Twin song / take queue" : "served: \(model.served_name)")
+            Text(model.backend == "yue" ? "Artist Twin song / take queue"
+                 : model.launch == false ? "batch job\(model.home_host.map { " on \($0)" } ?? "") · no endpoint"
+                 : "served: \(model.served_name)")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(2)
             // Selection row: context, quantization, input types.
             PillFlow(spacing: 6) {
                 InfoPill(text: ModelCardFacts.contextTitle(ctx: model.ctx, backend: model.backend),
-                         color: model.backend == "yue" ? ModelCardFacts.neutralColor : ModelCardFacts.contextColor(ctx: model.ctx))
+                         color: model.backend == "yue" || model.launch == false ? ModelCardFacts.neutralColor : ModelCardFacts.contextColor(ctx: model.ctx))
                     .help(ModelCardFacts.contextHelp(ctx: model.ctx, performance: model.performance))
                 if let quant = model.quant {
                     let tier = ModelCardFacts.quantTier(bits: model.quant_bits, scope: model.quant_scope)
@@ -1981,6 +2012,10 @@ struct ModelCard: View {
                 }
                 if model.backend != "yue", let modalities = model.modalities {
                     ModalityPill(modalities: modalities)
+                }
+                if let outputs = model.outputs, !outputs.isEmpty {
+                    InfoPill(text: ModelCardFacts.outputTitle(outputs), color: ModelCardFacts.modalityColor(outputs))
+                        .help("Output: " + outputs.joined(separator: " + "))
                 }
             }
             PillFlow(spacing: 6) {
