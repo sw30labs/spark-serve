@@ -34,6 +34,9 @@ struct ModelEntry: Identifiable, Codable {
     var ranking: ModelRanking? = nil
     /// Strix entries only: the name halo-ctl takes and lists for this model.
     var ctl_id: String? = nil
+    /// Strix always-on services (ADR 0019): the systemd unit, and `<engine>:<id>` disk copies the card stands for.
+    var unit: String? = nil
+    var covers: [String]? = nil
     /// YYYY-MM-DD the entry last changed, and where that date came from (spark_serve_freshness.py).
     var updated: String? = nil
     var updated_source: String? = nil
@@ -1948,6 +1951,7 @@ enum ModelCardFacts {
         case "lemonade": return "Lemonade"
         case "yue": return "YuE"
         case "batch": return "Batch CLI"
+        case "service": return "llama.cpp · systemd"
         default: return wrapper
         }
     }
@@ -1976,7 +1980,7 @@ enum ModelCardFacts {
         switch topology {
         case "single": return "1 Spark"
         case "distributed": return "2 Sparks"
-        case "strix": return "Strix Halo"
+        case "strix", "strix-service": return "Strix Halo"
         case "strix-cluster": return "2 Strix Halos"
         default: return nil
         }

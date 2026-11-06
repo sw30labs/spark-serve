@@ -197,3 +197,32 @@ check(abs(TickerFacts.duration(contentWidth: 374, gap: 26) - 10) < 0.001, "Ticke
 var bounded: [ActivityEntry] = []; var seq = 0
 for n in 0..<5 { appendActivity(&bounded, "l\(n)", source: "Spark", cap: 3, next: &seq) }
 check(bounded.map(\.text) == ["l2", "l3", "l4"] && bounded.last?.id == 5, "Activity history is bounded")
+// ADR 0019: always-on services outside halo-ctl, shown but never started or stopped.
+let svcJSON = #"{"boxes":[{"host":"one","engine":"none","phase":"stopped","model":"","port":null,"engines":{},"inference":"off","model_id":null,"url":null,"resources":null,"available":{"lemonade":[{"id":"gpt-Q4","label":"GPT Q4"},{"id":"new-Q4","label":"New Q4"}]},"rpc_worker":"inactive","rpc_clients":0,"services":[],"pinned":[],"shadowed":null,"role":null,"peer":"two","error":null},{"host":"two","engine":"none","phase":"stopped","model":"","port":null,"engines":{"cluster":"stopped"},"inference":"off","model_id":null,"url":null,"resources":null,"available":{"lemonade":[{"id":"gpt-Q4","label":"GPT Q4"}]},"rpc_worker":"active","rpc_clients":0,"services":[{"id":"svc-llm","label":"LLM (always on)","unit":"llm.service","active":"active","phase":"ready","model":"llm","port":8080,"url":"http://two:8080/v1","served_context":131072,"outputs":[],"metrics":{"active":0,"queued":0}},{"id":"svc-embed","label":"Embed (always on)","unit":"embed.service","active":"active","phase":"ready","model":"embed","port":8081,"url":"http://two:8081/v1","served_context":8192,"outputs":["embeddings"],"metrics":null}],"pinned":["llm.service","embed.service"],"shadowed":"halo-ctl reads embed.service on :8081 as its cluster engine","role":null,"peer":"one","error":null}],"cluster":null}"#
+let svcSite = try decoder.decode(StrixSite.self, from: Data(svcJSON.utf8))
+let svcStore = StrixStore()
+var svcLLM = ModelEntry(id: "svc-llm", label: "LLM (always on)", aliases: [], served_name: "llm", ctx: 131072, image: "llm.service",
+                        notes: "", wrapper: "service", hermes_provider: "", backend: "service", topology: "strix-service")
+svcLLM.home_host = "two"; svcLLM.unit = "llm.service"; svcLLM.covers = ["lemonade:gpt-Q4"]
+var svcEmbed = ModelEntry(id: "svc-embed", label: "Embed (always on)", aliases: [], served_name: "embed", ctx: 8192, image: "embed.service",
+                          notes: "", wrapper: "service", hermes_provider: "", backend: "service", topology: "strix-service")
+svcEmbed.home_host = "two"; svcEmbed.outputs = ["embeddings"]
+svcStore.models = [svcLLM, svcEmbed]
+svcStore.apply(svcSite, at: Date())
+let two = svcStore.box("two")!
+check(two.isPinned && !two.isServing && two.liveServices.count == 2 && two.shadowed != nil, "Always-on services decode and pin their box")
+check(svcStore.summary(two) == "Always on · llm, embed" && svcStore.summary(svcStore.box("one")!) == "Stopped", "A box with only services says what is always on")
+check(StrixFacts.boxColor(two) == .green, "A box whose services are ready shows green")
+let svcChoices = svcStore.choices(engine: "service")
+check(svcChoices.map(\.id) == ["svc-llm", "svc-embed"] && svcChoices.allSatisfy(\.catalogued), "Always-on cards fill their own column")
+check(svcStore.serves(svcChoices[0], "two") && !svcStore.serves(svcChoices[0], "one") && svcStore.servingPhase(svcChoices[0], "two") == "ready", "A ready service is marked as serving on its box")
+check(svcStore.isServingAnywhere(svcChoices[1]) && svcStore.serviceBox(svcChoices[1]) == "two", "Services know their box")
+check(svcStore.choices(engine: "lemonade").map(\.id) == ["lemonade:new-Q4"], "A disk copy an always-on card covers is not shown as uncatalogued")
+let lemon = svcStore.choices(engine: "lemonade")[0]
+check(svcStore.blocker(lemon, on: "two")?.hasPrefix("Always-on llm.service, embed.service here") == true, "A pinned box offers no halo-ctl start")
+check(svcStore.blocker(lemon, on: "one") == nil, "The other box stays switchable")
+check(svcStore.blocker(svcChoices[0], on: "one")?.hasPrefix("Always on: systemd runs it on two") == true, "Services are never started")
+check(StrixFacts.engineTitle("service") == "Always on" && StrixFacts.columns.last?.0 == "service" && !StrixFacts.engineIDs.contains("service"), "Services are a column, not a halo-ctl engine")
+check(ModelCardFacts.runtimeTitle(wrapper: "service") == "llama.cpp · systemd" && ModelCardFacts.sparkTitle(topology: "strix-service") == "Strix Halo", "Service cards name their runtime and box kind")
+check(ModelCardFacts.outputTitle(svcEmbed.outputs!) == "Makes embeddings", "The embedding card says what it makes")
+print("Strix always-on services smoke passed (ADR 0019).")

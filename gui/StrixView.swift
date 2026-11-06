@@ -38,6 +38,24 @@ struct StrixDiskModel: Codable, Hashable {
     let label: String
 }
 
+/// An always-on systemd service on a box, outside halo-ctl (ADR 0019); never started or stopped here.
+struct StrixService: Codable, Hashable {
+    let id: String
+    let label: String
+    let unit: String
+    let active: String?
+    /// ready, starting, stopped, or mismatch (its port answers with another model).
+    let phase: String
+    let model: String?
+    let port: Int?
+    let url: String?
+    var served_context: Int? = nil
+    var outputs: [String]? = nil
+
+    static func == (a: StrixService, b: StrixService) -> Bool { a.id == b.id && a.phase == b.phase && a.model == b.model }
+    func hash(into hasher: inout Hasher) { hasher.combine(id) }
+}
+
 /// One box. `role` is "master" or "worker" while the cluster runs; `error` means no reading.
 struct StrixStatus: Codable {
     let host: String
@@ -59,10 +77,17 @@ struct StrixStatus: Codable {
     var role: String? = nil
     var peer: String? = nil
     var error: String? = nil
+    /// Always-on services on this box (ADR 0019), the units that pin it, and a halo-ctl misreading they caused.
+    var services: [StrixService]? = nil
+    var pinned: [String]? = nil
+    var shadowed: String? = nil
 
     /// An engine is up or coming up on this box itself.
     var isServing: Bool { StrixFacts.engineIDs.contains(engine) && phase != "stopped" }
     var isWorker: Bool { role == "worker" }
+    /// spark-serve runs no halo-ctl up or stop here: always-on units hold its ports and memory.
+    var isPinned: Bool { !(pinned ?? []).isEmpty }
+    var liveServices: [StrixService] { (services ?? []).filter { $0.phase != "stopped" } }
 }
 
 struct StrixCluster: Codable {
@@ -238,6 +263,12 @@ final class StrixStore: ObservableObject {
             StrixChoice(id: $0.id, engine: engine, ctlID: $0.ctl_id ?? $0.served_name, label: $0.label, catalogued: true)
         }
         var known = Set(catalog.map(\.ctlID))
+        // Disk copies an always-on card stands for (ADR 0019) are not uncatalogued.
+        for model in models {
+            for cover in model.covers ?? [] where cover.hasPrefix(engine + ":") {
+                known.insert(String(cover.dropFirst(engine.count + 1)))
+            }
+        }
         var extra: [StrixChoice] = []
         for box in boxes {
             for disk in box.available?[engine] ?? [] where !known.contains(disk.id) {
@@ -260,8 +291,26 @@ final class StrixStore: ObservableObject {
         return (available[choice.engine] ?? []).contains { $0.id == choice.ctlID }
     }
 
+    /// The box an always-on card belongs to.
+    func serviceBox(_ choice: StrixChoice) -> String? {
+        models.first { $0.id == choice.id }?.home_host
+    }
+
+    func service(_ choice: StrixChoice, _ host: String) -> StrixService? {
+        box(host)?.services?.first { $0.id == choice.id }
+    }
+
+    /// "ready" or "starting" when the box serves this choice, as its start button says.
+    func servingPhase(_ choice: StrixChoice, _ host: String) -> String {
+        if choice.engine == "service" { return service(choice, host)?.phase == "ready" ? "ready" : "starting" }
+        return box(host)?.phase == "ready" ? "ready" : "starting"
+    }
+
     /// The box serves, or is starting, this choice itself.
     func serves(_ choice: StrixChoice, _ host: String) -> Bool {
+        if choice.engine == "service" {
+            return ["ready", "starting"].contains(service(choice, host)?.phase ?? "stopped")
+        }
         guard let b = box(host), b.engine == choice.engine, b.isServing else { return false }
         if choice.engine == "halogen" { return true }
         if let id = b.model_id { return id == choice.id }
@@ -274,11 +323,18 @@ final class StrixStore: ObservableObject {
     func blocker(_ choice: StrixChoice, on host: String) -> String? {
         guard let b = box(host) else { return "No reading from \(host) yet" }
         if b.error != nil { return "\(host) did not answer" }
+        if choice.engine == "service" {
+            let home = serviceBox(choice) ?? "its box"
+            if let s = service(choice, host), s.phase == "mismatch" { return "\(s.unit) answers with \(s.model ?? "another model")" }
+            return "Always on: systemd runs it on \(home); spark-serve never starts or stops it"
+        }
+        if b.isPinned { return "Always-on \((b.pinned ?? []).joined(separator: ", ")) here; spark-serve leaves \(host) alone" }
         if onDisk(choice, host) == false { return "Not on \(host)'s disk" }
         if serves(choice, host) { return b.phase == "ready" ? "Serving on \(host)" : "Starting on \(host)" }
         if choice.engine == "cluster" {
             guard let peerName = b.peer, let peer = box(peerName) else { return "The cluster needs two boxes" }
             if peer.error != nil { return "\(peerName), its worker, did not answer" }
+            if peer.isPinned { return "\(peerName), its worker, runs always-on services" }
             if peer.rpc_worker != "active" { return "\(peerName)'s RPC worker is \(peer.rpc_worker ?? "unknown")" }
         } else if b.isWorker, let master = b.peer, box(master)?.role != "master" {
             return "Busy as a cluster worker; its master is out of reach"
@@ -307,7 +363,12 @@ final class StrixStore: ObservableObject {
     func summary(_ b: StrixStatus) -> String {
         if b.error != nil { return "No answer" }
         if b.isWorker && !b.isServing { return "Cluster worker for \(b.peer ?? "the other box")" }
-        guard b.isServing else { return "Stopped" }
+        guard b.isServing else {
+            let live = b.liveServices
+            if live.isEmpty { return b.isPinned ? "Always-on services down" : "Stopped" }
+            return "Always on · " + live.map { ($0.model ?? $0.label) + ($0.phase == "ready" ? "" : " (\($0.phase))") }
+                .joined(separator: ", ")
+        }
         var bits = [StrixFacts.engineTitle(b.engine), b.phase]
         if let label = servingLabel(b) { bits.append(label) }
         return bits.joined(separator: " · ")
@@ -490,9 +551,11 @@ final class StrixStore: ObservableObject {
 enum StrixFacts {
     static let engines = [("halogen", "Halogen"), ("cluster", "Cluster"), ("lemonade", "Lemonade"), ("vllm", "vLLM")]
     static let engineIDs = Set(engines.map(\.0))
+    /// The Strix tab's card columns: halo-ctl's engines, then always-on services (ADR 0019).
+    static let columns = engines + [("service", "Always on")]
 
     static func engineTitle(_ engine: String?) -> String {
-        engines.first { $0.0 == engine }?.1 ?? engine ?? "—"
+        columns.first { $0.0 == engine }?.1 ?? engine ?? "—"
     }
 
     static func phaseColor(_ phase: String?) -> Color {
@@ -510,6 +573,9 @@ enum StrixFacts {
         if b.error != nil { return phaseColor("unreachable") }
         if busy { return phaseColor("starting") }
         if b.isWorker && !b.isServing { return phaseColor("worker") }
+        if !b.isServing, !b.liveServices.isEmpty {
+            return phaseColor(b.liveServices.allSatisfy { $0.phase == "ready" } ? "ready" : "starting")
+        }
         return phaseColor(b.phase)
     }
 
@@ -543,7 +609,7 @@ struct StrixView: View {
     @ObservedObject var store: StrixStore
     @State private var selected: String?
 
-    private var allChoices: [StrixChoice] { StrixFacts.engines.flatMap { store.choices(engine: $0.0) } }
+    private var allChoices: [StrixChoice] { StrixFacts.columns.flatMap { store.choices(engine: $0.0) } }
     private var selectedChoice: StrixChoice? { allChoices.first { $0.id == selected } }
     private var servingChoice: String? { allChoices.first { store.isServingAnywhere($0) }?.id }
 
@@ -555,7 +621,7 @@ struct StrixView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Choose a model")
                         .font(.headline)
-                    Text("Each box runs one engine at a time and the cluster takes both boxes. Starting stops whatever is in the way; each button says what.")
+                    Text("Each box runs one engine at a time and the cluster takes both boxes. Starting stops whatever is in the way; each button says what. Always-on services run under systemd outside halo-ctl: shown here, never started or stopped, and their box is left alone.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     grid
@@ -614,7 +680,7 @@ struct StrixView: View {
 
     private var grid: some View {
         HStack(alignment: .top, spacing: 12) {
-            ForEach(StrixFacts.engines, id: \.0) { engine, title in
+            ForEach(StrixFacts.columns, id: \.0) { engine, title in
                 VStack(alignment: .leading, spacing: 8) {
                     Text(title)
                         .font(.subheadline.weight(.semibold))
@@ -664,8 +730,11 @@ struct StrixView: View {
             if let choice = selectedChoice {
                 HStack(alignment: .top, spacing: 16) {
                     // A pinned master leaves one cluster button; other engines still start on either box.
-                    ForEach(store.boxes.filter { choice.engine != "cluster" || store.master == nil || $0.host == store.master },
-                            id: \.host) { box in
+                    // An always-on card has only its own box.
+                    ForEach(store.boxes.filter {
+                        (choice.engine != "cluster" || store.master == nil || $0.host == store.master)
+                            && (choice.engine != "service" || $0.host == store.serviceBox(choice))
+                    }, id: \.host) { box in
                         startButton(choice, box.host)
                     }
                 }
@@ -694,9 +763,19 @@ struct StrixView: View {
         let title = choice.engine == "cluster" ? "Start with \(host) as master" : "Start on \(host)"
         return VStack(alignment: .leading, spacing: 4) {
             if store.serves(choice, host) {
-                Label(store.box(host)?.phase == "ready" ? "Serving on \(host)" : "Starting on \(host)…",
+                Label((store.servingPhase(choice, host) == "ready" ? "Serving on \(host)" : "Starting on \(host)…")
+                      + (choice.engine == "service" ? " · always on" : ""),
                       systemImage: "checkmark.circle.fill")
                     .foregroundStyle(.green)
+                if choice.engine == "service" {
+                    Text("systemd keeps it up; spark-serve never starts or stops it")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+            } else if choice.engine == "service" {
+                Text(blocker ?? "Always on")
+                    .font(.caption2)
+                    .foregroundColor(.orange)
+                    .lineLimit(2)
             } else {
                 Button(title) { store.start(choice, on: host) }
                     .buttonStyle(.borderedProminent)
@@ -758,6 +837,18 @@ struct StrixBoxPanel: View {
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)
                 }
+                ForEach(box.services ?? [], id: \.id) { s in
+                    Text(["Always on: \(s.model ?? s.label)", s.unit, s.phase, s.url,
+                          s.served_context.map { "\(ModelCardFacts.contextTitle(ctx: $0, backend: "service")) served" }]
+                            .compactMap { $0 }.joined(separator: " · "))
+                        .font(.caption)
+                        .foregroundColor(s.phase == "ready" ? .secondary : .orange)
+                        .textSelection(.enabled)
+                }
+                if let shadowed = box.shadowed {
+                    Text("\(shadowed); spark-serve shows the service instead.")
+                        .font(.caption2).foregroundStyle(.tertiary)
+                }
                 resources(box.resources)
                 Text("Inference mode \(box.inference ?? "—") · RPC worker \(box.rpc_worker ?? "—")")
                     .font(.caption)
@@ -765,9 +856,10 @@ struct StrixBoxPanel: View {
                     .help("Inference mode pauses background jobs while Halogen or the cluster runs. It needs the box's password, so switch it from the box's widget. The RPC worker lends this box's GPU to a cluster master.")
                 HStack(spacing: 8) {
                     Button(box.isWorker && !box.isServing ? "Stop cluster" : "Stop") { store.stop(box.host) }
-                        .disabled(!stoppable || (store.isBusy && !store.busyIsStart))
+                        .disabled(!stoppable || box.isPinned || (store.isBusy && !store.busyIsStart))
+                        .help(box.isPinned ? "Always-on \((box.pinned ?? []).joined(separator: ", ")): spark-serve does not stop this box" : "")
                     Button("Copy connection details") { store.copyConnection(box.host) }
-                        .disabled(!stoppable)
+                        .disabled(!stoppable && !(box.services ?? []).contains { $0.phase == "ready" })
                     Button("Logs") { store.showLogs(box.host) }
                 }
                 .controlSize(.small)
@@ -890,9 +982,9 @@ struct StrixMenuSection: View {
                         }
                         Divider()
                         Button(box.isWorker && !box.isServing ? "Stop the cluster" : "Stop") { store.stop(box.host) }
-                            .disabled(!(box.isServing || box.isWorker) || (store.isBusy && !store.busyIsStart))
+                            .disabled(!(box.isServing || box.isWorker) || box.isPinned || (store.isBusy && !store.busyIsStart))
                         Button("Copy connection details") { store.copyConnection(box.host) }
-                            .disabled(!(box.isServing || box.isWorker))
+                            .disabled(!(box.isServing || box.isWorker) && !(box.services ?? []).contains { $0.phase == "ready" })
                     }
                 }
             }

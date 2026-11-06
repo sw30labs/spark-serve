@@ -469,3 +469,150 @@ def test_status_reports_the_pinned_master_and_rejects_an_unknown_one(boxes):
     assert strix.status(CFG)["master"] is None and strix.status(PINNED)["master"] == "one"
     with pytest.raises(strix.StrixError, match="not one of the hosts"):
         strix.pinned_master({"strix": {**CFG["strix"], "master": "three"}})
+
+
+# --- Always-on services outside halo-ctl (ADR 0019) ---
+
+SERVICE_MODELS = {
+    **MODELS,
+    "svc-llm": {"label": "LLM (always on)", "engine": "service", "box": "two", "unit": "llm.service",
+                "served_name": "llm", "port": 8080, "max_model_len": 131072, "modalities": ["text"],
+                "covers": ["lemonade:new-Q4"]},
+    "svc-embed": {"label": "Embed (always on)", "engine": "service", "box": "two", "unit": "embed.service",
+                  "served_name": "embed", "port": 8081, "max_model_len": 8192, "modalities": ["text"],
+                  "outputs": ["embeddings"]},
+}
+SVC = {"strix": {"hosts": ["one", "two"], "ctl": "~/bin/halo-ctl", "models": SERVICE_MODELS}}
+
+
+def serve_always(fake, host="two", llm="llm", embed="embed", active="active"):
+    """The box answers on both services' ports; halo-ctl, which finds the cluster by :8081, calls it ready."""
+    original = fake.probe
+
+    def probe(h):
+        out = original(h)
+        if h == host:
+            out["services"] = [
+                {"id": "svc-llm", "unit": "llm.service", "port": 8080, "active": active, "model": llm,
+                 "served_context": 131072, "counters": {"llamacpp:tokens_predicted_total": 40.0,
+                                                        "llamacpp:prompt_tokens_total": 90.0,
+                                                        "llamacpp:requests_processing": 1.0}},
+                {"id": "svc-embed", "unit": "embed.service", "port": 8081, "active": active, "model": embed,
+                 "served_context": 8192, "counters": {}}]
+            if active == "active" and fake.state[h][0] == "none":
+                out["state"] = {"engine": "cluster", "phase": "ready", "model": embed, "port": 8081,
+                                "engines": {"cluster": "ready"}, "inference": "off", "api_key": True}
+        return out
+    fake.probe = probe
+    return fake
+
+
+def test_service_entries_need_box_unit_port_and_a_known_box():
+    assert sorted(strix.services(SVC)) == ["svc-embed", "svc-llm"]
+    assert strix.services(SVC, "one") == {} and strix.pinned(SVC, "two") == ["llm.service", "embed.service"]
+    bad = {"strix": {"hosts": ["one"], "models": {"x": {"engine": "service", "box": "one", "served_name": "x"}}}}
+    with pytest.raises(strix.StrixError, match="lacks unit, port"):
+        strix.services(bad)
+    bad["strix"]["models"]["x"].update(unit="x.service", port=1, box="nowhere")
+    with pytest.raises(strix.StrixError, match="not one of the hosts"):
+        strix.services(bad)
+
+
+def test_the_probe_formats_and_compiles_with_services():
+    script = strix._PROBE % {"ctl": "~/bin/halo-ctl", "key": "~/k", "services": [["svc-llm", "llm.service", 8080]]}
+    compile(script, "probe", "exec")
+    assert "SERVICES = [['svc-llm', 'llm.service', 8080]]" in script
+
+
+def test_services_are_read_and_halo_ctls_cluster_misreading_is_dropped(boxes):
+    serve_always(boxes())
+    current = strix.status(SVC)
+    one, two = by_host(current)["one"], by_host(current)["two"]
+    assert (two["engine"], two["phase"], two["model"], two["url"], two["model_id"]) == ("none", "stopped", "", None, None)
+    assert "embed.service on :8081 as its cluster" in two["shadowed"]
+    assert current["cluster"] is None and one["role"] is None and two["role"] is None
+    assert two["served_context"] is None and two["metrics"]["generation_tokens_total"] is None
+    llm, embed = two["services"]
+    assert (llm["id"], llm["phase"], llm["url"], llm["served_context"]) == ("svc-llm", "ready", "http://two:8080/v1", 131072)
+    assert llm["metrics"]["generation_tokens_total"] == 40.0 and llm["metrics"]["active"] == 1.0
+    assert (embed["phase"], embed["outputs"], embed["url"]) == ("ready", ["embeddings"], "http://two:8081/v1")
+    assert two["pinned"] == ["llm.service", "embed.service"] and one["pinned"] == [] and one["services"] == []
+
+
+def test_a_service_answering_with_another_model_or_down_is_not_ready(boxes):
+    serve_always(boxes(), llm="other")
+    assert by_host(strix.status(SVC))["two"]["services"][0]["phase"] == "mismatch"
+    serve_always(boxes(), active="inactive", llm=None, embed=None)
+    two = by_host(strix.status(SVC))["two"]
+    assert [s["phase"] for s in two["services"]] == ["stopped", "stopped"] and two["shadowed"] is None
+
+
+def test_a_real_engine_on_another_port_is_not_mistaken_for_a_service(boxes):
+    serve_always(boxes(two=("lemonade", "ready", "b-Q4")))
+    two = by_host(strix.status(SVC))["two"]
+    assert two["model_id"] == "halo-b" and two["shadowed"] is None
+
+
+def test_services_are_never_started_and_their_box_is_left_alone(boxes):
+    fake = serve_always(boxes())
+    with pytest.raises(strix.StrixError, match="always on"):
+        strix.up(SVC, "svc-llm", "two")
+    with pytest.raises(strix.StrixError, match="two runs always-on llm.service, embed.service"):
+        strix.up(SVC, "bee", "two")
+    with pytest.raises(strix.StrixError, match="needs two as its worker"):
+        strix.up(SVC, "halo-q", "one")
+    with pytest.raises(strix.StrixError, match="starts and stops nothing there"):
+        strix.stop(SVC, "two")
+    assert commands(fake) == []
+    strix.up(SVC, "bee", "one")  # the other box is free
+    assert commands(fake) == [("one", "~/bin/halo-ctl up lemonade b-Q4")]
+
+
+def test_stopping_everything_skips_the_pinned_box(boxes):
+    fake = serve_always(boxes(one=("lemonade", "ready", "b-Q4")))
+    events = []
+    strix.stop(SVC, emit=events.append)
+    assert commands(fake) == [("one", "~/bin/halo-ctl stop")]
+    assert any("Leaving two alone" in e.get("detail", "") for e in events)
+
+
+def test_connection_and_logs_of_a_box_with_only_services(boxes):
+    fake = serve_always(boxes())
+    details = strix.connection(SVC, "two")
+    assert (details["engine"], details["base_url"], details["model"], details["api_key"]) == (
+        "service", "http://two:8080/v1", "llm", None)
+    assert [s["model"] for s in details["services"]] == ["llm", "embed"]
+    assert not any(c.startswith("cat ") for _, c in fake.calls)  # no key read for a keyless service
+    assert strix.logs(SVC, "two")["units"] == ["llm.service", "embed.service"]
+
+
+def test_service_cards_carry_box_unit_outputs_and_covers():
+    items = {i["id"]: i for i in strix.catalog(SVC, {})}
+    llm, embed = items["svc-llm"], items["svc-embed"]
+    assert (llm["backend"], llm["topology"], llm["home_host"], llm["unit"], llm["ctl_id"]) == (
+        "service", "strix-service", "two", "llm.service", None)
+    assert llm["covers"] == ["lemonade:new-Q4"] and llm["outputs"] is None and llm["image"] == "llm.service"
+    assert embed["outputs"] == ["embeddings"] and embed["ctx"] == 8192
+    assert items["halo-b"]["covers"] == [] and items["halo-b"]["home_host"] is None
+
+
+def test_the_cli_status_line_lists_services(boxes, capsys):
+    serve_always(boxes())
+    line = strix._box_line(by_host(strix.status(SVC))["two"])
+    assert "always on: LLM (always on) (llm.service) ready · llm · http://two:8080/v1" in line
+
+
+def test_shipped_catalogs_keep_services_consistent():
+    import pathlib
+    import tomllib
+    root = pathlib.Path(__file__).resolve().parent.parent
+    for name in ("models.example.toml", "models.toml"):
+        path = root / name
+        if not path.exists():
+            continue
+        cfg = tomllib.loads(path.read_text())
+        found = strix.services(cfg)
+        for mid, m in found.items():
+            assert m["served_name"] and isinstance(m["port"], int) and m["unit"].endswith(".service"), (name, mid)
+        ports = [(m["box"], m["port"]) for m in found.values()]
+        assert len(ports) == len(set(ports)), name

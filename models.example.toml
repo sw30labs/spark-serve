@@ -503,3 +503,44 @@ quant_scope = "all"
 quant_detail = "unsloth GGUF: Q4_K experts and attention, about 16% of expert weights Q6_K."
 modalities = ["text"]
 notes = "Lemonade 11.8.1, system llama.cpp (ROCm), one request at a time. Factory model."
+
+# Always-on services (ADR 0019): systemd user units on one box, outside
+# halo-ctl. Shown with their live health; spark-serve never starts or stops
+# them, and runs no halo-ctl up or stop on their box. covers = copies on a
+# box's disk that this card stands for, so they show no uncatalogued card.
+[strix.models.strix-gpt-oss-120b]
+label = "gpt-oss-120b (always on)"
+aliases = ["gpt-oss-120b", "strix-llm"]
+engine = "service"
+box = "strix-halo-2"
+unit = "strix-llm.service"
+served_name = "gpt-oss-120b"         # the /v1/models id (llama-server --alias)
+port = 8080
+max_model_len = 131072               # per request: -c 262144 over --parallel 2; /props n_ctx, = n_ctx_train
+max_num_seqs = 2
+quant = "Q4_K_M"
+quant_bits = 4
+quant_scope = "all"
+quant_detail = "unsloth GGUF labelled Q4_K_M (llama.cpp ftype Q4_K - Medium), 2 files, 62.8 GB: experts MXFP4 as published by OpenAI; attention Q4_K/Q5_0, small Q8_0 layers. 116.8B parameters."
+modalities = ["text"]
+covers = ["lemonade:gpt-oss-120b-Q4_K_M"]
+notes = "llama.cpp b11849 (ROCm) llama-server under systemd (Restart=always, linger), not halo-ctl. OpenAI-compatible on :8080 for the EFI and Pascal newsletters; no API key. 2 slots of 131,072 tokens, --jinja, metrics on. Weights: ~/models/gpt-oss-120b-GGUF, a reflink copy. Added 2026-11-04."
+
+[strix.models.strix-qwen3-embedding]
+label = "Qwen3-Embedding-0.6B (always on)"
+aliases = ["qwen3-embedding", "strix-embed"]
+engine = "service"
+box = "strix-halo-2"
+unit = "strix-embed.service"
+served_name = "qwen3-embedding-0.6b" # the /v1/models id (llama-server --alias)
+port = 8081                          # also the cluster's port: no cluster on this box while it runs
+max_model_len = 8192                 # per request: -c 16384 over --parallel 2; /props n_ctx
+max_num_seqs = 2
+quant = "F16"
+quant_bits = 16
+quant_scope = "all"
+quant_detail = "Qwen/Qwen3-Embedding-0.6B model.safetensors converted locally to GGUF f16 (1.2 GB); 596M parameters."
+modalities = ["text"]
+outputs = ["embeddings"]
+embedding_dims = 1024
+notes = "llama.cpp b11849 (ROCm) llama-server --embedding --pooling last under systemd (Restart=always, linger), not halo-ctl. OpenAI /v1/embeddings on :8081 for Pascal weekly_00 (replaced text-embedding-3-large); no API key. 1,024-dimension vectors (checked 2026-11-05). Added 2026-11-04."

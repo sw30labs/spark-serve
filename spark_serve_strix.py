@@ -12,6 +12,12 @@ fencing or allocation records.
 Catalog: [strix] with hosts, ctl and [strix.models.<id>] entries carrying the
 same card fields as Spark models plus engine, engine_model and port. What each
 box can serve comes from `halo-ctl models`, the models on its disk.
+
+Always-on services (ADR 0019): an entry with engine = "service" is a model a
+systemd user unit on one box serves outside halo-ctl (box, unit, port). The
+app shows it and reads its health, but never starts or stops it, and leaves
+that box's halo-ctl alone: a halo-ctl up or stop there would kill whatever
+holds its engine ports and take the box's GPU memory from the service.
 """
 from __future__ import annotations
 
@@ -24,6 +30,7 @@ import time
 import uuid
 
 ENGINES = ("halogen", "cluster", "lemonade", "vllm")
+SERVICE = "service"   # an always-on systemd unit outside halo-ctl (ADR 0019)
 UNITS = {"halogen": "halogen.service", "cluster": "halo-cluster.service",
          "lemonade": "halo-lemonade.service", "vllm": "halo-vllm.service"}
 RPC_UNIT = "ggml-rpc-server.service"
@@ -86,6 +93,32 @@ def box(cfg: dict, name: str | None) -> str:
 
 def models(cfg: dict) -> dict:
     return (cfg.get("strix") or {}).get("models") or {}
+
+
+def services(cfg: dict, host: str | None = None) -> dict:
+    """Always-on service entries (ADR 0019) by id, of one box or all; each needs box, unit, port and served_name."""
+    out = {}
+    for mid, m in models(cfg).items():
+        if m.get("engine") != SERVICE:
+            continue
+        missing = [k for k in ("box", "unit", "port", "served_name") if not m.get(k)]
+        if missing:
+            raise StrixError(f"[strix.models.{mid}] is a service but lacks {', '.join(missing)}")
+        if m["box"] not in hosts(cfg):
+            raise StrixError(f"[strix.models.{mid}] box {m['box']!r} is not one of the hosts: {', '.join(hosts(cfg))}")
+        if host is None or m["box"] == host:
+            out[mid] = m
+    return out
+
+
+def pinned(cfg: dict, host: str | None) -> list[str]:
+    """The always-on units on a box; spark-serve runs no halo-ctl up or stop on a box that has any."""
+    return [m["unit"] for m in services(cfg, host).values()] if host else []
+
+
+def _pinned_error(cfg: dict, host: str) -> StrixError:
+    return StrixError(f"{host} runs always-on {', '.join(pinned(cfg, host))} outside halo-ctl; "
+                      "spark-serve starts and stops nothing there (ADR 0019)")
 
 
 def resolve(cfg: dict, name: str) -> tuple[str, dict]:
@@ -161,6 +194,7 @@ def _match(cfg: dict, engine: str, reported: str) -> str | None:
 _PROBE = r"""
 import json, os, re, subprocess, urllib.request
 CTL, KEY = os.path.expanduser(%(ctl)r), os.path.expanduser(%(key)r)
+SERVICES = %(services)r
 WANTED = {"vllm:generation_tokens_total", "vllm:prompt_tokens_total", "vllm:num_requests_running",
           "vllm:num_requests_waiting", "vllm:kv_cache_usage_perc", "llamacpp:tokens_predicted_total",
           "llamacpp:prompt_tokens_total", "llamacpp:requests_processing", "llamacpp:requests_deferred",
@@ -176,8 +210,8 @@ def load(text, default=None):
     except ValueError:
         return default
 key = open(KEY).read().strip() if os.path.exists(KEY) else ""
-def get(url):
-    request = urllib.request.Request(url, headers={"Authorization": "Bearer " + key} if key else {})
+def get(url, auth=True):
+    request = urllib.request.Request(url, headers={"Authorization": "Bearer " + key} if key and auth else {})
     try:
         with urllib.request.urlopen(request, timeout=3) as response:
             return response.read(4 << 20).decode("utf-8", "replace")
@@ -210,14 +244,31 @@ elif engine == "lemonade" and port:
             text = get(loaded["backend_url"].rsplit("/v1", 1)[0] + "/metrics")
     except Exception:
         pass
-counters = {}
-for line in text.splitlines():
-    match = re.match(r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{[^}]*\})?\s+([0-9.eE+-]+)$", line.strip())
-    if match and match.group(1) in WANTED:
-        name, value = match.group(1), float(match.group(2))
-        counters[name] = max(counters.get(name, 0.0), value) if "kv_cache" in name else counters.get(name, 0.0) + value
-print(json.dumps({"state": state, "stats": stats, "served_context": served, "counters": counters,
-                  "disk": disk, "rpc_worker": rpc, "rpc_clients": rpc_clients}))
+def count(text):
+    counters = {}
+    for line in text.splitlines():
+        match = re.match(r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{[^}]*\})?\s+([0-9.eE+-]+)$", line.strip())
+        if match and match.group(1) in WANTED:
+            name, value = match.group(1), float(match.group(2))
+            counters[name] = max(counters.get(name, 0.0), value) if "kv_cache" in name else counters.get(name, 0.0) + value
+    return counters
+# Always-on llama-servers outside halo-ctl (ADR 0019): unit state, served id, context, counters. No key sent.
+services = []
+for sid, unit, sport in SERVICES:
+    item = {"id": sid, "unit": unit, "port": sport, "model": None, "served_context": None,
+            "active": sh("systemctl", "--user", "is-active", unit).strip() or "unknown"}
+    try:
+        item["model"] = json.loads(get("http://127.0.0.1:%%s/v1/models" %% sport, False))["data"][0].get("id")
+    except Exception:
+        pass
+    try:
+        item["served_context"] = (json.loads(get("http://127.0.0.1:%%s/props" %% sport, False)).get("default_generation_settings") or {}).get("n_ctx")
+    except Exception:
+        pass
+    item["counters"] = count(get("http://127.0.0.1:%%s/metrics" %% sport, False))
+    services.append(item)
+print(json.dumps({"state": state, "stats": stats, "served_context": served, "counters": count(text),
+                  "disk": disk, "rpc_worker": rpc, "rpc_clients": rpc_clients, "services": services}))
 """
 
 # Engine counters normalized to one shape; Halogen keeps halogen-stats' own fields.
@@ -230,6 +281,10 @@ _COUNTERS = {
                  # move live and equal tokens with one slot and no drafts, as Lemonade runs here.
                  "kv": "llamacpp:kv_cache_usage_ratio", "generation": "llamacpp:n_decode_total",
                  "prompt": "llamacpp:prompt_tokens_total"},
+    # Always-on llama-servers run several slots, so decode steps undercount; count finished tokens.
+    SERVICE: {"active": "llamacpp:requests_processing", "queued": "llamacpp:requests_deferred",
+              "kv": "llamacpp:kv_cache_usage_ratio", "generation": "llamacpp:tokens_predicted_total",
+              "prompt": "llamacpp:prompt_tokens_total"},
 }
 
 
@@ -258,10 +313,44 @@ def _available(disk) -> dict | None:
             for engine in ENGINES}
 
 
+def _service(cfg: dict, host: str, raw: dict) -> dict:
+    """One always-on service as the box reports it: ready only when its port serves the catalog's name."""
+    model = models(cfg).get(raw.get("id")) or {}
+    active, served = raw.get("active"), raw.get("model")
+    if active == "active" and served == model.get("served_name"):
+        phase = "ready"
+    elif active == "active" and served:
+        phase = "mismatch"      # the port answers with another model
+    elif active in ("active", "activating", "reloading"):
+        phase = "starting"
+    else:
+        phase = "stopped"
+    port = raw.get("port") or model.get("port")
+    return {"id": raw.get("id"), "label": model.get("label") or raw.get("id"), "unit": raw.get("unit"),
+            "active": active, "phase": phase, "model": served, "port": port,
+            "url": f"http://{host}:{int(port)}/v1" if port else None,
+            "served_context": raw.get("served_context"),
+            "outputs": list(model.get("outputs") or []),
+            "metrics": _metrics(SERVICE, {}, raw.get("counters") or {})}
+
+
 def _box(cfg: dict, host: str) -> dict:
-    script = _PROBE % {"ctl": _ctl(cfg), "key": site(cfg).get("api_key_file") or DEFAULT_KEY}
+    specs = services(cfg, host)
+    script = _PROBE % {"ctl": _ctl(cfg), "key": site(cfg).get("api_key_file") or DEFAULT_KEY,
+                       "services": [[sid, m["unit"], int(m["port"])] for sid, m in specs.items()]}
     raw = json.loads(ssh(host, "python3 - <<'SPARK_SERVE_PROBE'\n" + script + "\nSPARK_SERVE_PROBE").strip().splitlines()[-1])
     state, stats = raw.get("state") or {}, raw.get("stats") or {}
+    svc = [_service(cfg, host, s) for s in raw.get("services") or []]
+    # halo-ctl finds its engines by port: an always-on service on :8081 reads as the cluster
+    # being ready. A report that is one of this box's services is that service, not an engine.
+    shadowed = None
+    for s in svc:
+        if state.get("engine") in ENGINES and state.get("port") == s["port"] and state.get("model") == s["model"]:
+            shadowed = f"halo-ctl reads {s['unit']} on :{s['port']} as its {state['engine']} engine"
+            state = {**state, "engine": "none", "phase": "stopped", "model": "", "port": None,
+                     "engines": {**(state.get("engines") or {}), state["engine"]: "stopped"}}
+            raw = {**raw, "served_context": None, "counters": {}}
+            break
     engine, port = state.get("engine"), state.get("port")
     return {"host": host, **state,
             "model_id": _match(cfg, engine, state.get("model")) if engine in ENGINES else None,
@@ -273,6 +362,7 @@ def _box(cfg: dict, host: str) -> dict:
             "metrics": _metrics(engine, stats, raw.get("counters") or {}),
             "available": _available(raw.get("disk")),
             "rpc_worker": raw.get("rpc_worker"), "rpc_clients": raw.get("rpc_clients"),
+            "services": svc, "pinned": pinned(cfg, host), "shadowed": shadowed,
             "role": None, "peer": None, "error": None}
 
 
@@ -280,6 +370,7 @@ def _unreachable(host: str, error: str) -> dict:
     return {"host": host, "engine": "unknown", "phase": "unreachable", "model": "", "port": None, "engines": {},
             "inference": None, "model_id": None, "url": None, "served_context": None, "resources": None,
             "metrics": None, "available": None, "rpc_worker": None, "rpc_clients": None,
+            "services": [], "pinned": [], "shadowed": None,
             "role": None, "peer": None, "error": error}
 
 
@@ -402,12 +493,17 @@ def up(cfg: dict, name: str, host: str | None = None, emit=None) -> dict:
     """
     emit = emit or (lambda event: None)
     mid, model = target(cfg, name)
-    pinned = pinned_master(cfg) if model.get("engine") == "cluster" else None
-    if pinned:
-        if host not in (None, pinned):
-            raise StrixError(f"the cluster's master is pinned to {pinned} ([strix] master); start it with --box {pinned}")
-        host = pinned
+    if model.get("engine") == SERVICE:
+        raise StrixError(f"{model.get('label') or mid} is always on: {model.get('unit')} on {model.get('box')} "
+                         "serves it outside halo-ctl, and spark-serve never starts or stops it (ADR 0019)")
+    master = pinned_master(cfg) if model.get("engine") == "cluster" else None
+    if master:
+        if host not in (None, master):
+            raise StrixError(f"the cluster's master is pinned to {master} ([strix] master); start it with --box {master}")
+        host = master
     host = box(cfg, host)
+    if pinned(cfg, host):
+        raise _pinned_error(cfg, host)
     model = {**model, "label": model.get("label") or mid or name}
     engine, wanted = model.get("engine"), ctl_id(model) if model.get("engine") in ENGINES else None
     if engine not in ENGINES:
@@ -423,6 +519,8 @@ def up(cfg: dict, name: str, host: str | None = None, emit=None) -> dict:
         peer = boxes.get(me["peer"])
         if peer is None:
             raise StrixError("the cluster needs two [strix] hosts")
+        if pinned(cfg, peer["host"]):
+            raise StrixError(f"the cluster needs {peer['host']} as its worker, but {_pinned_error(cfg, peer['host'])}")
         if peer["error"]:
             raise StrixError(f"cannot check the cluster's worker: {peer['error']}")
         if peer["rpc_worker"] != "active":
@@ -469,6 +567,12 @@ def stop(cfg: dict, host: str | None = None, emit=None) -> dict:
         targets = [host]
         if boxes[host]["role"] == "worker" and boxes[host]["peer"]:
             targets.insert(0, boxes[host]["peer"])
+        for name in targets:
+            if pinned(cfg, name):
+                raise _pinned_error(cfg, name)
+    for name in [t for t in targets if pinned(cfg, t)]:
+        emit({"event": "progress", "detail": f"Leaving {name} alone: {', '.join(pinned(cfg, name))} always on"})
+        targets.remove(name)
     failed = []
     for name in targets:
         if boxes[name]["error"]:
@@ -491,7 +595,14 @@ def connection(cfg: dict, host: str | None = None) -> dict:
     if me["role"] == "worker" and boxes.get(me["peer"], {}).get("role") == "master":
         me = boxes[me["peer"]]
     if not _busy(me):
-        raise StrixError(f"nothing is serving on {host}")
+        ready = [s for s in me.get("services") or [] if s["phase"] == "ready"]
+        if not ready:
+            raise StrixError(f"nothing is serving on {host}")
+        # Always-on llama-servers take no key; the first is the catalog's first service on the box.
+        return {"host": me["host"], "engine": SERVICE, "base_url": ready[0]["url"], "model": ready[0]["model"],
+                "api_key": None, "unit": ready[0]["unit"],
+                "services": [{"id": s["id"], "label": s["label"], "unit": s["unit"], "model": s["model"],
+                              "base_url": s["url"], "outputs": s["outputs"]} for s in ready]}
     model = models(cfg).get(me["model_id"]) or {}
     served = model.get("served_name") or (me["model"].rsplit("/", 1)[-1] if me["engine"] == "vllm" else me["model"])
     return {"host": me["host"], "engine": me["engine"], "base_url": me["url"], "model": served,
@@ -506,6 +617,8 @@ def logs(cfg: dict, host: str | None = None, lines: int = 60) -> dict:
         raise StrixError(me["error"])
     if _busy(me):
         units = [UNITS[me["engine"]]]
+    elif me.get("services"):
+        units = [s["unit"] for s in me["services"]]
     elif me["role"] == "worker":
         units = [RPC_UNIT]
     else:
@@ -528,12 +641,17 @@ def catalog(cfg: dict, performance: dict, dates: dict | None = None) -> list[dic
         out.append({
             "id": mid, "label": m.get("label") or mid, "aliases": list(m.get("aliases") or []),
             "served_name": m.get("served_name", ""), "ctx": int(m.get("max_model_len") or 0),
-            "image": m.get("engine_model") or m.get("engine", ""), "notes": m.get("notes", ""),
-            "backend": m.get("engine", ""), "topology": "strix-cluster" if m.get("engine") == "cluster" else "strix",
+            "image": m.get("engine_model") or m.get("unit") or m.get("engine", ""), "notes": m.get("notes", ""),
+            "backend": m.get("engine", ""),
+            "topology": {"cluster": "strix-cluster", SERVICE: "strix-service"}.get(m.get("engine"), "strix"),
             "wrapper": m.get("engine", ""), "hermes_provider": "", "performance": performance.get(mid),
             "quant": m.get("quant"), "quant_bits": m.get("quant_bits"),
             "quant_scope": m.get("quant_scope"), "quant_detail": m.get("quant_detail"),
             "modalities": modalities(m), "ctl_id": ctl_id(m) if m.get("engine") in ENGINES else None,
+            "outputs": list(m["outputs"]) if m.get("outputs") else None,
+            "home_host": m.get("box"), "unit": m.get("unit"),
+            # `<engine>:<halo-ctl id>` copies on a box's disk this card stands for (ADR 0019).
+            "covers": list(m.get("covers") or []),
             "updated": (dates.get(mid) or {}).get("updated"),
             "updated_source": (dates.get(mid) or {}).get("updated_source"),
         })
@@ -658,7 +776,9 @@ def _box_line(b: dict) -> str:
         return b["error"] if b["error"].startswith(f"{b['host']}: ") else f"{b['host']}: {b['error']}"
     role = {"master": " · cluster master", "worker": " · cluster worker"}.get(b["role"], "")
     serving = f" · {b['model']} · {b['url']}" if _busy(b) and b.get("url") else ""
-    return f"{b['host']}: {b['engine']} {b['phase']}{role}{serving}"
+    always = "".join(f"\n  always on: {s['label']} ({s['unit']}) {s['phase']} · {s['model'] or '—'} · {s['url']}"
+                     for s in b.get("services") or [])
+    return f"{b['host']}: {b['engine']} {b['phase']}{role}{serving}{always}"
 
 
 def main(cfg: dict, args, performance: dict, dates: dict | None = None) -> int:
@@ -691,6 +811,8 @@ def main(cfg: dict, args, performance: dict, dates: dict | None = None) -> int:
             else:
                 print(f"Engine:   {details['engine']}\nBase URL: {details['base_url']}\n"
                       f"Model:    {details['model']}\nAPI key:  {details['api_key'] or '(no API key set)'}")
+                for extra in (details.get("services") or [])[1:]:
+                    print(f"Also:     {extra['model']} at {extra['base_url']}")
         elif args.strix_cmd == "logs":
             out = logs(cfg, args.box, args.lines)
             if args.json:
