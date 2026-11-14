@@ -5,8 +5,9 @@ import AppKit
 //
 // Splash on the local Mac (ADR 0020). The app drives `spark-serve macos …`.
 // Each card is its own `splash serve` process. Port 8000 is oMLX and is never
-// bound or stopped. On-disk status is whether the card's model_dir and
-// draft_dir exist.
+// bound, stopped, or selected for Hermes. On-disk status is whether the card's
+// model_dir and draft_dir exist. Use in Hermes writes the same config as the
+// Strix tab, and only once that card is ready.
 
 struct MacOSMachine: Codable {
     var name: String? = nil
@@ -111,8 +112,14 @@ final class MacOSStore: ObservableObject {
     private var lineBuffer = Data()
     private var cancelled = false
     private var afterCancel: (() -> Void)?
-    private var pendingHermes: HermesTarget?
+    /// Set for the duration of a Hermes selection so the log can confirm it the way the Strix screen does.
+    private var pendingHermes: PendingHermes?
     private var didReportHermes = false
+
+    private struct PendingHermes {
+        let title: String
+        let host: String
+    }
 
     init(poll: Bool = false) {
         home = SparkServePaths.home()
@@ -163,8 +170,11 @@ final class MacOSStore: ObservableObject {
 
     func apply(_ site: MacOSSite) { self.site = site }
 
+    /// `spark-serve macos use` for a ready card. Nil until it is ready, and never for port 8000.
     func hermesArguments(_ id: String, target: HermesTarget) -> [String]? {
-        guard let server = server(id), server.phase == "ready", !(server.url ?? "").isEmpty else { return nil }
+        guard let server = server(id), server.phase == "ready", server.port != MacOSFacts.reservedPort,
+              let url = server.url, !url.isEmpty else { return nil }
+        if let port = URL(string: url)?.port, port == MacOSFacts.reservedPort { return nil }
         return ["macos", "use", id, "--hermes-target", target.rawValue, "--json"]
     }
 
@@ -188,11 +198,12 @@ final class MacOSStore: ObservableObject {
         perform(title, args, isStart: false)
     }
 
+    /// Same control as the Strix panels: write the selected ready model into Hermes on this Mac or the head Spark.
     func useInHermes(_ id: String, target: HermesTarget) {
-        guard !isBusy, hermesArguments(id, target: target) != nil else { return }
+        guard !isBusy, let server = server(id), hermesArguments(id, target: target) != nil else { return }
         didReportHermes = false
-        pendingHermes = target
-        log("  connecting \(target.title)…")
+        pendingHermes = PendingHermes(title: target.title, host: server.host)
+        log("  connecting \(target.title) to \(server.host)…")
         perform("Connecting \(target.title)", ["macos", "use", id, "--hermes-target", target.rawValue, "--json"], isStart: false)
     }
 
@@ -241,7 +252,7 @@ final class MacOSStore: ObservableObject {
                 guard let self else { return }
                 self.consume(Data([0x0a]))
                 if code == 0, let pending = self.pendingHermes, !self.didReportHermes {
-                    self.log("  \(pending.title) updated")
+                    self.log("  \(pending.title) now uses \(pending.host)")
                 }
                 self.pendingHermes = nil
                 self.didReportHermes = false
@@ -285,8 +296,13 @@ final class MacOSStore: ObservableObject {
             if let detail = event["detail"] as? String { log("  hermes: \(detail)") }
         case "selected":
             let target = HermesTarget(rawValue: event["hermes_target"] as? String ?? "local") ?? .local
-            let label = event["label"] as? String ?? ""
-            log("  \(target.title) uses \(label)")
+            let host = event["host"] as? String ?? ""
+            let destination = (event["hermes_host"] as? String).map { " on \($0)" } ?? ""
+            let served = event["served"] as? String
+            let label = (event["label"] as? String)
+                ?? models.first { $0.served_name == served }?.label
+                ?? served
+            log("  \(target.title)\(destination) uses \(host)\(label.map { ": \($0)" } ?? "")")
             didReportHermes = true
         case "ready":
             log("  ready")
@@ -448,8 +464,8 @@ struct MacOSView: View {
                         .disabled(!MacOSFacts.canStop(server) || (store.isBusy && !store.busyIsStart))
                     Button("Logs") { store.showLogs(server.id) }
                         .disabled(store.isBusy)
+                    hermesButtons(server)
                 }
-                if server.phase == "ready" { hermesButtons(server) }
                 VStack(alignment: .leading, spacing: 2) {
                     Text(server.model_dir).font(.system(.caption2, design: .monospaced)).textSelection(.enabled)
                     Text(server.draft_dir).font(.system(.caption2, design: .monospaced)).textSelection(.enabled)
@@ -499,12 +515,14 @@ struct MacOSView: View {
         .frame(minWidth: 220, alignment: .leading)
     }
 
+    /// Same labels, style, and help as the Strix panel. Disabled until the selected card is ready.
     private func hermesButtons(_ server: MacOSServer) -> some View {
         HStack(spacing: 8) {
             ForEach(HermesTarget.allCases, id: \.self) { target in
                 Button("Use in \(target.title)") { store.useInHermes(server.id, target: target) }
                     .buttonStyle(.bordered)
                     .disabled(store.isBusy || store.hermesArguments(server.id, target: target) == nil)
+                    .accessibilityLabel("Use \(server.label) in \(target.title)")
                     .help(target == .local ? "Update Hermes on this Mac" : "Update Hermes on the head Spark")
             }
         }

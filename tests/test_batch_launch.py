@@ -4,6 +4,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import signal
 import subprocess
 import sys
 import tomllib
@@ -360,23 +361,37 @@ def state_of(d):
     return json.loads((d / "state.json").read_text())
 
 
+def run_supervisor(sup):
+    """Run the supervisor in-process and put this process's signals back.
+
+    ``main`` ignores SIGTERM for the restore. A child started later, including
+    the MacOS port-8000 guard, inherits that and then cannot be stopped.
+    """
+    previous = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGHUP)}
+    try:
+        return sup.main()
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+
 def test_supervisor_success_then_restore(tmp_path):
     d = make_job(tmp_path)
-    supervisor.Supervisor(str(d), sleep=lambda s: None).main()
+    run_supervisor(supervisor.Supervisor(str(d), sleep=lambda s: None))
     s = state_of(d)
     assert (s["result"], s["phase"], s["restore"], s["output_bytes"]) == ("done", "finished", "ok", 3)
 
 
 def test_supervisor_failed_job_still_restores(tmp_path):
     d = make_job(tmp_path, job_code="3", out=False)
-    supervisor.Supervisor(str(d), sleep=lambda s: None).main()
+    run_supervisor(supervisor.Supervisor(str(d), sleep=lambda s: None))
     s = state_of(d)
     assert s["result"] == "failed" and "exit 3" in s["error"] and s["restore"] == "ok"
 
 
 def test_supervisor_restore_failure_is_reported(tmp_path):
     d = make_job(tmp_path, restore_code="1")
-    supervisor.Supervisor(str(d), sleep=lambda s: None).main()
+    run_supervisor(supervisor.Supervisor(str(d), sleep=lambda s: None))
     s = state_of(d)
     assert s["restore"] == "failed" and s["restore_attempts"] == 2 and "qwen" in s["restore_error"]
 
@@ -390,7 +405,7 @@ def test_supervisor_cancel_kills_job_and_restores(tmp_path):
     threading.Timer(0.5, (d / "cancel").touch).start()
     sup = supervisor.Supervisor(str(d))
     supervisor.GRACE_SECONDS, supervisor.POLL_SECONDS = 1, 0.05
-    sup.main()
+    run_supervisor(sup)
     s = state_of(d)
     assert s["result"] == "cancelled" and s["restore"] == "ok" and s["job_pid"]
 
@@ -401,6 +416,6 @@ def test_supervisor_busy_gpu_skips_job_and_restores(tmp_path):
     real_run = subprocess.run
     run = lambda argv, **k: busy if argv[0] == "nvidia-smi" else real_run(argv, **k)
     popen = Mock(side_effect=AssertionError("job must not start"))
-    supervisor.Supervisor(str(d), sleep=lambda s: None, run=run, popen=popen).main()
+    run_supervisor(supervisor.Supervisor(str(d), sleep=lambda s: None, run=run, popen=popen))
     s = state_of(d)
     assert s["result"] == "failed" and "GPU is not free" in s["error"] and s["restore"] == "ok"

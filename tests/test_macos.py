@@ -1,4 +1,7 @@
 """MacOS Splash cards: local paths, documented serve flags, and a stop that cannot reach port 8000."""
+import argparse
+import importlib.machinery
+import importlib.util
 import json
 import os
 import stat
@@ -6,6 +9,7 @@ import tomllib
 from pathlib import Path
 
 import pytest
+import yaml
 
 import spark_serve_macos as macos
 
@@ -230,15 +234,25 @@ def test_catalog_marks_only_the_measured_card(state, tmp_path):
     assert items["m"]["backend"] == "splash" and items["m"]["topology"] == "macos"
 
 
+def _cli():
+    loader = importlib.machinery.SourceFileLoader("macos_hermes_cli", str(ROOT / "spark-serve"))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    cli = importlib.util.module_from_spec(spec)
+    loader.exec_module(cli)
+    return cli
+
+
 def test_use_selects_a_ready_card_without_moving_spark_blocks(state, tmp_path, monkeypatch):
-    cfg = card()
-    cfg["macos"]["models"]["m"]["hermes_provider"] = "splash"
+    cfg = card(port=8101, model="mlx-community/Qwen3.8-27B-8bit", max_model_len=262144,
+               hermes_supports_vision=True, hermes_provider="splash")
     lay_down(tmp_path, cfg)
     cfg["macos"]["splash"] = splash_script(tmp_path)
     monkeypatch.setattr(macos, "_wait_ready", lambda *args: True)
     macos.up(cfg, "m")
     try:
-        monkeypatch.setattr(macos, "_ready", lambda host, port, served: port != 8000)
+        monkeypatch.setattr(
+            macos, "_ready",
+            lambda host, port, served: port != 8000 and served == "mlx-community/Qwen3.8-27B-8bit")
         seen = {}
 
         def patch(*args, **kwargs):
@@ -247,12 +261,20 @@ def test_use_selects_a_ready_card_without_moving_spark_blocks(state, tmp_path, m
             return ("Hermes (Mac) now uses Qwen", True)
 
         result = macos.use({**cfg, "cluster": {"head": "sparkone"}}, "m", "spark", patch)
+        model = seen["args"][2]
+        assert model["served_name"] == "mlx-community/Qwen3.8-27B-8bit"
+        assert model["max_model_len"] == 262144
+        assert model["hermes_supports_vision"] is True
+        assert model["hermes_provider"] == "splash"
         assert seen["kwargs"]["move_ds4"] is False
         assert seen["kwargs"]["api_key"] is None
+        assert seen["kwargs"]["provider_label"] == "Splash on this Mac"
         assert seen["kwargs"]["remote_host"] == "sparkone"
-        assert seen["kwargs"]["base_url"] == "http://127.0.0.1:28101/v1"
+        assert seen["kwargs"]["base_url"] == "http://127.0.0.1:8101/v1"
         assert "8000" not in seen["kwargs"]["base_url"]
-        assert result["provider"] == "splash" and result["port"] == 28101
+        assert result["provider"] == "splash" and result["port"] == 8101
+        assert result["served"] == "mlx-community/Qwen3.8-27B-8bit"
+        assert result["hermes_target"] == "spark" and result["hermes_host"] == "sparkone"
         called = []
         monkeypatch.setattr(macos, "_ready", lambda *args: False)
         with pytest.raises(macos.MacOSError, match="not ready"):
@@ -260,6 +282,196 @@ def test_use_selects_a_ready_card_without_moving_spark_blocks(state, tmp_path, m
         assert called == []
     finally:
         macos.stop(cfg, "m")
+
+
+def test_use_cli_reports_hermes_without_starting_another_process(state, tmp_path, monkeypatch, capsys):
+    cfg = card(port=8104, model="unsloth/Qwen3.8-Flash-Next-GGUF:Q8_0", format="gguf",
+               max_model_len=131072, label="Flash Next")
+    lay_down(tmp_path, cfg)
+    cfg["macos"]["splash"] = splash_script(tmp_path)
+    monkeypatch.setattr(macos, "_wait_ready", lambda *args: True)
+    macos.up(cfg, "m")
+    spawned = []
+    real_popen = macos.subprocess.Popen
+    monkeypatch.setattr(macos.subprocess, "Popen", lambda *a, **k: spawned.append(a))
+    try:
+        monkeypatch.setattr(
+            macos, "_ready",
+            lambda host, port, served: port == 8104 and served == "unsloth/Qwen3.8-Flash-Next-GGUF:Q8_0")
+        seen = {}
+
+        def patch(cfg, mid, model, skip, **kwargs):
+            seen.update(mid=mid, served=model["served_name"], ctx=model.get("max_model_len"),
+                        provider=model.get("hermes_provider"), skip=skip, **kwargs)
+            return ("patched", True)
+
+        args = argparse.Namespace(macos_cmd="use", model="qwen", hermes_target="local", json=True)
+        assert macos.main(cfg, args, {}, hermes_patch=patch) == 0
+        assert spawned == []
+        assert seen["provider"] == "splash" and seen["served"] == "unsloth/Qwen3.8-Flash-Next-GGUF:Q8_0"
+        assert seen["ctx"] == 131072 and seen["base_url"] == "http://127.0.0.1:8104/v1"
+        assert seen["api_key"] is None and seen["remote_host"] is None
+        assert seen["provider_label"] == "Splash on this Mac" and seen["move_ds4"] is False
+        assert seen["skip"] is False and seen["mid"] == "m"
+        out = capsys.readouterr().out
+        assert "8000" not in out
+        events = [json.loads(line) for line in out.splitlines()]
+        assert [event["event"] for event in events] == ["hermes", "selected"]
+        selected = events[1]
+        assert selected["url"] == "http://127.0.0.1:8104/v1"
+        assert selected["served"] == "unsloth/Qwen3.8-Flash-Next-GGUF:Q8_0"
+        assert selected["hermes_target"] == "local" and selected["hermes_host"] is None
+        assert selected["host"] == "127.0.0.1" and selected["port"] == 8104
+    finally:
+        monkeypatch.setattr(macos.subprocess, "Popen", real_popen)
+        macos.stop(cfg, "m")
+
+
+def test_spark_hermes_target_uses_the_head_and_a_miss_never_patches(state, tmp_path, monkeypatch, capsys):
+    cfg = card(port=8101)
+    lay_down(tmp_path, cfg)
+    cfg["macos"]["splash"] = splash_script(tmp_path)
+    monkeypatch.setattr(macos, "_wait_ready", lambda *args: True)
+    macos.up(cfg, "m")
+    try:
+        monkeypatch.setattr(macos, "_ready", lambda host, port, served: port == 8101)
+        seen = {}
+
+        def patch(*args, **kwargs):
+            seen["remote_host"] = kwargs["remote_host"]
+            return ("patched", True)
+
+        headed = {**cfg, "cluster": {"head": "sparkone"}}
+        args = argparse.Namespace(macos_cmd="use", model="m", hermes_target="spark", json=True)
+        assert macos.main(headed, args, {}, hermes_patch=patch) == 0
+        assert seen["remote_host"] == "sparkone"
+        assert json.loads(capsys.readouterr().out.splitlines()[-1])["hermes_host"] == "sparkone"
+        with pytest.raises(macos.MacOSError, match="cluster.head"):
+            macos.use(cfg, "m", "spark", patch)
+        called = []
+        monkeypatch.setattr(macos, "_ready", lambda *args: False)
+        with pytest.raises(macos.MacOSError, match="not ready"):
+            macos.use(cfg, "m", "local", lambda *a, **k: called.append(True))
+        assert called == []
+        assert macos.main(cfg, argparse.Namespace(
+            macos_cmd="use", model="m", hermes_target="local", json=True), {}) == 1
+        assert "unavailable" in capsys.readouterr().out
+    finally:
+        macos.stop(cfg, "m")
+
+
+def test_use_refuses_port_8000_without_probing_or_patching(monkeypatch):
+    cfg = card(port=8000)
+    opened = []
+    monkeypatch.setattr(macos.urllib.request, "urlopen", lambda *a, **k: opened.append(True))
+    called = []
+
+    def patch(*args, **kwargs):
+        called.append(True)
+        return ("patched", True)
+
+    with pytest.raises(macos.MacOSError, match="8000"):
+        macos.use(cfg, "m", "local", patch)
+    assert called == [] and opened == []
+    args = argparse.Namespace(macos_cmd="use", model="m", hermes_target="local", json=True)
+    assert macos.main(cfg, args, {}, hermes_patch=patch) == 1
+    assert called == []
+
+
+def test_use_writes_the_same_hermes_keys_as_strix(state, tmp_path, monkeypatch):
+    cfg = card(port=8101, model="mlx-community/Qwen3.8-27B-8bit", max_model_len=262144,
+               hermes_supports_vision=True, hermes_provider="splash", label="Qwen3.8-27B")
+    lay_down(tmp_path, cfg)
+    flash = dict(cfg["macos"]["models"]["m"], label="Flash Next", aliases=["flash"],
+                 model="unsloth/Qwen3.8-Flash-Next-GGUF:Q8_0", format="gguf", port=8104,
+                 max_model_len=131072, hermes_supports_vision=False)
+    flash["model_dir"] = str(tmp_path / "flash")
+    flash["draft_dir"] = str(tmp_path / "flash-draft")
+    (tmp_path / "flash").mkdir()
+    (tmp_path / "flash-draft").mkdir()
+    cfg["macos"]["models"]["flash"] = flash
+    cfg["macos"]["splash"] = splash_script(tmp_path)
+    monkeypatch.setattr(macos, "_wait_ready", lambda *args: True)
+    started = []
+    try:
+        macos.up(cfg, "m")
+        started.append("m")
+        macos.up(cfg, "flash")
+        started.append("flash")
+        monkeypatch.setattr(macos, "_ready", lambda host, port, served: port in {8101, 8104})
+        cli = _cli()
+        path = tmp_path / "config.yaml"
+        original = {
+            "model": {"default": "old", "provider": "spark", "max_tokens": 4096},
+            "providers": {
+                "spark": {"name": "Spark cluster", "api_key": "PRIVATE-SPARK-KEY",
+                          "base_url": "http://sparkone.lan:8000/v1", "default_model": "old"},
+                "spark-ds4": {"base_url": "http://sparkone.lan:8000/v1"},
+            },
+        }
+        path.write_text(yaml.safe_dump(original, sort_keys=False))
+        path.chmod(0o600)
+        monkeypatch.setattr(cli, "HERMES_CONFIG", path)
+        monkeypatch.delenv("SPARK_SERVE_HERMES_KEY", raising=False)
+
+        first = macos.use(cfg, "m", "local", cli._hermes_patch)
+        assert first["base_url"] == "http://127.0.0.1:8101/v1"
+        assert first["served"] == "mlx-community/Qwen3.8-27B-8bit"
+        actual = yaml.safe_load(path.read_text())
+        assert actual["model"]["default"] == "mlx-community/Qwen3.8-27B-8bit"
+        assert actual["model"]["provider"] == "splash"
+        assert actual["model"]["max_tokens"] == 4096
+        block = actual["providers"]["splash"]
+        assert block["base_url"] == "http://127.0.0.1:8101/v1"
+        assert block["default_model"] == "mlx-community/Qwen3.8-27B-8bit"
+        assert block["api_key"] == "dummy"
+        assert block["name"] == "Splash on this Mac"
+        assert block["models"]["mlx-community/Qwen3.8-27B-8bit"] == {
+            "context_length": 262144, "supports_vision": True,
+        }
+        assert actual["providers"]["spark"] == original["providers"]["spark"]
+        assert actual["providers"]["spark-ds4"] == original["providers"]["spark-ds4"]
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert list(tmp_path.glob(".config.yaml.*")) == []
+
+        second = macos.use(cfg, "flash", "local", cli._hermes_patch)
+        assert second["served"] == "unsloth/Qwen3.8-Flash-Next-GGUF:Q8_0"
+        assert second["base_url"] == "http://127.0.0.1:8104/v1"
+        actual = yaml.safe_load(path.read_text())
+        assert actual["model"]["default"] == "unsloth/Qwen3.8-Flash-Next-GGUF:Q8_0"
+        block = actual["providers"]["splash"]
+        assert block["base_url"] == "http://127.0.0.1:8104/v1"
+        assert block["default_model"] == "unsloth/Qwen3.8-Flash-Next-GGUF:Q8_0"
+        assert block["name"] == "Splash on this Mac"
+        assert block["models"]["mlx-community/Qwen3.8-27B-8bit"]["context_length"] == 262144
+        assert block["models"]["unsloth/Qwen3.8-Flash-Next-GGUF:Q8_0"] == {
+            "context_length": 131072, "supports_vision": False,
+        }
+        assert "8000" not in block["base_url"]
+        assert actual["providers"]["spark"]["base_url"] == "http://sparkone.lan:8000/v1"
+        assert actual["providers"]["spark"]["api_key"] == "PRIVATE-SPARK-KEY"
+
+        kept = path.read_text()
+        monkeypatch.setattr(macos, "_ready", lambda *args: False)
+        with pytest.raises(macos.MacOSError, match="not ready"):
+            macos.use(cfg, "m", "local", cli._hermes_patch)
+        assert path.read_text() == kept
+    finally:
+        for name in started:
+            try:
+                macos.stop(cfg, name)
+            except macos.MacOSError:
+                pass
+
+
+def test_macos_use_parser_defaults_to_this_mac():
+    cli = _cli()
+    parser = cli.build_parser()
+    args = parser.parse_args(["macos", "use", "macos-qwen38-27b"])
+    assert args.macos_cmd == "use" and args.model == "macos-qwen38-27b"
+    assert args.hermes_target == "local" and args.json is False
+    spark = parser.parse_args(["macos", "use", "macos-flint", "--hermes-target", "spark", "--json"])
+    assert spark.hermes_target == "spark" and spark.json is True
 
 
 def test_shipped_catalog_matches_splash_and_keeps_port_8000():

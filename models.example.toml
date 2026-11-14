@@ -567,6 +567,10 @@ host = "127.0.0.1"
 splash = "splash"
 weights_root = "/Volumes/DATA/local-models/splash"
 reserved_ports = [8000]             # oMLX; always reserved even if this list changes
+# `macos use <id>` points Hermes at a Splash card that is already ready
+# (provider splash, unless the card sets hermes_provider). The base URL is
+# http://127.0.0.1:<port>/v1 and the served model id is `model` (splash --model).
+# context_length is max_model_len. Port 8000 is never selected.
 
 [macos.models.macos-qwen38-27b]
 label = "Qwen3.8-27B"

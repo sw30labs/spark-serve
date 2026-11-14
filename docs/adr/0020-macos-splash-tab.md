@@ -39,6 +39,14 @@ unmeasured.
   (`manual: true`) so `catalog_tps_bench.py summarize` keeps it until a
   protocol run replaces that id. The card shows decode, the 4-stream
   aggregate, prefill, and cached TTFT, and says it is not the 512-token protocol.
+- **Use in Hermes is the Strix write.** Bordered buttons beside Start, Stop,
+  and Logs, and `spark-serve macos use <card>`, call the same `_hermes_patch`.
+  A ready card is written as provider `splash` (or the card's
+  `hermes_provider`) at `http://127.0.0.1:<port>/v1`. `model.default` is the
+  card's `--model` id, and `context_length` is `max_model_len`. The control
+  stays off until the card is ready. Port 8000 is never selected, and the
+  `spark` provider block is left as it is. `--hermes-target spark` updates
+  Hermes on the head Spark.
 
 **Trade-off.** Splash is not a service manager. A server keeps running after
 the app quits until Stop. A process we did not start, including anything

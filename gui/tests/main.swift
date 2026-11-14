@@ -264,5 +264,10 @@ let macosStore = MacOSStore(poll: false)
 macosStore.models = [ModelEntry(id: "macos-flint", label: "Flint", aliases: [], served_name: "unsloth/flint-GGUF:UD-Q4_K_XL", ctx: 262144, image: "flint", notes: "", wrapper: "splash", hermes_provider: "splash", backend: "splash", topology: "macos")]
 macosStore.apply(macosSite)
 check(macosStore.hermesArguments("macos-flint", target: .local) == ["macos", "use", "macos-flint", "--hermes-target", "local", "--json"], "A ready Splash card can be handed to Hermes on this Mac")
+check(macosStore.hermesArguments("macos-flint", target: .spark) == ["macos", "use", "macos-flint", "--hermes-target", "spark", "--json"], "Splash Hermes Spark target stays separate from the card")
 check(macosStore.hermesArguments("macos-qwen38-27b", target: .spark) == nil, "A stopped card is not offered to Hermes")
+let omlxJSON = #"{"machine":{"name":"Mac Studio"},"host":"127.0.0.1","reserved_ports":[8000],"splash":"splash","models":[{"id":"macos-flint","label":"Flint","phase":"ready","port":8000,"host":"127.0.0.1","url":"http://127.0.0.1:8000/v1","model":"unsloth/flint-GGUF:UD-Q4_K_XL","model_dir":"/flint","draft_dir":"/flint-draft","model_on_disk":true,"draft_on_disk":true,"on_disk":true,"pid":7},{"id":"macos-qwen38-27b","label":"Qwen3.8-27B","phase":"ready","port":8101,"host":"127.0.0.1","url":"http://127.0.0.1:8000/v1","model":"mlx-community/Qwen3.8-27B-8bit","model_dir":"/weights","draft_dir":"/draft","model_on_disk":true,"draft_on_disk":true,"on_disk":true,"pid":8}]}"#
+macosStore.apply(try decoder.decode(MacOSSite.self, from: Data(omlxJSON.utf8)))
+check(macosStore.hermesArguments("macos-flint", target: .local) == nil, "Port 8000 is never handed to Hermes")
+check(macosStore.hermesArguments("macos-qwen38-27b", target: .spark) == nil, "A ready card whose URL is port 8000 is not handed to Hermes")
 print("MacOS Splash smoke passed (ADR 0020).")

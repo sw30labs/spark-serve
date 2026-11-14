@@ -19,6 +19,13 @@ Start runs `splash serve` for that card only, with flags documented by Splash
 `--host`, `--port`, and `--mmproj` when the card sets one. Stop signals only
 the process this module spawned for that card, and only after its command
 line still matches that card and names no reserved port.
+
+`macos use` points Hermes at a card that is already ready, through the same
+config write as Strix (`~/.hermes/config.yaml`, same keys, same atomic
+replace). The base URL is ``http://<host>:<card port>/v1``, the served model
+id is the card's ``--model`` string, and the context length is
+``max_model_len``. A card that is not ready is refused, and port 8000 is
+never selected.
 """
 from __future__ import annotations
 
@@ -619,7 +626,14 @@ def logs(cfg: dict, name: str, lines: int = 80) -> dict:
 
 
 def use(cfg: dict, name: str, hermes_target: str, patch) -> dict:
-    """Point Hermes at a Splash model that is already ready. Does not start or stop it."""
+    """Point Hermes at a Splash model that is already ready. Does not start or stop it.
+
+    ``patch`` is spark-serve._hermes_patch, so the file, keys, and atomic replace
+    match Strix. The served id is the card's ``--model`` string. Context length
+    is that card's ``max_model_len`` (the patch reads it). A card that is not
+    ready is refused, the same as a Strix model that is not ready, and a
+    reserved port (8000) is never written.
+    """
     if hermes_target not in ("local", "spark"):
         raise MacOSError("Hermes target must be local or spark")
     if patch is None:

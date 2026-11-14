@@ -275,7 +275,7 @@ make -f gui/Makefile
 open gui/SparkServeApp.app
 ```
 
-The window has three tabs:
+The window has four tabs:
 
 - **Overview** shows CPU and GPU utilization charts, memory use, temperature,
   power, and network/disk rates for each physical Spark, plus inference metrics
@@ -286,13 +286,15 @@ The window has three tabs:
 - **AMD Strix Halo** starts and stops models on the two AMD boxes and their
   cluster, and points Hermes at the selected ready model the same way the Spark
   tab does; see [AMD Strix Halo tab](#amd-strix-halo-tab).
+- **MacOS** serves Splash models on this Mac Studio and points Hermes at the
+  selected ready card the same way; see [MacOS tab](#macos-tab).
 
 The app no longer has a Benchmarks tab (removed 2026-10-25,
 [ADR 0015](docs/adr/0015-remove-native-benchmarks-tab.md)). Run bounded decode
 tests and prefill sweeps with the CLI `bench` commands below.
 
 The app invokes this CLI (`list`, `status`, `watch`, `up`, `stop`,
-`reboot`, `shutdown` and `strix`) and does not speak SSH itself. Live monitoring starts with the app and
+`reboot`, `shutdown`, `strix` and `macos`) and does not speak SSH itself. Live monitoring starts with the app and
 stops when it quits. Benchmarks run only from the CLI and only when requested.
 The same interfaces are available directly:
 
@@ -449,7 +451,26 @@ Start and Stop affect only that card's process. A card can start once both its
 ./spark-serve macos status
 ./spark-serve macos up macos-qwen38-27b
 ./spark-serve macos stop macos-qwen38-27b
+./spark-serve macos use macos-qwen38-27b          # ready card; --hermes-target spark updates the head
 ```
+
+Beside Start, Stop, and Logs, **Use in Hermes (Mac)** and **Use in Hermes
+(Spark)** match the Strix tab: same labels, bordered buttons, and log lines
+(`connecting Hermes (Mac) to 127.0.0.1…`, then `Hermes (Mac) uses 127.0.0.1: <model>`).
+The button stays off until that card is ready. A stopped card is not written
+into Hermes. It writes `~/.hermes/config.yaml` on this Mac, or the head Spark's
+copy with `--hermes-target spark`, through the same update Strix uses:
+
+- `model.provider` becomes `splash`, or the card's `hermes_provider`
+- `model.default`, and that provider's `base_url` and `default_model`, become
+  `http://127.0.0.1:<card port>/v1` and the card's `--model` id (for example
+  `mlx-community/Qwen3.8-27B-4bit` or `unsloth/flint-GGUF:UD-Q4_K_XL`)
+- `providers.splash.models.<served>.context_length` is the card's `max_model_len`
+- Splash takes no bearer, so the provider `api_key` stays the key already in
+  that block, or `dummy`
+
+Port 8000 is never selected. A MacOS selection does not rewrite the `spark`
+provider block.
 
 Qwen3.8-27B was measured on 2026-11-13 with Splash 1.6.1 (171 tok/s decode,
 about 544 tok/s prefill on a 19K prompt, 0.125 s cached TTFT, 192 tok/s
