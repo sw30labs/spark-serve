@@ -13,7 +13,7 @@ struct ActivityEntry: Identifiable, Equatable {
     let id: Int
     let date: Date
     let text: String
-    /// "Spark" or "Strix": which store logged it.
+    /// "Spark", "Strix", or "MacOS": which store logged it.
     let source: String
 }
 

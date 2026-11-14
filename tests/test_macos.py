@@ -1,0 +1,345 @@
+"""MacOS Splash cards: local paths, documented serve flags, and a stop that cannot reach port 8000."""
+import json
+import os
+import stat
+import tomllib
+from pathlib import Path
+
+import pytest
+
+import spark_serve_macos as macos
+
+ROOT = Path(__file__).resolve().parents[1]
+EXAMPLE = tomllib.loads((ROOT / "models.example.toml").read_text())
+MEASURED = json.loads((ROOT / "measured-performance.json").read_text())["models"]
+
+SERVE_FLAGS = {"--model", "--model-dir", "--draft-model", "--host", "--port", "--mmproj"}
+
+
+def card(port=28101, **over):
+    model = {
+        "label": "Qwen",
+        "model": "mlx-community/Qwen3.8-27B-4bit",
+        "format": "mlx",
+        "draft_model": "incoai/Qwen3.8-27B-DFlash2",
+        "port": port,
+        "max_model_len": 262144,
+        "aliases": ["qwen"],
+    }
+    model.update(over)
+    return {"macos": {"host": "127.0.0.1", "splash": "splash", "reserved_ports": [8000],
+                      "models": {"m": model}}}
+
+
+def lay_down(tmp_path, cfg):
+    model = cfg["macos"]["models"]["m"]
+    target = tmp_path / "weights"
+    draft = tmp_path / "draft"
+    target.mkdir()
+    draft.mkdir()
+    model["model_dir"] = str(target)
+    model["draft_dir"] = str(draft)
+    return target, draft
+
+
+def splash_script(tmp_path) -> str:
+    path = tmp_path / "splash"
+    path.write_text("#!/usr/bin/env python3\nimport time\ntime.sleep(120)\n")
+    path.chmod(path.stat().st_mode | stat.S_IEXEC)
+    return str(path)
+
+
+@pytest.fixture
+def state(monkeypatch, tmp_path):
+    monkeypatch.setenv("SPARK_SERVE_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(macos, "_port_busy", lambda host, port: False)
+    return tmp_path
+
+
+def test_omitted_paths_default_to_the_splash_repo_directory():
+    cfg = card()
+    model = cfg["macos"]["models"]["m"]
+    assert macos.model_dir(cfg, model) == (
+        "/Volumes/DATA/local-models/splash/mlx-community/Qwen3.8-27B-4bit")
+    assert macos.draft_dir(cfg, model) == (
+        "/Volumes/DATA/local-models/splash/incoai/Qwen3.8-27B-DFlash2")
+    variant = dict(model, model="ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:Q2_0",
+                   draft_model="incoai/Qwen3.8-Flash-Next-DFlash2")
+    assert macos.model_dir(cfg, variant).endswith(
+        "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF")
+    assert ":Q2_0" not in macos.model_dir(cfg, variant)
+
+
+def test_explicit_paths_win_and_disk_status_follows_them(state, tmp_path):
+    cfg = card()
+    model = cfg["macos"]["models"]["m"]
+    model["model_dir"] = str(tmp_path / "weights")
+    model["draft_dir"] = str(tmp_path / "draft")
+    view = macos.server_view(cfg, "m", model, macos.reserved_ports(cfg))
+    assert view["on_disk"] is False and view["model_on_disk"] is False and view["draft_on_disk"] is False
+    (tmp_path / "weights").mkdir()
+    view = macos.server_view(cfg, "m", model, macos.reserved_ports(cfg))
+    assert view["model_on_disk"] is True and view["draft_on_disk"] is False and view["on_disk"] is False
+    (tmp_path / "draft").mkdir()
+    view = macos.server_view(cfg, "m", model, macos.reserved_ports(cfg))
+    assert view["on_disk"] is True
+    (tmp_path / "weights").rmdir()
+    view = macos.server_view(cfg, "m", model, macos.reserved_ports(cfg))
+    assert view["on_disk"] is False and view["model_on_disk"] is False
+
+
+def test_port_8000_is_reserved_even_when_the_catalog_omits_it():
+    cfg = card(port=8000)
+    cfg["macos"]["reserved_ports"] = []
+    assert 8000 in macos.reserved_ports(cfg)
+    with pytest.raises(macos.MacOSError, match="8000"):
+        macos.serve_argv(cfg, "m")
+    cfg = card(port=28101)
+    cfg["macos"]["models"]["n"] = dict(cfg["macos"]["models"]["m"], port=28101)
+    with pytest.raises(macos.MacOSError, match="also used"):
+        macos._check_ports(cfg)
+
+
+def test_serve_argv_uses_only_documented_flags(state, tmp_path):
+    cfg = card()
+    lay_down(tmp_path, cfg)
+    argv = macos.serve_argv(cfg, "m", "/opt/splash")
+    assert argv[:2] == ["/opt/splash", "serve"]
+    flags = [arg for arg in argv if arg.startswith("--")]
+    assert flags == ["--model", "--model-dir", "--draft-model", "--host", "--port"]
+    assert set(flags) <= SERVE_FLAGS
+    assert "8000" not in argv
+    assert argv[argv.index("--port") + 1] == "28101"
+    assert argv[argv.index("--host") + 1] == "127.0.0.1"
+    assert argv[argv.index("--model") + 1] == "mlx-community/Qwen3.8-27B-4bit"
+    cfg["macos"]["models"]["m"]["mmproj"] = str(tmp_path / "mmproj.gguf")
+    with_vision = macos.serve_argv(cfg, "m", "/opt/splash")
+    assert with_vision[with_vision.index("--mmproj") + 1].endswith("mmproj.gguf")
+    assert [arg for arg in with_vision if arg.startswith("--")][-1] == "--mmproj"
+
+
+def test_missing_weights_do_not_spawn_splash(state, tmp_path, monkeypatch):
+    cfg = card()
+    cfg["macos"]["splash"] = splash_script(tmp_path)
+    spawned = []
+    monkeypatch.setattr(macos.subprocess, "Popen", lambda *a, **k: spawned.append(a))
+    with pytest.raises(macos.MacOSError, match="not on disk"):
+        macos.up(cfg, "qwen")
+    assert spawned == []
+
+
+def test_start_and_stop_touch_only_that_cards_process(state, tmp_path, monkeypatch):
+    cfg = card(port=28101)
+    lay_down(tmp_path, cfg)
+    other = dict(cfg["macos"]["models"]["m"], port=28102, label="Other")
+    cfg["macos"]["models"]["n"] = other
+    cfg["macos"]["splash"] = splash_script(tmp_path)
+    monkeypatch.setattr(macos, "_wait_ready", lambda *args: True)
+    signals = []
+    real_signal = macos._signal_group
+
+    def record(pid, sig):
+        signals.append((pid, sig))
+        real_signal(pid, sig)
+
+    monkeypatch.setattr(macos, "_signal_group", record)
+    first = macos.up(cfg, "m")
+    second = macos.up(cfg, "n")
+    try:
+        assert first["pid"] != second["pid"]
+        assert first["port"] == 28101 and second["port"] == 28102
+        stopped = macos.stop(cfg, "m")
+        assert stopped["stopped"] is True and stopped["pid"] == first["pid"]
+        assert macos._alive(second["pid"])
+        assert all(pid != second["pid"] for pid, _sig in signals)
+        assert {pid for pid, _sig in signals} == {first["pid"]}
+    finally:
+        for name in ("m", "n"):
+            try:
+                macos.stop(cfg, name)
+            except macos.MacOSError:
+                pass
+
+
+def test_a_process_on_port_8000_is_not_signalled(state, tmp_path, monkeypatch):
+    cfg = card(port=28101)
+    lay_down(tmp_path, cfg)
+    script = splash_script(tmp_path)
+    proc = macos.subprocess.Popen(
+        [script, "serve", "--model", "omlx", "--model-dir", "/no", "--draft-model", "/no",
+         "--host", "127.0.0.1", "--port", "8000"],
+        start_new_session=True, stdout=macos.subprocess.DEVNULL, stderr=macos.subprocess.DEVNULL,
+    )
+    try:
+        macos._remember("m", {
+            "pid": proc.pid, "port": 28101,
+            "argv": [script, "serve", "--model", "omlx", "--model-dir", "/no", "--draft-model", "/no",
+                     "--host", "127.0.0.1", "--port", "8000"],
+            "started": macos.process_started(proc.pid),
+        })
+        called = []
+        monkeypatch.setattr(macos, "_signal_group", lambda pid, sig: called.append(pid))
+        with pytest.raises(macos.MacOSError, match="8000"):
+            macos.stop(cfg, "m")
+        assert called == []
+        assert macos._alive(proc.pid)
+        view = macos.server_view(cfg, "m", cfg["macos"]["models"]["m"], macos.reserved_ports(cfg))
+        assert view["pid"] is None
+        assert macos._alive(proc.pid)
+    finally:
+        if macos._alive(proc.pid):
+            os.killpg(proc.pid, 15)
+            proc.wait(timeout=5)
+
+
+def test_a_busy_card_port_is_left_alone(state, tmp_path, monkeypatch):
+    cfg = card()
+    lay_down(tmp_path, cfg)
+    monkeypatch.setattr(macos, "_port_busy", lambda host, port: True)
+    spawned = []
+    monkeypatch.setattr(macos.subprocess, "Popen", lambda *a, **k: spawned.append(True))
+    with pytest.raises(macos.MacOSError, match="left that process alone"):
+        macos.up(cfg, "m")
+    assert spawned == []
+
+
+def test_ready_probe_never_requests_port_8000(monkeypatch):
+    opened = []
+
+    def urlopen(request, timeout=0):
+        opened.append(request.full_url)
+        raise OSError("should not be called")
+
+    monkeypatch.setattr(macos.urllib.request, "urlopen", urlopen)
+    assert macos._ready("127.0.0.1", 8000, "mlx-community/Qwen3.8-27B-4bit") is False
+    assert opened == []
+
+
+def test_catalog_marks_only_the_measured_card(state, tmp_path):
+    cfg = card()
+    cfg["macos"]["models"]["m"]["modalities"] = ["text", "image"]
+    cfg["macos"]["models"]["n"] = dict(cfg["macos"]["models"]["m"], label="Other", port=28102,
+                                       aliases=[])
+    performance = {"m": {"measured_at": "2026-11-13", "single_stream_tokens_per_second": 171,
+                         "concurrent_streams": 4, "concurrent_aggregate_tokens_per_second": 192}}
+    items = {item["id"]: item for item in macos.catalog(cfg, performance)}
+    assert items["m"]["performance"]["single_stream_tokens_per_second"] == 171
+    assert items["n"]["performance"] is None
+    assert items["m"]["ranking"]["best"] is True
+    assert items["n"]["ranking"] is None
+    assert items["m"]["backend"] == "splash" and items["m"]["topology"] == "macos"
+
+
+def test_use_selects_a_ready_card_without_moving_spark_blocks(state, tmp_path, monkeypatch):
+    cfg = card()
+    cfg["macos"]["models"]["m"]["hermes_provider"] = "splash"
+    lay_down(tmp_path, cfg)
+    cfg["macos"]["splash"] = splash_script(tmp_path)
+    monkeypatch.setattr(macos, "_wait_ready", lambda *args: True)
+    macos.up(cfg, "m")
+    try:
+        monkeypatch.setattr(macos, "_ready", lambda host, port, served: port != 8000)
+        seen = {}
+
+        def patch(*args, **kwargs):
+            seen["args"] = args
+            seen["kwargs"] = kwargs
+            return ("Hermes (Mac) now uses Qwen", True)
+
+        result = macos.use({**cfg, "cluster": {"head": "sparkone"}}, "m", "spark", patch)
+        assert seen["kwargs"]["move_ds4"] is False
+        assert seen["kwargs"]["api_key"] is None
+        assert seen["kwargs"]["remote_host"] == "sparkone"
+        assert seen["kwargs"]["base_url"] == "http://127.0.0.1:28101/v1"
+        assert "8000" not in seen["kwargs"]["base_url"]
+        assert result["provider"] == "splash" and result["port"] == 28101
+        called = []
+        monkeypatch.setattr(macos, "_ready", lambda *args: False)
+        with pytest.raises(macos.MacOSError, match="not ready"):
+            macos.use(cfg, "m", "local", lambda *a, **k: called.append(True))
+        assert called == []
+    finally:
+        macos.stop(cfg, "m")
+
+
+def test_shipped_catalog_matches_splash_and_keeps_port_8000():
+    models = EXAMPLE["macos"]["models"]
+    assert list(models) == [
+        "macos-qwen38-27b", "macos-qwen36-35b", "macos-ornith-15-122b",
+        "macos-qwen38-flash-next", "macos-flint",
+    ]
+    assert [models[mid]["port"] for mid in models] == [8101, 8102, 8103, 8104, 8105]
+    assert 8000 in macos.reserved_ports(EXAMPLE)
+    qwen = models["macos-qwen38-27b"]
+    assert qwen["model"] == "mlx-community/Qwen3.8-27B-4bit"
+    assert qwen["draft_model"] == "incoai/Qwen3.8-27B-DFlash2"
+    assert qwen["model_dir"] == (
+        "/Volumes/DATA/local-models/projects/TensorFold/models/mlx-community/Qwen3.8-27B-4bit")
+    assert qwen["draft_dir"] == (
+        "/Volumes/DATA/local-models/projects/TensorFold/models/incoai/Qwen3.8-27B-DFlash2")
+    expected = {
+        "macos-qwen36-35b": (
+            "mlx-community/Qwen3.6-35B-A3B-4bit", "incoai/Qwen3.6-35B-A3B-DFlash2", "mlx"),
+        "macos-ornith-15-122b": (
+            "ornith-ai/Ornith-1.5-122B-MLX-4bit", "incoai/Ornith-1.5-122B-DFlash2", "mlx"),
+        "macos-qwen38-flash-next": (
+            "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:Q2_0",
+            "incoai/Qwen3.8-Flash-Next-DFlash2", "gguf"),
+        "macos-flint": ("unsloth/flint-GGUF:UD-Q4_K_XL", "incoai/Flint-DFlash2", "gguf"),
+    }
+    root = "/Volumes/DATA/local-models/splash"
+    for mid, (model_id, draft, fmt) in expected.items():
+        row = models[mid]
+        assert (row["model"], row["draft_model"], row["format"]) == (model_id, draft, fmt)
+        assert row["model_dir"] == f"{root}/{macos.repo_name(model_id)}"
+        assert row["draft_dir"] == f"{root}/{draft}"
+    for mid in models:
+        argv = macos.serve_argv(EXAMPLE, mid)
+        assert [arg for arg in argv if arg.startswith("--")] == [
+            "--model", "--model-dir", "--draft-model", "--host", "--port"]
+        assert "8000" not in argv
+    row = MEASURED["macos-qwen38-27b"]
+    assert row["manual"] is True
+    assert row["measured_at"] == "2026-11-13"
+    assert row["splash_version"] == "1.6.1"
+    assert row["single_stream_tokens_per_second"] == 171
+    assert row["single_stream_ttft_seconds"] == 0.125
+    assert row["ttft_kind"] == "cached"
+    assert row["prefill_tokens_per_second"] == 544
+    assert row["prefill_prompt_tokens"] == 19000
+    assert row["prefill_approximate"] is True
+    assert (row["concurrent_streams"], row["concurrent_aggregate_tokens_per_second"]) == (4, 192)
+    items = {item["id"]: item for item in macos.catalog(EXAMPLE, MEASURED)}
+    assert items["macos-qwen38-27b"]["performance"]["single_stream_tokens_per_second"] == 171
+    assert items["macos-qwen38-27b"]["ranking"]["best"] is True
+    for mid in ("macos-qwen36-35b", "macos-ornith-15-122b", "macos-qwen38-flash-next", "macos-flint"):
+        assert items[mid]["performance"] is None and items[mid]["ranking"] is None
+
+
+def test_manual_measurements_survive_summarize_until_a_protocol_row_exists():
+    from tools import catalog_tps_bench as bench
+    manual = {"macos-qwen38-27b": {"manual": True, "single_stream_tokens_per_second": 171}}
+    protocol = {"ds4": {"single_stream_tokens_per_second": 39.6}}
+    merged = bench.merge_measurements(protocol, manual)
+    assert merged["macos-qwen38-27b"]["manual"] is True
+    assert merged["ds4"]["single_stream_tokens_per_second"] == 39.6
+    protocol["macos-qwen38-27b"] = {"single_stream_tokens_per_second": 180}
+    replaced = bench.merge_measurements(protocol, manual)
+    assert replaced["macos-qwen38-27b"] == {"single_stream_tokens_per_second": 180}
+
+
+def test_cli_registers_macos(monkeypatch, tmp_path, capsys):
+    import importlib.machinery
+    import importlib.util
+    loader = importlib.machinery.SourceFileLoader("macos_cli", str(ROOT / "spark-serve"))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    cli = importlib.util.module_from_spec(spec)
+    loader.exec_module(cli)
+    parser = cli.build_parser()
+    args = parser.parse_args(["macos", "list", "--json"])
+    assert args.cmd == "macos" and args.macos_cmd == "list" and args.json
+    monkeypatch.setattr(cli, "load", lambda: {"macos": {"models": {}}})
+    with pytest.raises(SystemExit) as raised:
+        cli.main(["macos", "status", "--json"])
+    assert raised.value.code == 1
+    assert "no [macos] models" in capsys.readouterr().out

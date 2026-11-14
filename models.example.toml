@@ -548,3 +548,115 @@ modalities = ["text"]
 outputs = ["embeddings"]
 embedding_dims = 1024
 notes = "llama.cpp b11849 (ROCm) llama-server --embedding --pooling last under systemd (Restart=always, linger), not halo-ctl. OpenAI /v1/embeddings on :8081 for Pascal weekly_00 (replaced text-embedding-3-large); no API key. 1,024-dimension vectors (checked 2026-11-05). Added 2026-11-04."
+
+# This Mac Studio (Mac15,14, M3 Ultra, 512 GB unified memory). Splash serves
+# one model per process: `splash serve` (brew install incoai/tap/splash),
+# OpenAI-compatible. Splash's own default port is 8000; that port is a live
+# oMLX server, so every card uses another port and spark-serve never binds or
+# stops anything on 8000. model_dir and draft_dir are the local weights.
+# On-disk status is whether those paths exist. Omit either path to use
+# <weights_root>/<OWNER>/<REPO> (a GGUF :VARIANT is not part of the directory).
+# Flags are only those Splash documents: --model, --model-dir, --draft-model,
+# --host, --port, and --mmproj when a card sets it.
+[macos]
+name = "Mac Studio"
+product = "Mac15,14"
+chip = "M3 Ultra"
+memory_gb = 512
+host = "127.0.0.1"
+splash = "splash"
+weights_root = "/Volumes/DATA/local-models/splash"
+reserved_ports = [8000]             # oMLX; always reserved even if this list changes
+
+[macos.models.macos-qwen38-27b]
+label = "Qwen3.8-27B"
+aliases = ["qwen38-27b", "qwen3.8-27b"]
+model = "mlx-community/Qwen3.8-27B-4bit"          # splash --model; the API's model id
+format = "mlx"                                     # MLX 4-bit; GGUF also loads (unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M)
+draft_model = "incoai/Qwen3.8-27B-DFlash2"         # family's DFlash2 draft (install/families.py)
+# Hugging Face repo ids under the TensorFold models root. Rename these two
+# fields if the folders on disk use different names.
+model_dir = "/Volumes/DATA/local-models/projects/TensorFold/models/mlx-community/Qwen3.8-27B-4bit"
+draft_dir = "/Volumes/DATA/local-models/projects/TensorFold/models/incoai/Qwen3.8-27B-DFlash2"
+port = 8101
+max_model_len = 262144                             # Splash native window (256K = 262,144); no --max-context passed
+quant = "MLX 4-bit"
+quant_bits = 4
+quant_scope = "all"
+quant_detail = "mlx-community MLX affine 4-bit, group 64, the checkpoint Splash documents for Qwen3.8-27B. The DFlash2 draft is incoai/Qwen3.8-27B-DFlash2 (BF16 safetensors) and is not part of the served weights."
+modalities = ["text", "image"]
+hermes_supports_vision = true
+hermes_provider = "splash"
+notes = "Splash on this Mac Studio. Measured 2026-11-13 with Splash 1.6.1: decode 171 tok/s, prefill about 544 tok/s on a 19K prompt, cached TTFT 0.125 s, 4 concurrent 192 tok/s aggregate. Local MLX weights and draft; splash serve uses --model-dir and --draft-model on 127.0.0.1:8101. Port 8000 is oMLX and is never used."
+
+[macos.models.macos-qwen36-35b]
+label = "Qwen3.6-35B-A3B"
+aliases = ["qwen36-35b", "qwen3.6-35b-a3b"]
+model = "mlx-community/Qwen3.6-35B-A3B-4bit"
+format = "mlx"                                     # GGUF also loads (unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M)
+draft_model = "incoai/Qwen3.6-35B-A3B-DFlash2"
+model_dir = "/Volumes/DATA/local-models/splash/mlx-community/Qwen3.6-35B-A3B-4bit"
+draft_dir = "/Volumes/DATA/local-models/splash/incoai/Qwen3.6-35B-A3B-DFlash2"
+port = 8102
+max_model_len = 262144
+quant = "MLX 4-bit"
+quant_bits = 4
+quant_scope = "all"
+quant_detail = "mlx-community MLX 4-bit, the checkpoint Splash's model table lists for Qwen3.6-35B-A3B. Draft incoai/Qwen3.6-35B-A3B-DFlash2."
+modalities = ["text", "image"]
+hermes_supports_vision = true
+hermes_provider = "splash"
+notes = "Unmeasured. Weights download to the splash directory above (the Hugging Face repo id). Start stays off until both paths exist, then runs splash serve on 127.0.0.1:8102 only."
+
+[macos.models.macos-ornith-15-122b]
+label = "Ornith-1.5-122B"
+aliases = ["ornith", "ornith-1.5-122b"]
+model = "ornith-ai/Ornith-1.5-122B-MLX-4bit"       # family Qwen3.5-122B-A10B; GGUF: unsloth/Ornith-1.5-122B-GGUF:UD-Q4_K_XL
+format = "mlx"
+draft_model = "incoai/Ornith-1.5-122B-DFlash2"
+model_dir = "/Volumes/DATA/local-models/splash/ornith-ai/Ornith-1.5-122B-MLX-4bit"
+draft_dir = "/Volumes/DATA/local-models/splash/incoai/Ornith-1.5-122B-DFlash2"
+port = 8103
+max_model_len = 262144
+quant = "MLX 4-bit"
+quant_bits = 4
+quant_scope = "all"
+quant_detail = "ornith-ai MLX 4-bit, including its vision tower. Splash treats Ornith-1.5-122B as the Qwen3.5-122B-A10B family. Draft incoai/Ornith-1.5-122B-DFlash2."
+modalities = ["text", "image"]
+hermes_supports_vision = true
+hermes_provider = "splash"
+notes = "Unmeasured. splash serve on 127.0.0.1:8103 once both directories exist. --language-only is not passed, so the MLX vision tower loads."
+
+[macos.models.macos-qwen38-flash-next]
+label = "Qwen3.8-Flash-Next"
+aliases = ["qwen38-flash-next", "flash-next"]
+model = "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:Q2_0"   # MLX checkpoints of Flash-Next do not run on Splash
+format = "gguf"
+draft_model = "incoai/Qwen3.8-Flash-Next-DFlash2"
+model_dir = "/Volumes/DATA/local-models/splash/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF"
+draft_dir = "/Volumes/DATA/local-models/splash/incoai/Qwen3.8-Flash-Next-DFlash2"
+port = 8104
+max_model_len = 262144
+quant = "Q2_0"
+quant_bits = 2
+quant_scope = "all"
+quant_detail = "ISTA-DASLab GGUF Q2_0, the variant in Splash's model table. The directory is the Hugging Face repo; --model carries the :Q2_0 variant. No --mmproj, so this GGUF serves text only. Draft incoai/Qwen3.8-Flash-Next-DFlash2."
+modalities = ["text"]
+hermes_provider = "splash"
+notes = "Unmeasured. GGUF only. Point model_dir at the Q2_0 file if the repo directory holds more than one variant. Served on 127.0.0.1:8104."
+
+[macos.models.macos-flint]
+label = "Flint"
+aliases = ["flint"]
+model = "unsloth/flint-GGUF:UD-Q4_K_XL"            # MLX checkpoints of Flint do not run on Splash
+format = "gguf"
+draft_model = "incoai/Flint-DFlash2"
+model_dir = "/Volumes/DATA/local-models/splash/unsloth/flint-GGUF"
+draft_dir = "/Volumes/DATA/local-models/splash/incoai/Flint-DFlash2"
+port = 8105
+max_model_len = 262144                             # Flint's native window is its maximum; a longer --max-context refuses to start
+quant = "UD-Q4_K_XL"
+quant_detail = "Unsloth mixed-precision GGUF UD-Q4_K_XL, the variant Splash's model table serves. Not a uniform bit width. Flint is text only (no vision tower) and decides when to reason; reasoning settings cannot force it. Draft incoai/Flint-DFlash2."
+modalities = ["text"]
+hermes_provider = "splash"
+notes = "Unmeasured. GGUF only, text only. Served on 127.0.0.1:8105. Point model_dir at the UD-Q4_K_XL file if the repo directory holds more than one variant."

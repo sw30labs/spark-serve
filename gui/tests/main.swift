@@ -234,3 +234,35 @@ check(svcStore.hermesEndpoint(svcChoices[0]) == StrixHermesEndpoint(host: "two",
 check(svcStore.hermesArguments(svcChoices[0], target: .spark) == ["strix", "use", "svc-llm", "--box", "two", "--hermes-target", "spark", "--json"], "Service Hermes arguments name its box and the Spark target")
 check(svcStore.hermesEndpoint(svcChoices[1])?.model == "embed", "The embedding service is its own Hermes endpoint")
 print("Strix always-on services smoke passed (ADR 0019).")
+
+let standardPerf = try decoder.decode(ModelPerformance.self, from: Data(#"{"measured_at":"2026-10-19","single_stream_tokens_per_second":39.672,"single_stream_ttft_seconds":0.5293,"concurrent_streams":2,"concurrent_aggregate_tokens_per_second":63.093}"#.utf8))
+check(ModelCardFacts.speedDetail(standardPerf) == "Measured 2026-10-19, 512-token prompt, 256 output tokens, thinking off · first token 0.53s · 2 streams: 63.1 tok/s total", "Catalog-protocol tooltip is unchanged")
+check(ModelCardFacts.measurementCaption(standardPerf) == ["2 streams: 63.1 tok/s · measured 2026-10-19"], "Catalog-protocol cards keep a single measurement line")
+let splashPerf = try decoder.decode(ModelPerformance.self, from: Data(#"{"measured_at":"2026-11-13","single_stream_tokens_per_second":171,"single_stream_ttft_seconds":0.125,"ttft_kind":"cached","prefill_tokens_per_second":544,"prefill_prompt_tokens":19000,"prefill_approximate":true,"concurrent_streams":4,"concurrent_aggregate_tokens_per_second":192,"protocol_note":"Splash 1.6.1 on Mac15,14 (M3 Ultra, 512 GB unified memory); not the 512-token catalog protocol"}"#.utf8))
+check(ModelCardFacts.speedTitle(splashPerf.single_stream_tokens_per_second) == "171 tok/s", "Splash decode shows on the speed pill")
+check(ModelCardFacts.prefillTitle(splashPerf) == "Prefill about 544 tok/s on a 19K prompt", "Splash prefill names the 19K prompt")
+check(ModelCardFacts.measurementCaption(splashPerf) == [
+    "4 streams: 192 tok/s · measured 2026-11-13",
+    "Prefill about 544 tok/s on a 19K prompt",
+    "Cached TTFT 0.125 s",
+], "Splash card shows decode aggregate, prefill, and cached TTFT")
+let splashDetail = ModelCardFacts.speedDetail(splashPerf)
+check(splashDetail.contains("Splash 1.6.1") && splashDetail.contains("cached first token 0.125s") && !splashDetail.contains("512-token prompt"), "Splash tooltip does not claim the catalog protocol")
+check(ModelCardFacts.runtimeTitle(wrapper: "splash") == "Splash" && ModelCardFacts.sparkTitle(topology: "macos") == "Mac Studio", "Splash cards name the runtime and this Mac")
+let macosJSON = #"{"machine":{"name":"Mac Studio","product":"Mac15,14","chip":"M3 Ultra","memory_gb":512},"host":"127.0.0.1","reserved_ports":[8000],"splash":"splash","models":[{"id":"macos-qwen38-27b","label":"Qwen3.8-27B","phase":"stopped","port":8101,"host":"127.0.0.1","model":"mlx-community/Qwen3.8-27B-4bit","format":"mlx","draft_model":"incoai/Qwen3.8-27B-DFlash2","model_dir":"/weights","draft_dir":"/draft","model_on_disk":true,"draft_on_disk":false,"on_disk":false,"port_busy":false},{"id":"macos-flint","label":"Flint","phase":"ready","port":8105,"host":"127.0.0.1","url":"http://127.0.0.1:8105/v1","model":"unsloth/flint-GGUF:UD-Q4_K_XL","model_dir":"/flint","draft_dir":"/flint-draft","model_on_disk":true,"draft_on_disk":true,"on_disk":true,"pid":42}]}"#
+let macosSite = try decoder.decode(MacOSSite.self, from: Data(macosJSON.utf8))
+let qwenServer = macosSite.models[0]
+let flintServer = macosSite.models[1]
+check(macosSite.reserved_ports == [8000] && macosSite.machine.product == "Mac15,14" && macosSite.machine.memory_gb == 512, "MacOS status names the machine and the reserved port")
+check(MacOSFacts.diskNote(qwenServer) == "Draft not on disk yet" && !MacOSFacts.canStart(qwenServer), "A missing draft stays not on disk and cannot start")
+check(MacOSFacts.blocker(qwenServer) == "Draft not on disk yet", "Start says which path is missing")
+check(MacOSFacts.canStop(flintServer) && flintServer.port != MacOSFacts.reservedPort, "Stop is offered only for the card's own ready process")
+var reserved = flintServer
+reserved = MacOSServer(id: flintServer.id, label: flintServer.label, phase: "ready", port: 8000, host: flintServer.host, url: flintServer.url, model: flintServer.model, format: nil, draft_model: nil, model_dir: flintServer.model_dir, draft_dir: flintServer.draft_dir, model_on_disk: true, draft_on_disk: true, on_disk: true, pid: 9, port_busy: nil, error: nil)
+check(!MacOSFacts.canStart(reserved) && !MacOSFacts.canStop(reserved) && MacOSFacts.blocker(reserved)?.contains("8000") == true, "Port 8000 is never started or stopped")
+let macosStore = MacOSStore(poll: false)
+macosStore.models = [ModelEntry(id: "macos-flint", label: "Flint", aliases: [], served_name: "unsloth/flint-GGUF:UD-Q4_K_XL", ctx: 262144, image: "flint", notes: "", wrapper: "splash", hermes_provider: "splash", backend: "splash", topology: "macos")]
+macosStore.apply(macosSite)
+check(macosStore.hermesArguments("macos-flint", target: .local) == ["macos", "use", "macos-flint", "--hermes-target", "local", "--json"], "A ready Splash card can be handed to Hermes on this Mac")
+check(macosStore.hermesArguments("macos-qwen38-27b", target: .spark) == nil, "A stopped card is not offered to Hermes")
+print("MacOS Splash smoke passed (ADR 0020).")

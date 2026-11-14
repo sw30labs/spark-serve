@@ -123,6 +123,26 @@ def summarize_runs(runs):
     return out
 
 
+def preserved_manual(path=OUT) -> dict:
+    """Rows entered by hand (`manual: true`). A later protocol pair replaces one of the same id."""
+    try:
+        doc = json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return {}
+    models = doc.get("models")
+    if not isinstance(models, dict):
+        return {}
+    return {key: row for key, row in models.items() if isinstance(row, dict) and row.get("manual") is True}
+
+
+def merge_measurements(measured: dict, manual: dict) -> dict:
+    """Protocol rows win. A manual row stays until a protocol row exists for that id."""
+    out = dict(measured)
+    for key, row in manual.items():
+        out.setdefault(key, row)
+    return out
+
+
 def write_summary():
     from spark_serve_benchmarks import list_benchmarks
     runs = list_benchmarks({})
@@ -132,7 +152,7 @@ def write_summary():
                                               "Strix: halo-ctl switch per model on the chosen box",
                      "settle_seconds": SETTLE_SECONDS,
                      "headline": "p50 completion tokens/s per request, end to end (server usage tokens)"},
-        "models": summarize_runs(runs),
+        "models": merge_measurements(summarize_runs(runs), preserved_manual()),
     }
     OUT.write_text(json.dumps(doc, indent=2) + "\n")
     log(f"wrote {OUT} ({len(doc['models'])} models)")
@@ -143,7 +163,8 @@ def _check_contexts(measured):
     """Flag catalog contexts that differ from what the engine served."""
     import tomllib
     catalog = tomllib.loads((ROOT / "models.toml").read_text())
-    entries = {**catalog.get("models", {}), **(catalog.get("strix") or {}).get("models", {})}
+    entries = {**catalog.get("models", {}), **(catalog.get("strix") or {}).get("models", {}),
+               **(catalog.get("macos") or {}).get("models", {})}
     for model, row in sorted(measured.items()):
         served, listed = row.get("served_context"), (entries.get(model) or {}).get("max_model_len")
         if served and listed and int(served) != int(listed):

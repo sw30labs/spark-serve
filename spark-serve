@@ -50,6 +50,7 @@ _ensure_python_311()
 import tomllib
 
 from spark_serve_ranking import modalities, score_models
+from spark_serve_macos import add_parser as macos_add_parser, main as macos_main
 from spark_serve_strix import add_parser as strix_add_parser, main as strix_main
 from spark_serve_controller import (
     Controller,
@@ -1089,7 +1090,7 @@ def _example_models(table: str = "models") -> dict:
 def catalog_freshness(cfg: dict, performance: dict, table: str = "models") -> dict:
     """Per-entry {"updated", "updated_source"}; see spark_serve_freshness. Never fails the list.
 
-    table="strix.models" dates the [strix.models.*] cards with the same rules.
+    table="strix.models" or "macos.models" dates that section's cards with the same rules.
     """
     try:
         live = cfg
@@ -2428,6 +2429,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="read the sudo password from stdin; not stored. Used only on hosts without passwordless systemctl",
     )
     strix_add_parser(sub)
+    macos_add_parser(sub)
     return p
 
 
@@ -2444,6 +2446,10 @@ def main(argv: list[str] | None = None) -> None:
         performance = measured_performance()
         dates = catalog_freshness(cfg, performance, "strix.models") if args.strix_cmd == "list" else {}
         sys.exit(strix_main(cfg, args, performance, dates, hermes_patch=_hermes_patch))
+    if args.cmd == "macos":
+        performance = measured_performance()
+        dates = catalog_freshness(cfg, performance, "macos.models") if args.macos_cmd == "list" else {}
+        sys.exit(macos_main(cfg, args, performance, dates, hermes_patch=_hermes_patch))
     if args.cmd == "list":
         if args.json:
             cmd_list_json(cfg)
