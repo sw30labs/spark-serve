@@ -567,6 +567,12 @@ host = "127.0.0.1"
 splash = "splash"
 weights_root = "/Volumes/DATA/local-models/splash"
 reserved_ports = [8000]             # oMLX; always reserved even if this list changes
+# Splash writes serve-<port>.json ({"pid", "phase"}) under this directory
+# after `splash serve` detaches. Default is
+# ~/Library/Application Support/Splash/runtime. Set this only when
+# --serve-record points somewhere else. A value containing {port} is the
+# whole path.
+# serve_record_dir = "~/Library/Application Support/Splash/runtime"
 # `macos use <id>` points Hermes at a Splash card that is already ready
 # (provider splash, unless the card sets hermes_provider). The base URL is
 # http://127.0.0.1:<port>/v1 and the served model id is `model` (splash --model).

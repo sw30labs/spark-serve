@@ -5,6 +5,8 @@ import importlib.util
 import json
 import os
 import stat
+import sys
+import time
 import tomllib
 from pathlib import Path
 
@@ -555,3 +557,375 @@ def test_cli_registers_macos(monkeypatch, tmp_path, capsys):
         cli.main(["macos", "status", "--json"])
     assert raised.value.code == 1
     assert "no [macos] models" in capsys.readouterr().out
+
+
+def _kill_group(pid: int) -> None:
+    if pid <= 0 or not macos._alive(pid):
+        return
+    try:
+        os.killpg(pid, 15)
+    except OSError:
+        return
+    for _ in range(50):
+        if not macos._alive(pid):
+            return
+        time.sleep(0.05)
+    try:
+        os.killpg(pid, 9)
+    except OSError:
+        pass
+
+
+def _wait_argv(pid: int, model: str) -> list[str]:
+    for _ in range(50):
+        argv = macos.process_argv(pid) or []
+        if macos._flag(argv, "--model") == model and macos._alive(pid):
+            return argv
+        time.sleep(0.02)
+    raise AssertionError(f"pid {pid} did not show --model {model}")
+
+
+def detached_server(tmp_path, model: str, port: int, record_dir: Path, phase: str = "ready"):
+    """A live process with the detached Splash argv shape: --model and --port, no --model-dir."""
+    record_dir.mkdir(parents=True, exist_ok=True)
+    script = tmp_path / f"detached-{port}.py"
+    script.write_text("import time\ntime.sleep(300)\n")
+    record = record_dir / f"serve-{port}.json"
+    proc = macos.subprocess.Popen(
+        [sys.executable, str(script), "-m", "server.server",
+         "--model", model, "--binary", "splash", "--port", str(port),
+         "--serve-record", str(record)],
+        start_new_session=True,
+        stdout=macos.subprocess.DEVNULL,
+        stderr=macos.subprocess.DEVNULL,
+    )
+    record.write_text(json.dumps({"pid": proc.pid, "phase": phase}))
+    _wait_argv(proc.pid, model)
+    return proc
+
+
+def handoff_splash(tmp_path, record_dir: Path) -> str:
+    """A splash launcher that starts a detached server, writes the serve record, and exits."""
+    record_dir.mkdir(parents=True, exist_ok=True)
+    server = tmp_path / "detached_server.py"
+    server.write_text("import time\ntime.sleep(300)\n")
+    path = tmp_path / "splash"
+    script = """#!/usr/bin/env python3
+import json, os, subprocess, sys
+port = sys.argv[sys.argv.index("--port") + 1]
+model = sys.argv[sys.argv.index("--model") + 1]
+record_dir = __RECORD_DIR__
+os.makedirs(record_dir, exist_ok=True)
+record = os.path.join(record_dir, "serve-" + port + ".json")
+proc = subprocess.Popen(
+    [__PYTHON__, __SERVER__, "-m", "server.server",
+     "--model", model, "--binary", "splash", "--port", port, "--serve-record", record],
+    start_new_session=True,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+)
+temporary = record + ".tmp"
+with open(temporary, "w") as out:
+    json.dump({"pid": proc.pid, "phase": "ready"}, out)
+os.replace(temporary, record)
+raise SystemExit(0)
+"""
+    path.write_text(
+        script.replace("__RECORD_DIR__", repr(str(record_dir)))
+        .replace("__PYTHON__", repr(sys.executable))
+        .replace("__SERVER__", repr(str(server)))
+    )
+    path.chmod(path.stat().st_mode | stat.S_IEXEC)
+    return str(path)
+
+
+def test_ready_matches_the_listed_model_id(monkeypatch):
+    class Body:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def read(self, _limit):
+            return self.payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    opened = []
+
+    def urlopen(request, timeout=0):
+        opened.append(request.full_url)
+        body = b'{"data":[{"id":"mlx-community/Qwen3.8-27B-4bit-extra","max_model_len":262144}]}'
+        return Body(body)
+
+    monkeypatch.setattr(macos.urllib.request, "urlopen", urlopen)
+    assert macos._listed_models("127.0.0.1", 8000, {8000}) is None
+    assert macos._ready("127.0.0.1", 8000, "mlx-community/Qwen3.8-27B-4bit") is False
+    assert opened == []
+    assert macos._listed_models("127.0.0.1", 28101) == ["mlx-community/Qwen3.8-27B-4bit-extra"]
+    assert macos._ready("127.0.0.1", 28101, "mlx-community/Qwen3.8-27B-4bit") is False
+    assert macos._ready("127.0.0.1", 28101, "mlx-community/Qwen3.8-27B-4bit-extra") is True
+    assert all(":8000" not in url for url in opened)
+
+
+def test_dead_launcher_adopts_the_serve_record(state, tmp_path, monkeypatch):
+    port = 28151
+    cfg = card(port=port)
+    lay_down(tmp_path, cfg)
+    record_dir = tmp_path / "runtime"
+    cfg["macos"]["serve_record_dir"] = str(record_dir)
+    model = cfg["macos"]["models"]["m"]
+    model_id = model["model"]
+    proc = detached_server(tmp_path, model_id, port, record_dir)
+    launcher_argv = macos.serve_argv(cfg, "m", "/opt/splash")
+    live = macos.process_argv(proc.pid)
+    assert macos._flag(live, "--model-dir") is None
+    assert macos._flag(live, "--draft-model") is None
+    assert macos._flag(live, "--host") is None
+    assert macos._same_server(live, launcher_argv) is False
+    dead = macos.subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    assert dead.pid != proc.pid and not macos._alive(dead.pid)
+    macos._remember("m", {
+        "pid": dead.pid, "port": port, "argv": launcher_argv, "started": "launcher-token",
+    })
+    try:
+        reserved = macos.reserved_ports(cfg)
+        starting = macos.server_view(cfg, "m", model, reserved)
+        assert starting["phase"] == "starting" and starting["pid"] == proc.pid
+        monkeypatch.setattr(
+            macos, "_listed_models",
+            lambda host, probed, reserved=None: None if probed == 8000 else [model_id])
+        view = macos.server_view(cfg, "m", model, reserved)
+        assert view["phase"] == "ready" and view["pid"] == proc.pid
+        assert view["url"] == f"http://127.0.0.1:{port}/v1"
+        saved = json.loads((tmp_path / "state" / "macos-servers.json").read_text())
+        assert saved["models"]["m"]["pid"] == proc.pid
+        assert saved["models"]["m"]["started"] == macos.process_started(proc.pid)
+        assert saved["models"]["m"]["started"]
+        assert "--model-dir" not in saved["models"]["m"]["argv"]
+        (record_dir / f"serve-{port}.json").unlink()
+        macos._remember("m", None)
+        scanned = macos.server_view(cfg, "m", model, reserved)
+        assert scanned["phase"] == "ready" and scanned["pid"] == proc.pid
+        signals = []
+        real_signal = macos._signal_group
+
+        def record(pid, sig):
+            signals.append(pid)
+            real_signal(pid, sig)
+
+        monkeypatch.setattr(macos, "_signal_group", record)
+        stopped = macos.stop(cfg, "m")
+        assert stopped["stopped"] is True and stopped["pid"] == proc.pid
+        assert signals == [proc.pid]
+        assert not macos._alive(proc.pid)
+    finally:
+        _kill_group(proc.pid)
+
+
+def test_up_records_the_detached_server_not_the_launcher(state, tmp_path, monkeypatch):
+    port = 28161
+    cfg = card(port=port)
+    lay_down(tmp_path, cfg)
+    record_dir = tmp_path / "runtime"
+    cfg["macos"]["serve_record_dir"] = str(record_dir)
+    cfg["macos"]["splash"] = handoff_splash(tmp_path, record_dir)
+    model_id = cfg["macos"]["models"]["m"]["model"]
+    monkeypatch.setattr(macos, "POLL_SECONDS", 0.05)
+    monkeypatch.setattr(macos, "HANDOFF_GRACE", 2)
+
+    def listed(host, probed, reserved=None):
+        if probed == 8000:
+            return None
+        record = record_dir / f"serve-{probed}.json"
+        return [model_id] if record.is_file() else None
+
+    monkeypatch.setattr(macos, "_listed_models", listed)
+    view = macos.up(cfg, "m", ready_timeout=5)
+    record = json.loads((record_dir / f"serve-{port}.json").read_text())
+    try:
+        assert view["phase"] == "ready"
+        assert view["pid"] == record["pid"]
+        live = macos.process_argv(view["pid"])
+        assert "server.server" in live
+        assert macos._same_server(live, macos.serve_argv(cfg, "m")) is False
+        saved = json.loads((tmp_path / "state" / "macos-servers.json").read_text())
+        assert saved["models"]["m"]["pid"] == record["pid"]
+        assert saved["models"]["m"]["started"] == macos.process_started(record["pid"])
+        assert "--model-dir" not in saved["models"]["m"]["argv"]
+        stopped = macos.stop(cfg, "m")
+        assert stopped["pid"] == record["pid"] and stopped["stopped"] is True
+        assert not macos._alive(record["pid"])
+    finally:
+        _kill_group(record["pid"])
+
+
+def test_up_stops_the_detached_server_if_it_never_serves(state, tmp_path, monkeypatch):
+    port = 28162
+    cfg = card(port=port)
+    lay_down(tmp_path, cfg)
+    record_dir = tmp_path / "runtime"
+    cfg["macos"]["serve_record_dir"] = str(record_dir)
+    cfg["macos"]["splash"] = handoff_splash(tmp_path, record_dir)
+    monkeypatch.setattr(macos, "POLL_SECONDS", 0.05)
+    monkeypatch.setattr(macos, "_listed_models", lambda *args, **kwargs: None)
+    signals = []
+    real_signal = macos._signal_group
+
+    def record(pid, sig):
+        signals.append(pid)
+        real_signal(pid, sig)
+
+    monkeypatch.setattr(macos, "_signal_group", record)
+    try:
+        with pytest.raises(macos.MacOSError, match="did not become ready"):
+            macos.up(cfg, "m", ready_timeout=0.6)
+        written = json.loads((record_dir / f"serve-{port}.json").read_text())
+        assert written["pid"] in signals
+        assert not macos._alive(written["pid"])
+    finally:
+        path = record_dir / f"serve-{port}.json"
+        if path.is_file():
+            _kill_group(json.loads(path.read_text()).get("pid") or 0)
+
+
+def test_up_adopts_a_running_server_instead_of_spawning(state, tmp_path, monkeypatch):
+    port = 28171
+    cfg = card(port=port)
+    lay_down(tmp_path, cfg)
+    record_dir = tmp_path / "runtime"
+    cfg["macos"]["serve_record_dir"] = str(record_dir)
+    model_id = cfg["macos"]["models"]["m"]["model"]
+    proc = detached_server(tmp_path, model_id, port, record_dir)
+    monkeypatch.setattr(
+        macos, "_listed_models",
+        lambda host, probed, reserved=None: None if probed == 8000 else [model_id])
+    spawned = []
+    real_popen = macos.subprocess.Popen
+
+    def track(*args, **kwargs):
+        spawned.append(args)
+        return real_popen(*args, **kwargs)
+
+    monkeypatch.setattr(macos.subprocess, "Popen", track)
+    try:
+        view = macos.up(cfg, "m")
+        assert spawned == []
+        assert view["phase"] == "ready" and view["pid"] == proc.pid
+    finally:
+        _kill_group(proc.pid)
+
+
+def test_serving_port_without_a_verified_pid_enables_hermes(state, tmp_path, monkeypatch):
+    port = 28181
+    cfg = card(port=port)
+    lay_down(tmp_path, cfg)
+    cfg["macos"]["serve_record_dir"] = str(tmp_path / "no-records")
+    model_id = cfg["macos"]["models"]["m"]["model"]
+    monkeypatch.setattr(macos, "_command_lines", lambda: [])
+
+    def listed(host, probed, reserved=None):
+        if probed == 8000:
+            raise AssertionError("probed 8000")
+        return [model_id]
+
+    monkeypatch.setattr(macos, "_listed_models", listed)
+    view = macos.server_view(cfg, "m", cfg["macos"]["models"]["m"], macos.reserved_ports(cfg))
+    assert view["phase"] == "ready" and view["pid"] is None
+    assert view["url"] == f"http://127.0.0.1:{port}/v1"
+    assert "Stop stays off" in view["error"]
+    assert macos._record("m") is None
+    result = macos.use(cfg, "m", "local", lambda *args, **kwargs: ("Hermes (Mac) now uses Qwen", True))
+    assert result["base_url"] == f"http://127.0.0.1:{port}/v1"
+    assert "8000" not in result["base_url"]
+    signals = []
+    monkeypatch.setattr(macos, "_signal_group", lambda pid, sig: signals.append(pid))
+    assert macos.stop(cfg, "m")["stopped"] is False
+    assert signals == []
+
+
+def test_port_serving_another_model_keeps_hermes_off(state, tmp_path, monkeypatch):
+    port = 28191
+    cfg = card(port=port)
+    lay_down(tmp_path, cfg)
+    cfg["macos"]["serve_record_dir"] = str(tmp_path / "no-records")
+    monkeypatch.setattr(macos, "_command_lines", lambda: [])
+
+    def listed(host, probed, reserved=None):
+        if probed == 8000:
+            raise AssertionError("probed 8000")
+        return ["other/model"]
+
+    monkeypatch.setattr(macos, "_listed_models", listed)
+    view = macos.server_view(cfg, "m", cfg["macos"]["models"]["m"], macos.reserved_ports(cfg))
+    assert view["phase"] == "busy" and view["pid"] is None and view["url"] is None
+    assert view["port_busy"] is True
+    assert "other/model" in view["error"] and "busy with another model" in view["error"]
+    called = []
+    with pytest.raises(macos.MacOSError, match="not ready"):
+        macos.use(cfg, "m", "local", lambda *args, **kwargs: called.append(True))
+    assert called == []
+    signals = []
+    monkeypatch.setattr(macos, "_signal_group", lambda pid, sig: signals.append(pid))
+    assert macos.stop(cfg, "m")["stopped"] is False
+    assert signals == []
+
+
+def test_port_8000_is_never_probed_or_signalled(state, tmp_path, monkeypatch):
+    port = 28201
+    cfg = card(port=port)
+    lay_down(tmp_path, cfg)
+    record_dir = tmp_path / "runtime"
+    record_dir.mkdir()
+    cfg["macos"]["serve_record_dir"] = str(record_dir)
+    model_id = cfg["macos"]["models"]["m"]["model"]
+    assert macos.serve_record_path(cfg, 8000) is None
+    script = tmp_path / "sleeper.py"
+    script.write_text("import time\ntime.sleep(300)\n")
+    proc = macos.subprocess.Popen(
+        [sys.executable, str(script), "-m", "server.server",
+         "--model", model_id, "--port", str(port), "--port", "8000",
+         "--serve-record", str(record_dir / "serve-8000.json")],
+        start_new_session=True,
+        stdout=macos.subprocess.DEVNULL,
+        stderr=macos.subprocess.DEVNULL,
+    )
+    (record_dir / f"serve-{port}.json").write_text(json.dumps({"pid": proc.pid, "phase": "ready"}))
+    (record_dir / "serve-8000.json").write_text("{this is not json")
+    opened = []
+
+    def urlopen(request, timeout=0):
+        opened.append(request.full_url)
+        raise OSError("closed")
+
+    monkeypatch.setattr(macos.urllib.request, "urlopen", urlopen)
+    binds = []
+
+    def busy(host, probed):
+        binds.append(probed)
+        if probed == 8000:
+            raise AssertionError("bound 8000")
+        return False
+
+    monkeypatch.setattr(macos, "_port_busy", busy)
+    signals = []
+    monkeypatch.setattr(macos, "_signal_group", lambda pid, sig: signals.append(pid))
+    try:
+        _wait_argv(proc.pid, model_id)
+        assert macos._listed_models("127.0.0.1", 8000, {8000}) is None
+        assert macos._ready("127.0.0.1", 8000, model_id) is False
+        view = macos.server_view(cfg, "m", cfg["macos"]["models"]["m"], macos.reserved_ports(cfg))
+        assert view["pid"] is None
+        assert view["phase"] == "stopped"
+        macos.status(cfg)
+        stopped = macos.stop(cfg, "m")
+        assert stopped["stopped"] is False
+        assert signals == []
+        assert macos._alive(proc.pid)
+        assert all(":8000" not in url for url in opened)
+        assert 8000 not in binds
+    finally:
+        _kill_group(proc.pid)
