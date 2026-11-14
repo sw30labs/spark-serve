@@ -434,6 +434,29 @@ their speeds use the same benchmark protocol as the Sparks but different
 hardware. Design notes: [Strix Halo analysis](docs/strix-halo-analysis.md) and
 [ADR 0013](docs/adr/0013-strix-halo-pair.md).
 
+### MacOS tab
+
+The **MacOS** tab serves models on this Mac Studio (Mac15,14, M3 Ultra, 512 GB
+unified memory) with [Splash](https://github.com/incoai/splash)
+(`brew install incoai/tap/splash`). Each card is its own `splash serve`
+process. Splash's default port is 8000; that port is a live oMLX server, so
+the cards use 8101–8105 and spark-serve never binds or stops anything on 8000.
+Start and Stop affect only that card's process. A card can start once both its
+`model_dir` and `draft_dir` exist. See [ADR 0020](docs/adr/0020-macos-splash-tab.md).
+
+```sh
+./spark-serve macos list
+./spark-serve macos status
+./spark-serve macos up macos-qwen38-27b
+./spark-serve macos stop macos-qwen38-27b
+```
+
+Qwen3.8-27B was measured on 2026-11-13 with Splash 1.6.1 (171 tok/s decode,
+about 544 tok/s prefill on a 19K prompt, 0.125 s cached TTFT, 192 tok/s
+aggregate at 4 concurrent). That row is marked manual in
+`measured-performance.json` because it is not the 512-token catalog protocol.
+The other four cards are unmeasured.
+
 ### Screenshots
 
 The Overview above was captured from the native app on

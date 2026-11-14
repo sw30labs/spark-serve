@@ -4,7 +4,7 @@ Dates come from sources that already exist, never from "now":
 
 - App: the commit date of the checkout's HEAD (plus short hash and branch).
   Not a git checkout -> the mtime of the spark-serve script.
-- Entry ([models.<id>] or, with table="strix.models", [strix.models.<id>]),
+- Entry ([models.<id>] or, with table="strix.models" / "macos.models", that section),
   first match wins:
   1. an explicit ``updated = 2026-10-30`` in the entry's models.toml table;
   2. the entry matches models.example.toml -> newest committer date among the

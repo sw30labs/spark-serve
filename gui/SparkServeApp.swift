@@ -215,6 +215,7 @@ struct ModelRanking: Codable {
 }
 
 /// Fixed-protocol decode measurement from tools/catalog_tps_bench.py.
+/// Optional fields carry a manual measurement that used a different prompt (ADR 0020).
 struct ModelPerformance: Codable {
     let measured_at: String
     let single_stream_tokens_per_second: Double?
@@ -222,6 +223,12 @@ struct ModelPerformance: Codable {
     let concurrent_streams: Int
     let concurrent_aggregate_tokens_per_second: Double?
     var served_context: Int? = nil
+    var prefill_tokens_per_second: Double? = nil
+    var prefill_prompt_tokens: Int? = nil
+    var prefill_approximate: Bool? = nil
+    /// "cached" when single_stream_ttft_seconds is a cached time to first token.
+    var ttft_kind: String? = nil
+    var protocol_note: String? = nil
 }
 
 enum ModelFamily: String, CaseIterable, Identifiable {
@@ -1211,6 +1218,7 @@ struct SparkServeApp: App {
     @StateObject private var runner = CLIRunner()
     // One Strix store for the window and the menu bar, read even with no window open.
     @StateObject private var strix = StrixStore(poll: true)
+    @StateObject private var macos = MacOSStore(poll: true)
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 
     var body: some Scene {
@@ -1218,6 +1226,7 @@ struct SparkServeApp: App {
             MainView()
                 .environmentObject(runner)
                 .environmentObject(strix)
+                .environmentObject(macos)
                 .frame(minWidth: 900, minHeight: 660)
         }
         .windowStyle(.titleBar)
@@ -1227,6 +1236,7 @@ struct SparkServeApp: App {
             MenuBarView()
                 .environmentObject(runner)
                 .environmentObject(strix)
+                .environmentObject(macos)
         } label: {
             MenuBarLabel()
                 .environmentObject(runner)
@@ -1268,6 +1278,7 @@ struct MenuBarLabel: View {
 struct MenuBarView: View {
     @EnvironmentObject var runner: CLIRunner
     @EnvironmentObject var strix: StrixStore
+    @EnvironmentObject var macos: MacOSStore
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -1348,6 +1359,7 @@ struct MenuBarView: View {
             .disabled(runner.isBusy)
 
             StrixMenuSection(store: strix)
+            MacOSMenuSection(store: macos)
 
             Divider()
 
@@ -1384,6 +1396,7 @@ struct MainView: View {
     @State private var confirmCancelJobs = false
     @State private var selectedTab = "overview"
     @EnvironmentObject var strix: StrixStore
+    @EnvironmentObject var macos: MacOSStore
 
     var body: some View {
         VStack(spacing: 12) {
@@ -1392,6 +1405,7 @@ struct MainView: View {
                 Text("Overview").tag("overview")
                 Text("NVIDIA DGX Spark").tag("models")
                 Text("AMD Strix Halo").tag("strix")
+                Text("MacOS").tag("macos")
             }
             .pickerStyle(.segmented)
             Divider()
@@ -1399,6 +1413,8 @@ struct MainView: View {
                 OverviewView(telemetry: runner.telemetry, strix: strix)
             } else if selectedTab == "strix" {
                 StrixView(store: strix)
+            } else if selectedTab == "macos" {
+                MacOSView(store: macos)
             } else {
               ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
@@ -1426,8 +1442,8 @@ struct MainView: View {
         }
         .padding(16)
         .safeAreaInset(edge: .bottom, spacing: 0) {
-            ActivityTicker(items: TickerFacts.items(runner.logEntries, strix.logEntries),
-                           history: TickerFacts.history(runner.logEntries, strix.logEntries))
+            ActivityTicker(items: TickerFacts.items(runner.logEntries, strix.logEntries, macos.logEntries),
+                           history: TickerFacts.history(runner.logEntries, strix.logEntries, macos.logEntries))
         }
         .confirmationDialog("Cancel active YuE renders and stop?", isPresented: $confirmCancelJobs) {
             Button("Cancel renders and stop", role: .destructive) { runner.stop(cancelJobs: true) }
@@ -1952,6 +1968,7 @@ enum ModelCardFacts {
         case "yue": return "YuE"
         case "batch": return "Batch CLI"
         case "service": return "llama.cpp · systemd"
+        case "splash": return "Splash"
         default: return wrapper
         }
     }
@@ -1982,6 +1999,7 @@ enum ModelCardFacts {
         case "distributed": return "2 Sparks"
         case "strix", "strix-service": return "Strix Halo"
         case "strix-cluster": return "2 Strix Halos"
+        case "macos": return "Mac Studio"
         default: return nil
         }
     }
@@ -1996,6 +2014,7 @@ enum ModelCardFacts {
         case "cluster": return Color(red: 0.42, green: 0.84, blue: 0.70)
         case "lemonade": return Color(red: 0.98, green: 0.86, blue: 0.30)
         case "yue": return Color(red: 0.96, green: 0.45, blue: 0.62)
+        case "splash": return Color(red: 0.35, green: 0.55, blue: 0.95)
         default: return Color(red: 0.62, green: 0.66, blue: 0.72)
         }
     }
@@ -2005,12 +2024,51 @@ enum ModelCardFacts {
         return tps >= 100 ? "\(Int(tps.rounded())) tok/s" : String(format: "%.1f tok/s", tps)
     }
 
+    static func prefillTitle(_ p: ModelPerformance) -> String? {
+        guard let tps = p.prefill_tokens_per_second, let speed = speedTitle(tps) else { return nil }
+        let about = p.prefill_approximate == true ? "about " : ""
+        let prompt: String
+        if let tokens = p.prefill_prompt_tokens, tokens > 0 {
+            let size = tokens >= 1000 ? "\(tokens / 1000)K" : "\(tokens)"
+            prompt = " on a \(size) prompt"
+        } else {
+            prompt = ""
+        }
+        return "Prefill \(about)\(speed)\(prompt)"
+    }
+
+    /// Lines under the pills. The concurrent line is the catalog protocol's;
+    /// prefill and cached TTFT appear only when that measurement recorded them.
+    static func measurementCaption(_ p: ModelPerformance) -> [String] {
+        var lines: [String] = []
+        if let total = speedTitle(p.concurrent_aggregate_tokens_per_second) {
+            lines.append("\(p.concurrent_streams) streams: \(total) · measured \(p.measured_at)")
+        }
+        if let prefill = prefillTitle(p) { lines.append(prefill) }
+        if p.ttft_kind == "cached", let ttft = p.single_stream_ttft_seconds {
+            lines.append(String(format: "Cached TTFT %.3f s", ttft))
+        }
+        return lines
+    }
+
     static func speedDetail(_ p: ModelPerformance) -> String {
-        var parts = ["Measured \(p.measured_at), 512-token prompt, 256 output tokens, thinking off"]
-        if let ttft = p.single_stream_ttft_seconds { parts.append(String(format: "first token %.2fs", ttft)) }
+        var parts: [String] = []
+        if let note = p.protocol_note, !note.isEmpty {
+            parts.append("Measured \(p.measured_at), \(note)")
+        } else {
+            parts.append("Measured \(p.measured_at), 512-token prompt, 256 output tokens, thinking off")
+        }
+        if let ttft = p.single_stream_ttft_seconds {
+            if p.ttft_kind == "cached" {
+                parts.append(String(format: "cached first token %.3fs", ttft))
+            } else {
+                parts.append(String(format: "first token %.2fs", ttft))
+            }
+        }
         if let agg = speedTitle(p.concurrent_aggregate_tokens_per_second) {
             parts.append("\(p.concurrent_streams) streams: \(agg) total")
         }
+        if let prefill = prefillTitle(p) { parts.append(prefill) }
         return parts.joined(separator: " · ")
     }
 
@@ -2284,12 +2342,13 @@ struct ModelCard: View {
                         .help(ModelCardFacts.speedDetail(performance))
                 }
             }
-            if let performance = model.performance,
-               let total = ModelCardFacts.speedTitle(performance.concurrent_aggregate_tokens_per_second) {
-                Text("\(performance.concurrent_streams) streams: \(total) · measured \(performance.measured_at)")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+            if let performance = model.performance {
+                ForEach(ModelCardFacts.measurementCaption(performance), id: \.self) { line in
+                    Text(line)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
             }
             if let updated = FreshnessFacts.cardTitle(model) {
                 Text(updated)

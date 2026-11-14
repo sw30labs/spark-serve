@@ -237,6 +237,23 @@
         "6de5545634824d81acb0f86d946dccda",
         "e2830568f25b47f7b5f1b9c77fbbaed0"
       ]
+    },
+    "macos-qwen38-27b": {
+      "manual": true,
+      "measured_at": "2026-11-13",
+      "engine": "splash",
+      "splash_version": "1.6.1",
+      "machine": "Mac15,14",
+      "single_stream_tokens_per_second": 171,
+      "single_stream_ttft_seconds": 0.125,
+      "ttft_kind": "cached",
+      "prefill_tokens_per_second": 544,
+      "prefill_prompt_tokens": 19000,
+      "prefill_approximate": true,
+      "concurrent_streams": 4,
+      "concurrent_aggregate_tokens_per_second": 192,
+      "protocol_note": "Splash 1.6.1 on Mac15,14 (M3 Ultra, 512 GB unified memory); not the 512-token catalog protocol",
+      "reasoning_observed": false
     }
   }
 }

@@ -25,6 +25,7 @@ Dates below are record dates, not reconstructed approval dates. All are accepted
 | [0017](0017-batch-card-only-entries.md) | Show batch jobs as card-only catalog entries (superseded for runnable entries by 0018) |
 | [0018](0018-batch-jobs-spark-side-restore.md) | Run batch entries (Pika H3 Flex) with validate-before-stop and a Spark-side restore |
 | [0019](0019-strix-always-on-services.md) | Show always-on Strix services (systemd, outside halo-ctl) and leave their box alone |
+| [0020](0020-macos-splash-tab.md) | Serve this Mac Studio's Splash models on their own ports and never touch oMLX on :8000 |
 
 Keep ADRs short: context, decision, trade-off, evidence. Amend clarifications in
 place. For a changed decision, add a new numbered ADR and link the superseded
