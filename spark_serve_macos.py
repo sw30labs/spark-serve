@@ -16,9 +16,15 @@ nothing is marked permanently downloaded or missing.
 
 Start runs `splash serve` for that card only, with flags documented by Splash
 (README and docs/server.md): `--model`, `--model-dir`, `--draft-model`,
-`--host`, `--port`, and `--mmproj` when the card sets one. Stop signals only
-the process this module spawned for that card, and only after its command
-line still matches that card and names no reserved port.
+`--host`, `--port`, and `--mmproj` when the card sets one. Splash 1.6 then
+exits that launcher and leaves a detached server whose pid and phase are in
+``serve-<port>.json`` (``~/Library/Application Support/Splash/runtime`` by
+default, or ``[macos] serve_record_dir``). Status follows that process, or a
+process whose argv ``--port`` and ``--model`` match the card. Stop signals
+only that verified Splash process group, and only when it names no reserved
+port. A port that answers with this card's model but has no such process is
+shown as serving so Hermes can use it; Stop stays off. A port serving a
+different model is busy, and Hermes stays off.
 
 `macos use` points Hermes at a card that is already ready, through the same
 config write as Strix (`~/.hermes/config.yaml`, same keys, same atomic
@@ -59,6 +65,14 @@ READY_SECONDS = 1800
 POLL_SECONDS = 2
 STOP_SECONDS = 5
 PROBE_SECONDS = 2
+# Splash 1.6 writes serve-<port>.json here after the launcher exits.
+DEFAULT_SERVE_RECORD_DIR = "~/Library/Application Support/Splash/runtime"
+# `up` gives a still-running launcher this long to hand off, then keeps it.
+HANDOFF_GRACE = 0.2
+HANDOFF_SECONDS = 5
+UNVERIFIED_STOP = (
+    "This port is serving this model, but no Splash process could be verified. Stop stays off."
+)
 
 
 class MacOSError(RuntimeError):
@@ -184,17 +198,27 @@ def serve_argv(cfg: dict, mid: str, binary: str | None = None) -> list[str]:
 def _flag_ports(argv: list[str]) -> set[int]:
     ports = set()
     for index, arg in enumerate(argv):
+        raw = None
         if arg == "--port" and index + 1 < len(argv):
-            ports.add(int(argv[index + 1]))
+            raw = argv[index + 1]
         elif arg.startswith("--port="):
-            ports.add(int(arg.split("=", 1)[1]))
+            raw = arg.split("=", 1)[1]
+        if raw is None:
+            continue
+        try:
+            ports.add(int(raw))
+        except ValueError:
+            continue
     return ports
 
 
 def _flag(argv: list[str], name: str) -> str | None:
+    prefix = name + "="
     for index, arg in enumerate(argv):
         if arg == name and index + 1 < len(argv):
             return argv[index + 1]
+        if arg.startswith(prefix):
+            return arg[len(prefix):]
     return None
 
 
@@ -329,11 +353,197 @@ def _same_server(live: list[str], expected: list[str]) -> bool:
     return _flag(expected, "--port") is not None
 
 
+def _splash_argv(argv: list[str]) -> bool:
+    """True for `splash serve`, the detached `server.server`, or serve-native."""
+    if not argv:
+        return False
+    if "server.server" in argv or "serve-native" in argv:
+        return True
+    if any(arg == "--serve-record" or arg.startswith("--serve-record=") for arg in argv):
+        return True
+    if "serve" in argv and any(os.path.basename(arg) == "splash" for arg in argv):
+        return True
+    return False
+
+
+def _blocked_port(port: int, reserved: set[int] | None = None) -> bool:
+    if port == OMLX_PORT or port <= 0:
+        return True
+    return bool(reserved) and port in reserved
+
+
+def _card_process(argv: list[str], port: int, model_id: str, reserved: set[int]) -> bool:
+    """A Splash argv for this card: same --port, same --model, no reserved port."""
+    if not argv or _blocked_port(port, reserved) or not _splash_argv(argv):
+        return False
+    ports = _flag_ports(argv)
+    if ports != {port} or ports & reserved or OMLX_PORT in ports:
+        return False
+    return _flag(argv, "--model") == model_id
+
+
+def _group_leader(pid: int) -> bool:
+    try:
+        return os.getpgid(pid) == pid
+    except OSError:
+        return False
+
+
+def serve_record_path(cfg: dict, port: int) -> Path | None:
+    """Splash's ``serve-<port>.json``. None for port 8000 and any reserved port.
+
+    ``[macos] serve_record_dir`` overrides the directory. A value containing
+    ``{port}`` is the whole path.
+    """
+    if _blocked_port(port, reserved_ports(cfg)):
+        return None
+    raw = str((cfg.get("macos") or {}).get("serve_record_dir") or DEFAULT_SERVE_RECORD_DIR)
+    expanded = os.path.expanduser(raw)
+    if "{port}" in expanded:
+        return Path(expanded.format(port=port))
+    return Path(expanded) / f"serve-{port}.json"
+
+
+def _read_serve_record(cfg: dict, port: int) -> dict | None:
+    path = serve_record_path(cfg, port)
+    if path is None:
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _command_lines() -> list[tuple[int, list[str]]]:
+    """Every process argv. /proc on Linux, wide `ps` where there is no /proc."""
+    root = Path("/proc")
+    if root.is_dir():
+        rows = []
+        for entry in root.iterdir():
+            if not entry.name.isdigit():
+                continue
+            argv = process_argv(int(entry.name))
+            if argv:
+                rows.append((int(entry.name), argv))
+        return rows
+    try:
+        done = subprocess.run(
+            ["ps", "-ax", "-ww", "-o", "pid=,command="],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if done.returncode != 0:
+        return []
+    rows = []
+    for line in done.stdout.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        pid_text, sep, command = stripped.partition(" ")
+        if not sep or not pid_text.isdigit() or not command.strip():
+            continue
+        try:
+            argv = shlex.split(command.strip())
+        except ValueError:
+            continue
+        if argv:
+            rows.append((int(pid_text), argv))
+    return rows
+
+
+def _adoptable(pid: int, argv: list[str], port: int, model_id: str, reserved: set[int]) -> bool:
+    return bool(
+        argv and _card_process(argv, port, model_id, reserved) and _alive(pid) and _group_leader(pid)
+    )
+
+
+def _owned_row(mid: str, pid: int, port: int, argv: list[str], log: str | None = None) -> dict:
+    return {
+        "pid": pid,
+        "port": port,
+        "argv": list(argv),
+        "log": log or str(_logs_dir() / f"{mid}.log"),
+        "started": process_started(pid),
+    }
+
+
+def _find_live_server(cfg: dict, mid: str, model: dict, port: int, reserved: set[int],
+                      commands: list[tuple[int, list[str]]] | None = None) -> dict | None:
+    """The detached Splash server for this card, if its pid is still that process.
+
+    Prefers Splash's serve record, then a single process whose argv names this
+    card's port and model. Never returns a pid that names a reserved port.
+    """
+    if _blocked_port(port, reserved):
+        return None
+    model_id = model["model"]
+    record = _read_serve_record(cfg, port)
+    seen: set[int] = set()
+    if record is not None:
+        try:
+            recorded = int(record["pid"])
+        except (KeyError, TypeError, ValueError):
+            recorded = 0
+        if recorded > 0:
+            seen.add(recorded)
+            argv = process_argv(recorded)
+            if argv and _adoptable(recorded, argv, port, model_id, reserved):
+                return _owned_row(mid, recorded, port, argv)
+    if commands is None:
+        commands = _command_lines()
+    matches = []
+    for pid, argv in commands:
+        if pid in seen or not _adoptable(pid, argv, port, model_id, reserved):
+            continue
+        matches.append((pid, argv))
+    if len(matches) != 1:
+        return None
+    pid, argv = matches[0]
+    return _owned_row(mid, pid, port, argv)
+
+
+def _capture_server(cfg: dict, mid: str, model: dict, port: int, reserved: set[int],
+                    launcher_pid: int | None = None) -> dict | None:
+    """Remember a live server that is not the launcher we just spawned."""
+    found = _find_live_server(cfg, mid, model, port, reserved)
+    if not found or (launcher_pid is not None and found["pid"] == launcher_pid):
+        return None
+    previous = _record(mid)
+    if previous and previous.get("log"):
+        found["log"] = previous["log"]
+    _remember(mid, found)
+    return found
+
+
+def _settle_handoff(cfg: dict, mid: str, model: dict, port: int, reserved: set[int],
+                    launcher_pid: int) -> None:
+    """Record Splash's detached pid once the launcher has handed off."""
+    started = time.monotonic()
+    while True:
+        if _capture_server(cfg, mid, model, port, reserved, launcher_pid):
+            return
+        record = _read_serve_record(cfg, port) or {}
+        try:
+            record_pid = int(record["pid"]) if "pid" in record else None
+        except (TypeError, ValueError):
+            record_pid = None
+        elapsed = time.monotonic() - started
+        if _alive(launcher_pid) and record_pid in (None, launcher_pid) and elapsed >= HANDOFF_GRACE:
+            return
+        if elapsed >= HANDOFF_SECONDS:
+            return
+        time.sleep(0.05)
+
+
 def ownership(record: dict, reserved: set[int]) -> tuple[bool, str]:
-    """True only when this pid is still the splash serve we spawned for the card.
+    """True only when this pid is still a Splash server for the recorded card.
 
     A reserved port anywhere in its command line is never owned, so oMLX on
-    :8000 cannot be stopped through a stale or edited state file.
+    :8000 cannot be stopped through a stale or edited state file. The saved
+    argv is compared as-is: a detached server does not carry the launcher's
+    ``--model-dir``, ``--draft-model``, or ``--host``.
     """
     try:
         pid = int(record["pid"])
@@ -353,17 +563,16 @@ def ownership(record: dict, reserved: set[int]) -> tuple[bool, str]:
         return False, "reserved port"
     if port not in live_ports:
         return False, "different port"
+    if not _splash_argv(live):
+        return False, "not splash"
     if not _same_server(live, argv):
         return False, "different command"
     started = record.get("started")
     current = process_started(pid)
     if started and current and started != current:
         return False, "different process"
-    try:
-        if os.getpgid(pid) != pid:
-            return False, "not a group leader"
-    except OSError:
-        return False, "unreadable"
+    if not _group_leader(pid):
+        return False, "not a group leader"
     return True, "ok"
 
 
@@ -396,42 +605,58 @@ def _machine(cfg: dict) -> dict:
     return out
 
 
-def server_view(cfg: dict, mid: str, model: dict, reserved: set[int]) -> dict:
+def _listed_models(host: str, port: int, reserved: set[int] | None = None) -> list[str] | None:
+    """Model ids from GET /v1/models. None when the port does not answer.
+
+    Never requests port 8000 or any other reserved port. An answer that is
+    not a model list is an empty list, which is not this card's model.
+    """
+    if _blocked_port(port, reserved):
+        return None
+    url = f"http://{host}:{port}/v1/models"
+    request = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=PROBE_SECONDS) as response:
+            body = response.read(1_000_000)
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+        return None
+    try:
+        payload = json.loads(body.decode(errors="replace"))
+    except ValueError:
+        return []
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, list):
+        return []
+    found = []
+    for item in data:
+        if isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"]:
+            found.append(item["id"])
+    return found
+
+
+def _ready(host: str, port: int, served: str) -> bool:
+    """True when /v1/models lists this model id. Never requests port 8000."""
+    if port == OMLX_PORT or not served:
+        return False
+    listed = _listed_models(host, port)
+    return bool(listed) and served in listed
+
+
+def _view(cfg: dict, mid: str, model: dict, *, phase: str, pid: int | None,
+          port_busy: bool, error: str | None) -> dict:
     target = model_dir(cfg, model)
     draft = draft_dir(cfg, model)
     port = card_port(model, mid)
     host = card_host(cfg, model)
     weights = _on_disk(target)
     draft_ok = _on_disk(draft)
-    record = _record(mid)
-    owned, why = ownership(record, reserved) if record else (False, "absent")
-    phase = "stopped"
-    error = None
-    if why == "dead":
-        _remember(mid, None)
-        record, owned = None, False
-    elif why == "reserved port":
-        # Drop the pointer. Do not signal the process it names (oMLX owns :8000).
-        _remember(mid, None)
-        record, owned = None, False
-        error = f"A recorded pid named port {OMLX_PORT}; it was not signalled."
-    elif why in {"different port", "different command", "different process"}:
-        _remember(mid, None)
-        record, owned = None, False
-        error = f"Recorded server no longer matches this card ({why}); it was not stopped."
-    elif record and not owned and why != "absent":
-        error = f"Cannot confirm the recorded server ({why}); it was not stopped."
-    if owned:
-        phase = "ready" if _ready(host, port, model["model"]) else "starting"
-    url = f"http://{host}:{port}/v1"
-    busy = phase == "stopped" and port not in reserved and _port_busy(host, port)
     return {
         "id": mid,
         "label": model.get("label") or mid,
         "phase": phase,
         "port": port,
         "host": host,
-        "url": url if phase != "stopped" else None,
+        "url": f"http://{host}:{port}/v1" if phase in {"ready", "starting"} else None,
         "model": model["model"],
         "format": model.get("format"),
         "draft_model": model.get("draft_model"),
@@ -440,10 +665,71 @@ def server_view(cfg: dict, mid: str, model: dict, reserved: set[int]) -> dict:
         "model_on_disk": weights,
         "draft_on_disk": draft_ok,
         "on_disk": weights and draft_ok,
-        "pid": int(record["pid"]) if owned and record else None,
-        "port_busy": busy,
+        "pid": pid,
+        "port_busy": port_busy,
         "error": error,
     }
+
+
+def server_view(cfg: dict, mid: str, model: dict, reserved: set[int],
+                commands: list[tuple[int, list[str]]] | None = None) -> dict:
+    """What this card is doing, from the live process and the card's own port.
+
+    A dead launcher pid is not "stopped" while Splash's serve record (or a
+    process argv) still points at this card's server. Port 8000 is never
+    probed. Ready requires /v1/models to list this card's model id.
+    """
+    port = card_port(model, mid)
+    host = card_host(cfg, model)
+    if _blocked_port(port, reserved):
+        return _view(cfg, mid, model, phase="stopped", pid=None, port_busy=False, error=None)
+    record = _record(mid)
+    owned, why = ownership(record, reserved) if record else (False, "absent")
+    error = None
+    found = record if owned else None
+    if not owned:
+        if why == "reserved port":
+            # Drop the pointer. Do not signal the process it names (oMLX owns :8000).
+            _remember(mid, None)
+            record = None
+            error = f"A recorded pid named port {OMLX_PORT}; it was not signalled."
+        found = _find_live_server(cfg, mid, model, port, reserved, commands)
+        if found:
+            if record and record.get("log"):
+                found["log"] = record["log"]
+            _remember(mid, found)
+            error = None
+        elif why == "dead":
+            _remember(mid, None)
+        elif why in {"different port", "different command", "different process", "not splash"}:
+            _remember(mid, None)
+            error = f"Recorded server no longer matches this card ({why}); it was not stopped."
+        elif record and why not in {"absent", "reserved port"}:
+            error = f"Cannot confirm the recorded server ({why}); it was not stopped."
+    model_id = model["model"]
+    if _ready(host, port, model_id):
+        observed, observed_error = "ready", None
+    else:
+        listed = _listed_models(host, port, reserved)
+        if listed and model_id not in listed:
+            shown = ", ".join(listed)
+            observed = "busy"
+            observed_error = f"Port {port} is busy with another model ({shown}), not {model_id}."
+        else:
+            observed, observed_error = "closed", None
+    if observed == "busy":
+        # The listener is not this card. Leave that process alone.
+        _remember(mid, None)
+        return _view(cfg, mid, model, phase="busy", pid=None, port_busy=True, error=observed_error)
+    if found and observed == "ready":
+        return _view(cfg, mid, model, phase="ready", pid=int(found["pid"]), port_busy=False, error=None)
+    if found:
+        # Serve-record phase "starting", or the port is not answering yet.
+        return _view(cfg, mid, model, phase="starting", pid=int(found["pid"]), port_busy=False, error=None)
+    if observed == "ready":
+        return _view(cfg, mid, model, phase="ready", pid=None, port_busy=False, error=UNVERIFIED_STOP)
+    busy = port not in reserved and _port_busy(host, port)
+    return _view(cfg, mid, model, phase="stopped", pid=None, port_busy=busy, error=error)
 
 
 def status(cfg: dict) -> dict:
@@ -451,27 +737,14 @@ def status(cfg: dict) -> dict:
     reserved = reserved_ports(cfg)
     if OMLX_PORT not in reserved:
         raise MacOSError("port 8000 must stay reserved")
+    commands = _command_lines()
     return {
         "machine": _machine(cfg),
         "host": site(cfg).get("host") or DEFAULT_HOST,
         "reserved_ports": sorted(reserved),
         "splash": site(cfg).get("splash") or "splash",
-        "models": [server_view(cfg, mid, model, reserved) for mid, model in models(cfg).items()],
+        "models": [server_view(cfg, mid, model, reserved, commands) for mid, model in models(cfg).items()],
     }
-
-
-def _ready(host: str, port: int, served: str) -> bool:
-    """GET the card's own /v1/models. Never requests port 8000."""
-    if port == OMLX_PORT or not served:
-        return False
-    url = f"http://{host}:{port}/v1/models"
-    request = urllib.request.Request(url, method="GET")
-    try:
-        with urllib.request.urlopen(request, timeout=PROBE_SECONDS) as response:
-            body = response.read(1_000_000).decode(errors="replace")
-    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
-        return False
-    return served in body
 
 
 def _wait_ready(host: str, port: int, served: str, timeout: float, emit) -> bool:
@@ -497,22 +770,27 @@ def _require_weights(cfg: dict, mid: str, model: dict) -> None:
 
 
 def up(cfg: dict, name: str, emit=None, *, ready_timeout: float = READY_SECONDS) -> dict:
-    """Spawn splash serve for this card. Does not stop any other process."""
+    """Serve this card. A Splash server already on the card port is recorded, not replaced."""
     emit = emit or (lambda event: None)
     _check_ports(cfg)
     mid, model = resolve(cfg, name)
     port = card_port(model, mid)
     host = card_host(cfg, model)
-    if port in reserved_ports(cfg):
-        raise MacOSError(f"refusing to start {mid} on reserved port {port}")
-    _require_weights(cfg, mid, model)
     reserved = reserved_ports(cfg)
-    record = _record(mid)
-    if record and ownership(record, reserved)[0]:
-        if _ready(host, port, model["model"]):
-            emit({"event": "ready", "model": mid, "port": port, "detail": "already serving"})
-            return server_view(cfg, mid, model, reserved)
+    if port in reserved:
+        raise MacOSError(f"refusing to start {mid} on reserved port {port}")
+    current = server_view(cfg, mid, model, reserved)
+    if current["phase"] == "ready" and current.get("pid"):
+        emit({"event": "ready", "model": mid, "port": port, "detail": "already serving"})
+        return current
+    if current["phase"] == "ready":
+        raise MacOSError(
+            f"port {port} is serving {model['model']}, but no Splash process could be verified; left it alone")
+    if current["phase"] == "starting" and current.get("pid"):
         raise MacOSError(f"{model.get('label') or mid} is already starting on port {port}")
+    if current["phase"] == "busy":
+        raise MacOSError(current["error"] or f"port {port} is busy with another model; left that process alone")
+    _require_weights(cfg, mid, model)
     if _port_busy(host, port):
         raise MacOSError(f"port {port} is already in use; left that process alone")
     binary = splash_binary(cfg)
@@ -536,12 +814,15 @@ def up(cfg: dict, name: str, emit=None, *, ready_timeout: float = READY_SECONDS)
         "started": process_started(proc.pid),
     })
     try:
-        if not _wait_ready(host, port, model["model"], ready_timeout, emit):
+        became = _wait_ready(host, port, model["model"], ready_timeout, emit)
+        _settle_handoff(cfg, mid, model, port, reserved, proc.pid)
+        if not became:
             stop(cfg, mid, emit=emit)
             raise MacOSError(f"splash did not become ready on port {port}; stopped that process")
     except MacOSError:
         raise
     except Exception:
+        _settle_handoff(cfg, mid, model, port, reserved, proc.pid)
         stop(cfg, mid, emit=emit)
         raise
     view = server_view(cfg, mid, model, reserved)
@@ -557,33 +838,42 @@ def _signal_group(pid: int, sig: int) -> None:
 
 
 def stop(cfg: dict, name: str, emit=None) -> dict:
-    """Stop the splash process this card started. No other pid is signalled."""
+    """Stop this card's Splash process group. No other pid is signalled."""
     emit = emit or (lambda event: None)
     _check_ports(cfg)
     mid, model = resolve(cfg, name)
     port = card_port(model, mid)
     if port in reserved_ports(cfg) or port == OMLX_PORT:
         raise MacOSError(f"refusing to stop anything on reserved port {port}")
-    record = _record(mid)
-    if not record:
-        emit({"event": "stopped", "model": mid, "detail": "not running"})
-        return {"id": mid, "stopped": False, "detail": "not running"}
     reserved = reserved_ports(cfg)
-    owned, why = ownership(record, reserved)
-    pid = int(record.get("pid") or 0)
+    record = _record(mid)
+    owned, why = ownership(record, reserved) if record else (False, "absent")
+    if why == "reserved port":
+        _remember(mid, None)
+        record = None
+        owned = False
     if not owned:
-        if why == "dead":
-            _remember(mid, None)
+        adopted = _find_live_server(cfg, mid, model, port, reserved)
+        if adopted:
+            if record and record.get("log"):
+                adopted["log"] = record["log"]
+            _remember(mid, adopted)
+            record = adopted
+            owned = True
         elif why == "reserved port":
-            _remember(mid, None)
             raise MacOSError(
-                f"recorded pid {pid} names reserved port {OMLX_PORT}; it was not signalled")
+                f"recorded pid names reserved port {OMLX_PORT}; it was not signalled")
+        elif why in {"dead", "absent"} or not record:
+            if why == "dead":
+                _remember(mid, None)
+            emit({"event": "stopped", "model": mid, "detail": "not running"})
+            return {"id": mid, "stopped": False, "detail": "not running"}
         else:
+            pid = int(record.get("pid") or 0)
             raise MacOSError(f"recorded pid {pid} is not this card's splash ({why}); it was not signalled")
-        emit({"event": "stopped", "model": mid, "detail": "not running"})
-        return {"id": mid, "stopped": False, "detail": "not running"}
+    pid = int(record["pid"])
     live = process_argv(pid) or []
-    if OMLX_PORT in _flag_ports(live) or not _same_server(live, list(record["argv"])):
+    if not _card_process(live, port, model["model"], reserved) or not _same_server(live, list(record["argv"])):
         raise MacOSError(f"refusing to signal pid {pid}: it is not this card's splash on port {port}")
     try:
         _signal_group(pid, signal.SIGTERM)
@@ -769,7 +1059,7 @@ def add_parser(sub) -> None:
     start = commands.add_parser("up", help="splash serve for one card, on that card's port only")
     start.add_argument("model", help="catalog id or alias")
     start.add_argument("--json", action="store_true", help="JSON events are the default output")
-    halt = commands.add_parser("stop", help="stop the splash process this card started, and no other")
+    halt = commands.add_parser("stop", help="stop this card's Splash server, and no other process")
     halt.add_argument("model", help="catalog id or alias")
     halt.add_argument("--json", action="store_true", help="JSON events are the default output")
     log = commands.add_parser("logs", help="the log of the splash process this card started")

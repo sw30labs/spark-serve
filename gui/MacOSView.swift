@@ -4,10 +4,11 @@ import AppKit
 // MARK: - This Mac Studio
 //
 // Splash on the local Mac (ADR 0020). The app drives `spark-serve macos …`.
-// Each card is its own `splash serve` process. Port 8000 is oMLX and is never
-// bound, stopped, or selected for Hermes. On-disk status is whether the card's
-// model_dir and draft_dir exist. Use in Hermes writes the same config as the
-// Strix tab, and only once that card is ready.
+// Each card is its own splash server. Splash 1.6 exits the launcher, so status
+// follows the detached process (or the port, when no process can be verified).
+// Port 8000 is oMLX and is never bound, stopped, or selected for Hermes.
+// On-disk status is whether the card's model_dir and draft_dir exist. Use in
+// Hermes writes the same config as the Strix tab, and only once that card is ready.
 
 struct MacOSMachine: Codable {
     var name: String? = nil
@@ -62,7 +63,7 @@ enum MacOSFacts {
 
     static func canStart(_ server: MacOSServer) -> Bool {
         server.port != reservedPort && server.on_disk && server.port_busy != true
-            && server.phase != "ready" && server.phase != "starting"
+            && server.phase != "ready" && server.phase != "starting" && server.phase != "busy"
     }
 
     static func canStop(_ server: MacOSServer) -> Bool {
@@ -70,10 +71,31 @@ enum MacOSFacts {
             && (server.phase == "ready" || server.phase == "starting")
     }
 
+    /// Shown when the port is serving but Stop has no verified Splash process.
+    static func stopNote(_ server: MacOSServer) -> String? {
+        guard server.pid == nil else { return nil }
+        guard server.phase == "ready" || server.phase == "starting" else { return nil }
+        if let error = server.error, !error.isEmpty { return error }
+        return "This port is serving this model, but no Splash process could be verified. Stop stays off."
+    }
+
+    static func phaseTitle(_ server: MacOSServer) -> String {
+        switch server.phase {
+        case "ready": return "serving"
+        case "starting": return "starting"
+        case "busy": return "busy with another model"
+        case "failed": return "failed"
+        default: return "stopped"
+        }
+    }
+
     /// Why Start is off, or nil when it can run. A serving card has no start blocker.
     static func blocker(_ server: MacOSServer) -> String? {
         if server.port == reservedPort { return "Port 8000 is oMLX; splash is never started there" }
         if server.phase == "ready" || server.phase == "starting" { return nil }
+        if server.phase == "busy" {
+            return server.error ?? "Port \(server.port) is busy with another model"
+        }
         if !server.model_on_disk { return "Weights not on disk yet" }
         if !server.draft_on_disk { return "Draft not on disk yet" }
         if server.port_busy == true { return "Port \(server.port) is in use; it will not be stopped" }
@@ -83,7 +105,7 @@ enum MacOSFacts {
     static func phaseColor(_ phase: String) -> Color {
         switch phase {
         case "ready": return .green
-        case "starting": return .orange
+        case "starting", "busy": return .orange
         case "failed": return .red
         default: return .gray
         }
@@ -107,6 +129,7 @@ final class MacOSStore: ObservableObject {
     private var backgroundTimer: Timer?
     private var timer: Timer?
     private var refreshing = false
+    private var refreshQueued = false
     private var viewers = 0
     private var running: Process?
     private var lineBuffer = Data()
@@ -137,6 +160,8 @@ final class MacOSStore: ObservableObject {
         viewers += 1
         guard timer == nil else { return }
         refresh()
+        // While this tab is open, status is polled so a handoff can enable Hermes
+        // without restarting the app. Start also refreshes when it reports ready.
         timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in self?.refresh() }
     }
 
@@ -148,7 +173,11 @@ final class MacOSStore: ObservableObject {
     }
 
     func refresh() {
-        guard !refreshing, !cliPath.isEmpty else { return }
+        guard !cliPath.isEmpty else { return }
+        if refreshing {
+            refreshQueued = true
+            return
+        }
         refreshing = true
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
@@ -163,6 +192,10 @@ final class MacOSStore: ObservableObject {
                     self.lastError = "Splash status did not answer."
                 } else if site != nil, !self.isBusy, self.lastError == "Splash status did not answer." {
                     self.lastError = nil
+                }
+                if self.refreshQueued {
+                    self.refreshQueued = false
+                    self.refresh()
                 }
             }
         }
@@ -306,11 +339,14 @@ final class MacOSStore: ObservableObject {
             didReportHermes = true
         case "ready":
             log("  ready")
+            refresh()
         case "stopped":
             log("  stopped")
+            refresh()
         case "starting":
             if let port = event["port"] as? Int { log("  starting on port \(port)") }
             if let argv = event["argv"] as? [String] { log("  \(argv.joined(separator: " "))") }
+            refresh()
         default:
             log("  \(name)")
         }
@@ -448,9 +484,9 @@ struct MacOSView: View {
             } else {
                 Text(server.label).font(.headline)
             }
-            Text(":\(server.port) · \(MacOSFacts.diskNote(server))")
+            Text(":\(server.port) · \(MacOSFacts.phaseTitle(server)) · \(MacOSFacts.diskNote(server))")
                 .font(.caption2)
-                .foregroundStyle(server.on_disk ? Color.secondary : Color.orange)
+                .foregroundStyle(server.phase == "busy" ? Color.orange : (server.on_disk ? Color.secondary : Color.orange))
                 .padding(.leading, 4)
         }
     }
@@ -462,6 +498,7 @@ struct MacOSView: View {
                     startControl(server)
                     Button("Stop") { store.stop(server.id) }
                         .disabled(!MacOSFacts.canStop(server) || (store.isBusy && !store.busyIsStart))
+                        .help(MacOSFacts.stopNote(server) ?? "Stop this card's Splash process")
                     Button("Logs") { store.showLogs(server.id) }
                         .disabled(store.isBusy)
                     hermesButtons(server)
@@ -474,7 +511,9 @@ struct MacOSView: View {
                 if let url = server.url {
                     Text(url).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
                 }
-                if let error = server.error {
+                if let note = MacOSFacts.stopNote(server) {
+                    Text(note).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                } else if let error = server.error {
                     Text(error).font(.caption).foregroundStyle(.orange).textSelection(.enabled)
                 }
             }
@@ -502,6 +541,11 @@ struct MacOSView: View {
                 Label(server.phase == "ready" ? "Serving on :\(server.port)" : "Starting on :\(server.port)…",
                       systemImage: "checkmark.circle.fill")
                     .foregroundStyle(MacOSFacts.phaseColor(server.phase))
+            } else if server.phase == "busy" {
+                Label(MacOSFacts.blocker(server) ?? "Busy with another model",
+                      systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(MacOSFacts.phaseColor(server.phase))
+                    .font(.caption)
             } else {
                 Button("Start") { store.start(server.id) }
                     .buttonStyle(.borderedProminent)
@@ -523,7 +567,9 @@ struct MacOSView: View {
                     .buttonStyle(.bordered)
                     .disabled(store.isBusy || store.hermesArguments(server.id, target: target) == nil)
                     .accessibilityLabel("Use \(server.label) in \(target.title)")
-                    .help(target == .local ? "Update Hermes on this Mac" : "Update Hermes on the head Spark")
+                    .help(server.phase == "busy"
+                          ? (server.error ?? "This port is busy with another model")
+                          : (target == .local ? "Update Hermes on this Mac" : "Update Hermes on the head Spark"))
             }
         }
     }
@@ -590,7 +636,9 @@ struct MacOSMenuSection: View {
     }
 
     private func menuTitle(_ server: MacOSServer) -> String {
-        if server.phase == "ready" { return "✓ \(server.label)" }
+        if server.phase == "ready" {
+            return server.pid == nil ? "✓ \(server.label) (Stop unavailable)" : "✓ \(server.label)"
+        }
         if let blocker = MacOSFacts.blocker(server) { return "\(server.label) — \(blocker)" }
         return "\(server.label) · :\(server.port)"
     }

@@ -24,9 +24,10 @@ unmeasured.
 - **One Splash process per card.** Start runs `splash serve` with only flags
   Splash documents (`--model`, `--model-dir`, `--draft-model`, `--host`,
   `--port`, and `--mmproj` when the card sets one). Cards default to ports
-  8101–8105 on 127.0.0.1. Stop signals only the process this tool spawned for
-  that card, and only after its command line still matches the card and names
-  no reserved port.
+  8101–8105 on 127.0.0.1. Splash 1.6 exits that launcher and writes
+  `serve-<port>.json`; status records that pid when it is alive, its `--port`
+  and `--model` match the card, and it names no reserved port. Stop signals
+  only that process group.
 - **Port 8000 stays untouched.** It is reserved even if the catalog drops it.
   No card may use it. Status never requests it, and a state file that points
   at a process on it is forgotten without a signal.
@@ -48,12 +49,16 @@ unmeasured.
   `spark` provider block is left as it is. `--hermes-target spark` updates
   Hermes on the head Spark.
 
-**Trade-off.** Splash is not a service manager. A server keeps running after
-the app quits until Stop. A process we did not start, including anything
-already bound to a card's port, is left alone, so Start fails closed instead
-of taking the port. Qwen3.8-27B's directory names are the Hugging Face repo
-ids under the TensorFold models root; rename `model_dir` and `draft_dir` if
-the folders differ.
+**Trade-off.** Splash 1.6 hands the serve off to a detached process and the
+launcher exits. Status follows the process that is actually serving: Splash's
+`serve-<port>.json`, or one process whose argv names that card's port and
+model. Stop signals only that verified process group. A port that answers
+with the card's model but whose process cannot be verified is shown as
+serving so Hermes can use it, and Stop stays off. A port serving a different
+model is shown as busy and is not selected. oMLX on port 8000 is never probed
+or signalled. Qwen3.8-27B's directory names are the Hugging Face repo ids
+under the TensorFold models root; rename `model_dir` and `draft_dir` if the
+folders differ.
 
 **Evidence.** [CLI](../../spark_serve_macos.py), [app](../../gui/MacOSView.swift),
 [tests](../../tests/test_macos.py),
