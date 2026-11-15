@@ -41,9 +41,13 @@ def example():
         return tomllib.load(f)
 
 
+def pika_model():
+    with (ROOT / "tests/fixtures/pika-h3-flex.toml").open("rb") as f:
+        return tomllib.load(f)["models"]["pika-h3-flex"]
+
+
 def config():
-    cfg = example()
-    pika = cfg["models"]["pika-h3-flex"]
+    pika = pika_model()
     return {
         "cluster": {"head": "sparkone", "worker": "sparktwo", "nnodes": 2, "port": 8000,
                     "lan_url": "http://head.lan:8000", "container": "vllm_cluster"},

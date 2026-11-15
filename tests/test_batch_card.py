@@ -100,12 +100,13 @@ def test_text_list_handles_card_without_image(capsys):
     assert "card only: batch job on sparktwo, no endpoint" in line
 
 
-def test_example_catalog_pika_entry_is_a_launchable_batch_job():
+def test_example_catalog_omits_the_pika_card():
     cfg = example()
-    model = cfg["models"]["pika-h3-flex"]
-    assert cli.launch_refusal("pika-h3-flex", model) is None  # ADR 0018 superseded card-only for Pika
-    assert model["home_node"] == "worker" and int(model["nnodes"]) == 1
-    assert "container" not in model  # never joins the stop set
-    assert cli.resolve_model(cfg, "pika") == ("pika-h3-flex", model)
-    # Not added to any stop list or the protected set.
-    assert "pika" not in " ".join(cfg["cluster"].get("stop_names") or [])
+    models = cfg["models"]
+    assert "pika-h3-flex" not in models
+    aliases = {
+        alias
+        for model in models.values()
+        for alias in (model.get("aliases") or [])
+    }
+    assert "pika" not in aliases and "pika-h3" not in aliases

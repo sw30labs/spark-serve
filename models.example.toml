@@ -415,58 +415,6 @@ args = [
   "--compilation-config", '{"backend":"eager"}',
 ]
 
-# Pika H3 Flex (Pika-Labs) — 33B text/image-to-video + audio on MiniMax-H3 with LoRA adapters.
-# Batch entry (ADR 0018): `up pika-h3-flex --prompt ...` checks sparktwo, stops the serving model
-# through the normal fenced stop, runs one pika-h3-pro job on sparktwo detached, and a supervisor
-# there restores the previous model when the job ends (done, failed or `batch stop`), Mac or not.
-# It is not an OpenAI-compatible server; its ~68 GiB GPU peak cannot share a Spark with Qwen.
-# `pull` refuses it (prepared by hand). Runbook: docs/pika-h3-flex.md.
-[models.pika-h3-flex]
-aliases = ["pika", "pika-h3"]
-label = "Pika H3 Flex video + audio"
-wrapper = "batch"
-# No prepare script: `pull` refuses this unknown recipe before any SSH.
-recipe = "pika-h3-flex"
-home_node = "worker"
-nnodes = 1
-hf_id = "Pika-Labs/Pika-H3-Flex"
-revision = "0ddf55ad7067ca1e76812253bd7b4600df87f759"
-base_model = "MiniMaxAI/MiniMax-H3@42ed227ee7df40d41602854ae760620d6eb651fe"
-served_name = ""
-image = ""
-quant = "BF16"
-quant_bits = 16
-quant_scope = "all"
-quant_detail = "Unquantized BF16: transformer 62 GB, text encoder 63 GB, video VAE 9.8 GB, audio VAE 0.6 GB, FL2VA LoRA 2.6 GB (137 GB on disk)."
-modalities = ["text", "image"]
-outputs = ["video", "audio"]
-gpu_peak_gib = 68
-notes = "Batch job on sparktwo only, no API endpoint. 480p/768p, 5–15 s, tasks t2va/i2va/l2va/fl2va/ref2va; only the FL2VA adapter is installed and only t2va is tested. Needs the Spark's GPU to itself: ~68 GiB peak (66.6 GiB allocated while sampling), ~52 GiB host RSS, so it cannot run beside Qwen. 480p 5 s t2va on 2026-11-05: 19 min wall (7.2 min conditioning, 6.5 min transformer load, 1.8 min sampling, 3.2 min decode)."
-
-[models.pika-h3-flex.batch]
-workdir = "~/pika-h3-flex"
-outputs = "~/pika-h3-flex/outputs"
-# {prompt_file} {output} {resolution} {aspect} {duration} {seed} are filled per job.
-command = ["~/pika-h3-flex/venv/bin/pika-h3-pro", "--task", "t2va", "--prompt-file", "{prompt_file}",
-  "--model-repo", "Pika-Labs/Pika-H3-Flex", "--revision", "0ddf55ad7067ca1e76812253bd7b4600df87f759",
-  "--base-path", "~/pika-h3-flex/weights", "--adapter-path", "~/pika-h3-flex/weights/fl2va",
-  "--resolution", "{resolution}", "--aspect", "{aspect}", "--duration", "{duration}", "--seed", "{seed}",
-  "--output", "{output}"]
-path_prepend = ["~/pika-h3-flex/venv/bin", "~/pika-h3-flex/bin"]
-unset_env = ["HF_TOKEN"]
-env = { HF_HUB_OFFLINE = "1", TRANSFORMERS_OFFLINE = "1", DIFFUSERS_OFFLINE = "1", VIRTUAL_ENV = "~/pika-h3-flex/venv", CPATH = "~/pika-h3-flex/deps/pydev/usr/include", C_INCLUDE_PATH = "~/pika-h3-flex/deps/pydev/usr/include" }
-require_paths = ["~/pika-h3-flex/venv/bin/pika-h3-pro", "~/pika-h3-flex/weights/transformer", "~/pika-h3-flex/weights/text_encoder", "~/pika-h3-flex/weights/fl2va/adapter.safetensors", "~/pika-h3-flex/bin/ffmpeg"]
-resolutions = ["480p", "768p"]
-aspects = ["16:9", "9:16", "1:1", "4:3", "3:4", "21:9", "9:21", "3:2", "2:3", "5:4", "4:5"]
-duration_min = 5
-duration_max = 15
-default_resolution = "480p"
-default_aspect = "16:9"
-default_duration = 5
-default_seed = 42
-expected_minutes = 20
-timeout_minutes = 120
-
 # AMD Strix Halo boxes: one engine at a time on each through its halo-ctl
 # (halo-inference-control); `./spark-serve strix up <id> --box <host>` stops
 # the others there. The cluster engine spans both boxes: --box is its master.
